@@ -2,6 +2,12 @@
 (function (w, config) {
   'use strict';
 
+  // 幂等：这个脚本会被执行两次——一次是 WKUserScript 的 atDocumentStart，
+  // 一次是 didCommit 时的 evaluateJavaScript 补注入（前者在自定义 scheme 下
+  // 可能不生效或延迟）。__zeehoIOS 是 configurable:false 的，重复定义会抛
+  // "Attempting to change value of a readonly property" 把整页炸掉。
+  if (w.__zeehoIOS) return;
+
   // 诊断面板：网页在真机白屏时，光看 Xcode/Console 拿不到线索（TrollStore 装的包
   // 也没法连调试器）。这里在 documentStart 就挂好错误捕获，一旦脚本抛错或资源
   // 加载失败，直接把原因画在页面上——比白屏让用户猜好得多。
