@@ -112,7 +112,7 @@ widget_sources=()
 while IFS= read -r path; do swift_sources+=("$repo_dir/$path"); done < "$build_dir/swift-sources.txt"
 while IFS= read -r path; do shared_sources+=("$repo_dir/$path"); done < "$build_dir/shared-sources.txt"
 while IFS= read -r path; do widget_sources+=("$repo_dir/$path"); done < "$build_dir/widget-sources.txt"
-# PanelLoadingView.swift 及根业务源只入 host；Shared 独立 module/static object，两端链接、不嵌入假 framework。
+# 根业务源只入 host；Shared 独立 module/static object，两端链接、不嵌入假 framework。
 activity_args=(-Xlinker -weak_framework -Xlinker ActivityKit)
 xcrun --sdk iphoneos swiftc -O -swift-version 5 -parse-as-library -whole-module-optimization -application-extension \
     -target arm64-apple-ios15.4 -sdk "$sdk_path" -module-name ZeehoSystemShared \

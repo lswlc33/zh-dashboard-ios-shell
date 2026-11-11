@@ -26,7 +26,7 @@ final class IOSSystemService: NSObject, IOSBridgeCancellableService, IOSBridgeMe
 
     let methods = [
         "file.share", "file.save", "clipboard.write", "clipboard.read",
-        "app.info", "app.settings", "notifications.status", "notifications.request",
+        "app.info", "app.appearance", "app.settings", "notifications.status", "notifications.request",
         "notifications.schedule", "notifications.cancel", "media.permission", "photos.save"
     ]
 
@@ -126,6 +126,21 @@ final class IOSSystemService: NSObject, IOSBridgeCancellableService, IOSBridgeMe
                 case "app.info":
                     guard options.isEmpty else { throw Failure(IOSStrings.invalidArguments) }
                     reply(self.appInfo(), nil)
+                case "app.appearance":
+                    // 只接受 {dark: Bool}：网页切深浅色时同步状态栏与系统控件明暗。
+                    // 不申请权限、不弹确认框——它只改本 App 的外观，没有副作用。
+                    guard Set(options.keys).isSubset(of: ["dark"]),
+                          let raw = options["dark"] as? NSNumber,
+                          CFGetTypeID(raw) == CFBooleanGetTypeID() else {
+                        throw Failure(IOSStrings.invalidArguments)
+                    }
+                    let isDark = raw.boolValue
+                    let style: UIUserInterfaceStyle = isDark ? .dark : .light
+                    UIApplication.shared.connectedScenes
+                        .compactMap { $0 as? UIWindowScene }
+                        .flatMap { $0.windows }
+                        .forEach { $0.overrideUserInterfaceStyle = style }
+                    reply(["status": "applied", "dark": isDark], nil)
                 case "notifications.status":
                     guard options.isEmpty else { throw Failure(IOSStrings.invalidArguments) }
                     let job = try self.begin(method: method, args: args, interactive: false, reply: reply)
@@ -420,7 +435,22 @@ final class IOSSystemService: NSObject, IOSBridgeCancellableService, IOSBridgeMe
             "systemVersion": UIDevice.current.systemVersion, "methods": methods,
             "maxFileBytes": Self.maxFileBytes, "maxClipboardBytes": Self.maxClipboardBytes,
             "photoMimeTypes": Self.photoMimes, "localNotifications": true,
-            "backgroundPolling": false, "liveActivities": false, "crossAppMedia": false
+            "backgroundPolling": false, "liveActivities": false, "crossAppMedia": false,
+            // 网页用它决定顶栏/底栏留白。WebView 已铺满整屏，env(safe-area-inset-*)
+            // 在 WK 里可能给 0，所以必须由原生给出真实点值（pt 与 CSS px 1:1）。
+            "safeArea": safeAreaJSON(),
+            "panelLine": IOSPanelLine.current.rawValue
+        ]
+    }
+
+    /// 当前窗口安全区。取不到时返回全 0，网页会回退到 CSS env()。
+    private func safeAreaJSON() -> [String: Any] {
+        let insets = controller()?.view.safeAreaInsets ?? .zero
+        return [
+            "top": Double(max(0, insets.top)),
+            "bottom": Double(max(0, insets.bottom)),
+            "left": Double(max(0, insets.left)),
+            "right": Double(max(0, insets.right))
         ]
     }
 

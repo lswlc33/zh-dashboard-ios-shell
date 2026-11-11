@@ -33,29 +33,72 @@ config = (root / 'xtool.yml').read_text(encoding='utf-8')
 assert 'product: DashboardIOS' in config and 'product: DashboardWidgets' in config
 assert 'infoPath: Widgets/Info.plist' in config and 'entitlementsPath: XtoolSupport/Widgets.entitlements' in config
 
-# 壳负责完整安全区，避免网页视口推断将 Home 指示条留白清零。
+# 主界面完全沉浸：WebView 四边贴 view（不是 safeAreaLayoutGuide），
+# 安全区改由 app.info.safeArea 交给网页，避免 WK 的 env() 给 0 或含导航栏高度。
 controller = (root / 'Dashboard.swift').read_text(encoding='utf-8')
 for edge in ('top', 'bottom', 'leading', 'trailing'):
-    assert f'web.{edge}Anchor.constraint(equalTo: view.safeAreaLayoutGuide.{edge}Anchor)' in controller
-    assert f'loading.{edge}Anchor.constraint(equalTo: web.{edge}Anchor)' in controller
-for event, active in [('didStartProvisionalNavigation', 'true'), ('didFinish', 'false')]:
-    assert re.search(r'func webView\([^\n]*' + event + r'[^\n]*loading.setLoading\(' + active + r'\)', controller)
-load = controller.split('private func loadPanel()', 1)[1].split('\n    }', 1)[0]
-assert load.index('loading.setLoading(true)') < load.index('preparePanel(PanelNavigation.home)')
+    assert f'web.{edge}Anchor.constraint(equalTo: view.{edge}Anchor)' in controller
+    assert f'view.safeAreaLayoutGuide.{edge}Anchor' not in controller
+assert 'setNavigationBarHidden' not in controller and 'UINavigationController' not in controller
+assert 'contentInsetAdjustmentBehavior = .never' in controller
+# 安全区变化要通知网页重新取值，否则旋转后 --sat/--sab 会停在旧值。
+assert "window.dispatchEvent(new Event('resize'))" in controller
+assert 'viewSafeAreaInsetsDidChange' in controller
+
+# 启动分流：有快照且非首次安装直接进面板，否则先走原生欢迎/恢复页。
+assert 'RootRouter' in controller and 'RecoveryViewController' in controller
+assert 'BootHealth.needsWelcome()' in controller
 # 新文档先异步准备可信快照，只有成功才 load；失败显示错误，不绕过桥门禁启动网页。
 prepare = controller.split('private func preparePanel(_ url: URL)', 1)[1].split('\n    }', 1)[0]
-assert prepare.index('loading.setLoading(true)') < prepare.index('bridge.prepareNavigation(to: url)')
 assert prepare.index('bridge.prepareNavigation(to: url)') < prepare.index('case let .success(target):') < prepare.index('self.web.load(')
 assert 'URLRequest(url: target' in prepare
 failure = prepare.split('case let .failure(error):', 1)[1]
 assert 'self.showError(error)' in failure and 'web.load(' not in failure
 error = controller.split('private func showError', 1)[1].split('\n    }', 1)[0]
-assert error.index('NSURLErrorCancelled') < error.index('loading.setLoading(false)') < error.index('UIAlertController')
-assert 'webViewWebContentProcessDidTerminate(_ webView: WKWebView) { loadPanel() }' in controller
-loading = (root / 'PanelLoadingView.swift').read_text(encoding='utf-8')
-assert 'backgroundColor = .systemBackground' in loading
-assert 'clipsToBounds = true' in loading
-assert 'PanelLoadingView.swift' in (root / 'build.sh').read_text(encoding='utf-8')
+assert error.index('NSURLErrorCancelled') < error.index('BootHealth.failed(reason: "load_failed")')
+assert 'onBootFailure?("load_failed")' in error
+assert 'webViewWebContentProcessDidTerminate(_ webView: WKWebView) {' in controller
+assert 'onBootFailure?("renderer")' in controller
+
+# 欢迎/恢复页：一个控制器承载两种语义，初始化与取消互斥。
+recovery = (root / 'RecoveryView.swift').read_text(encoding='utf-8')
+assert 'IOSStrings.recoveryTitle' in recovery and 'IOSStrings.recoverySubtitle' in recovery
+assert 'initializeButton.isHidden = cancellable' in recovery
+assert 'cancelButton.isHidden = !cancellable' in recovery
+assert 'enterButton.isEnabled = ready && !busy' in recovery
+# 欢迎页不创建 WebView，也不调用 JS。
+assert 'WKWebView' not in recovery and 'evaluateJavaScript' not in recovery
+
+# 资源快照：清单与自定义 scheme 必须一致，否则本地页面缺资源。
+cache = (root / 'PanelCache.swift').read_text(encoding='utf-8')
+scheme = (root / 'PanelSchemeHandler.swift').read_text(encoding='utf-8')
+assert 'static let resources' in cache and '"index.html"' in cache
+assert 'zeeho-panel' in scheme
+assert 'didFailWithError' in scheme and 'resolvingSymlinksInPath' in scheme
+navigation = (root / 'Navigation.swift').read_text(encoding='utf-8')
+assert 'IOSPanelSchemeHandler.scheme' in navigation
+
+# 线路选择：五个同步方法齐全，begin 同步完成（与安卓现状一致）。
+line = (root / 'PanelLineService.swift').read_text(encoding='utf-8')
+for method in ('panelLineVersion', 'panelLineInfo', 'beginPanelLine', 'pollPanelLine', 'cancelPanelLine'):
+    assert method in line
+assert 'unknown_ticket' in line
+
+# 系统服务：safeArea 与外观通道必须在白名单里，否则网页永远拿不到。
+system = (root / 'System.swift').read_text(encoding='utf-8')
+assert '"safeArea": safeAreaJSON()' in system
+assert '"app.appearance"' in system
+assert 'overrideUserInterfaceStyle' in system
+
+# 全部 Swift 源文件都要进构建清单，新增文件漏了会静默不编译。
+# build.sh 从 build-support.py 的 inventory 读文件表，所以检查 inventory 而不是 shell 脚本。
+# inventory 里的路径带 `ios-shell/` 前缀（相对仓库根）。
+listed = set(inputs['swiftSources'])
+for name in ('RecoveryView.swift', 'PanelCache.swift', 'PanelSchemeHandler.swift',
+             'PanelLine.swift', 'PanelLineService.swift', 'Dashboard.swift'):
+    assert f'ios-shell/{name}' in listed, name
+# 首屏骨架已由欢迎页取代，不能留孤儿文件。
+assert not (root / 'PanelLoadingView.swift').exists()
 if len(sys.argv) > 1:
     report = helper.verify_artifacts(sys.argv[1], expected_info=info if pathlib.Path(sys.argv[1]).name == helper.IPA_NAME else None)
     print('Real IPA ZIP/Mach-O/appex/SDK/signature structure/hash checks passed; cryptographic verification depends on the recorded build backend')

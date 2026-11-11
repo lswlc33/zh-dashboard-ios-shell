@@ -64,6 +64,41 @@ enum IOSStrings {
     static let liveActivityEndTitle = "结束 iOS 实时活动"
     static let liveActivityEndMessage = "结束当前车辆的所选实时活动，不执行车控、不停止充电，也不删除骑行历史或修改系统通知权限。"
 
+    // MARK: - 欢迎 / 恢复页
+
+    static let recoveryTitle = "欢迎使用几何面板"
+    static let recoverySubtitle = "先准备面板资源，再安心进入。"
+    static let recoveryStatusPending = "面板初始化（待完成）"
+    /// 百分比占位。NSString 的 format 用 %d，不是安卓的 %1$d。
+    static let recoveryStatusProgress = "面板初始化（进度%d%%）"
+    static let recoveryStatusDone = "面板初始化（已完成）"
+    static let recoveryResourceProgress = "资源 %d/%d · %@"
+    static let recoveryBytes = "已下载 %@ / %@"
+    static let recoveryBytesUnknown = "已下载 %@；总量未知"
+    static let recoveryInitialize = "初始化面板"
+    static let recoveryReinitialize = "重新初始化"
+    static let recoveryCancel = "取消本次任务"
+    static let recoveryEnter = "进入面板"
+    static let recoveryReadyHint = "面板资源已就绪，可以进入。"
+    static let recoveryVersionTitle = "版本与更新"
+    static let recoveryBackupTitle = "备份与迁移"
+    static let recoveryAppVersionLabel = "软件版本"
+    static let recoveryPanelVersionLabel = "面板版本"
+    static let recoveryPanelVersionNone = "暂无已确认资源"
+    static let recoveryLineLabel = "面板线路"
+    static let recoveryBackupUnavailable = "iOS 版的账号备份与迁移将随后续版本提供；当前请直接使用网页内的账号管理。"
+
+    static let recoveryInitError = "资源初始化失败。%@"
+    static let recoveryInitErrorGeneric = "请重试；账号和设置不会清除。"
+    static let recoveryReasonUnsafe = "页面安全检查未通过，已停止打开。请重新初始化可信资源后再试。"
+    static let recoveryReasonRenderer = "网页显示进程已停止，已返回原生恢复页。请检查资源后手动重试。"
+    static let recoveryReasonTimeout = "页面未在规定时间内准备好。已停止等待，可以手动重试。"
+    static let recoveryReasonResources = "未找到确认可用的面板资源，请先初始化。"
+    static let recoveryReasonEngine = "上次页面内核检查未通过，已停止打开。请检查系统 WebView 版本后重试。"
+    static let recoveryReasonUnfinished = "上次没有记录到页面准备完成，可能是正常退出或系统回收，并不一定是崩溃。请检查资源后手动进入。"
+    static let recoveryReasonGeneric = "上次面板未能正常打开。可以检查资源后手动重试；账号和设置不会被初始化操作清除。"
+
+
     static let invalidArguments = "原生操作参数不正确，请重新打开页面后再试。"
     static let unsupportedMethod = "当前 iOS 壳没有实现这项原生能力。"
     static let unavailable = "原生服务暂时不可用，请重新打开 App。"

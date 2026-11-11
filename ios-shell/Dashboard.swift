@@ -8,7 +8,7 @@ final class AppDelegate: UIResponder, UIApplicationDelegate {
     func application(_ application: UIApplication,
                      didFinishLaunchingWithOptions launchOptions: [UIApplication.LaunchOptionsKey: Any]?) -> Bool {
         let window = UIWindow(frame: UIScreen.main.bounds)
-        window.rootViewController = UINavigationController(rootViewController: PanelController())
+        window.rootViewController = RootRouter()
         window.makeKeyAndVisible()
         self.window = window
         if let identifiers = launchOptions?[.bluetoothCentrals] as? [String] {
@@ -18,37 +18,165 @@ final class AppDelegate: UIResponder, UIApplicationDelegate {
     }
 }
 
-final class PanelController: UIViewController, WKNavigationDelegate, WKUIDelegate {
-    private let web = WKWebView(frame: .zero, configuration: WKWebViewConfiguration())
-    private let loading = PanelLoadingView()
-    private var bridge: IOSBridge?
-    private var checkingUpdate = false
-    private var checkedOnLaunch = false
+// 启动分流：有可用快照且不是刚升级过就直接进面板，否则先走原生欢迎/恢复页。
+// 与安卓的 RecoveryActivity 语义一致——冷启动第一帧可以是原生页，而不是网页骨架。
+final class RootRouter: UIViewController {
+    private var panel: PanelController?
+    private var recovery: RecoveryViewController?
+    private var settled = false
 
     override func viewDidLoad() {
         super.viewDidLoad()
         view.backgroundColor = .systemBackground
-        title = "几何面板"
-        navigationItem.rightBarButtonItem = UIBarButtonItem(title: "软件更新", style: .plain, target: self, action: #selector(checkSoftwareUpdate))
-        navigationItem.leftBarButtonItem = UIBarButtonItem(title: "刷新面板", style: .plain, target: self, action: #selector(refreshPanel))
+    }
+
+    override func viewDidAppear(_ animated: Bool) {
+        super.viewDidAppear(animated)
+        guard !settled else { return }
+        settled = true
+        route()
+    }
+
+    private func route() {
+        // 上次启动失败过就一定要给恢复页，让用户能看到原因并手动重试。
+        let reason = BootHealth.pendingReason()
+        if !reason.isEmpty {
+            showRecovery(reason: reason)
+            return
+        }
+        IOSPanelCache.shared.refresh { [weak self] state in
+            guard let self = self else { return }
+            if state.ready && !BootHealth.needsWelcome() {
+                BootHealth.markWelcomeShown()
+                self.showPanel()
+            } else {
+                BootHealth.markWelcomeShown()
+                self.showRecovery(reason: "")
+            }
+        }
+    }
+
+    private func showPanel() {
+        let controller = PanelController()
+        panel = controller
+        addChild(controller)
+        controller.view.frame = view.bounds
+        controller.view.autoresizingMask = [.flexibleWidth, .flexibleHeight]
+        view.addSubview(controller.view)
+        controller.didMove(toParent: self)
+        controller.onBootFailure = { [weak self] reason in
+            self?.switchToRecovery(reason: reason)
+        }
+    }
+
+    private func showRecovery(reason: String) {
+        let controller = RecoveryViewController(reason: reason)
+        recovery = controller
+        controller.onEnter = { [weak self] in
+            guard let self = self else { return }
+            self.dismissRecovery()
+            BootHealth.clear()
+            self.showPanel()
+        }
+        addChild(controller)
+        controller.view.frame = view.bounds
+        controller.view.autoresizingMask = [.flexibleWidth, .flexibleHeight]
+        view.addSubview(controller.view)
+        controller.didMove(toParent: self)
+    }
+
+    private func dismissRecovery() {
+        guard let controller = recovery else { return }
+        controller.willMove(toParent: nil)
+        controller.view.removeFromSuperview()
+        controller.removeFromParent()
+        recovery = nil
+    }
+
+    private func switchToRecovery(reason: String) {
+        guard let controller = panel else { showRecovery(reason: reason); return }
+        controller.willMove(toParent: nil)
+        controller.view.removeFromSuperview()
+        controller.removeFromParent()
+        panel = nil
+        BootHealth.failed(reason: reason)
+        showRecovery(reason: reason)
+    }
+
+    override var prefersStatusBarHidden: Bool { false }
+    override var childForStatusBarStyle: UIViewController? { children.first }
+}
+
+// 启动健康状态：等价安卓 BootHealth。
+// 只记「上次是否正常进入面板」，用来决定下次冷启动是否强制走恢复页。
+enum BootHealth {
+    private static let defaults = UserDefaults.standard
+    private static let reasonKey = "io.github.lswlc33.dashboard.ios.boot.reason"
+    private static let welcomeKey = "io.github.lswlc33.dashboard.ios.boot.welcome"
+    private static let buildKey = "io.github.lswlc33.dashboard.ios.boot.build"
+
+    /// 首次安装或 App 版本变化后需要看一次欢迎页。
+    static func needsWelcome() -> Bool {
+        let build = Bundle.main.infoDictionary?["CFBundleVersion"] as? String ?? ""
+        return defaults.string(forKey: buildKey) != build
+    }
+
+    static func markWelcomeShown() {
+        let build = Bundle.main.infoDictionary?["CFBundleVersion"] as? String ?? ""
+        defaults.set(build, forKey: buildKey)
+    }
+
+    static func pendingReason() -> String {
+        defaults.string(forKey: reasonKey) ?? ""
+    }
+
+    static func failed(reason: String) {
+        defaults.set(reason, forKey: reasonKey)
+    }
+
+    static func clear() {
+        defaults.removeObject(forKey: reasonKey)
+    }
+}
+
+final class PanelController: UIViewController, WKNavigationDelegate, WKUIDelegate {
+    private lazy var web: WKWebView = {
+        let configuration = WKWebViewConfiguration()
+        // 本地快照走自定义 scheme；没有快照时这个 handler 不会被用到。
+        configuration.setURLSchemeHandler(IOSPanelSchemeHandler(rootProvider: { IOSPanelCache.shared.snapshotDirectory() }),
+                                          forURLScheme: IOSPanelSchemeHandler.scheme)
+        let view = WKWebView(frame: .zero, configuration: configuration)
+        return view
+    }()
+    private var bridge: IOSBridge?
+    private var checkingUpdate = false
+    private var checkedOnLaunch = false
+    private var lastSafeArea = UIEdgeInsets.zero
+
+    /// 启动失败回调：交给 RootRouter 切到恢复页。
+    var onBootFailure: ((String) -> Void)?
+
+    // 完全沉浸：状态栏与 home indicator 都可见，但页面铺到它们下面。
+    override var prefersStatusBarHidden: Bool { false }
+    override var prefersHomeIndicatorAutoHidden: Bool { false }
+
+    override func viewDidLoad() {
+        super.viewDidLoad()
+        view.backgroundColor = .systemBackground
         web.navigationDelegate = self
         web.uiDelegate = self
         installBridge()
         web.allowsBackForwardNavigationGestures = true
+        // 页面自己按原生给出的 safeArea 留白，不需要 WebView 再叠一层 inset。
         web.scrollView.contentInsetAdjustmentBehavior = .never
         web.translatesAutoresizingMaskIntoConstraints = false
         view.addSubview(web)
-        loading.translatesAutoresizingMaskIntoConstraints = false
-        view.addSubview(loading)
+        // 四边贴 view 而不是 safeAreaLayoutGuide：内容延伸到状态栏与 home indicator 下面。
         NSLayoutConstraint.activate([
-            web.topAnchor.constraint(equalTo: view.safeAreaLayoutGuide.topAnchor),
-            web.bottomAnchor.constraint(equalTo: view.safeAreaLayoutGuide.bottomAnchor),
-            web.leadingAnchor.constraint(equalTo: view.safeAreaLayoutGuide.leadingAnchor),
-            web.trailingAnchor.constraint(equalTo: view.safeAreaLayoutGuide.trailingAnchor),
-            loading.topAnchor.constraint(equalTo: web.topAnchor),
-            loading.bottomAnchor.constraint(equalTo: web.bottomAnchor),
-            loading.leadingAnchor.constraint(equalTo: web.leadingAnchor),
-            loading.trailingAnchor.constraint(equalTo: web.trailingAnchor)
+            web.topAnchor.constraint(equalTo: view.topAnchor),
+            web.bottomAnchor.constraint(equalTo: view.bottomAnchor),
+            web.leadingAnchor.constraint(equalTo: view.leadingAnchor),
+            web.trailingAnchor.constraint(equalTo: view.trailingAnchor)
         ])
         loadPanel()
     }
@@ -61,13 +189,23 @@ final class PanelController: UIViewController, WKNavigationDelegate, WKUIDelegat
         }
     }
 
+    // 安全区变化（旋转、状态栏高度变化）时通知网页重新取值。
+    override func viewSafeAreaInsetsDidChange() {
+        super.viewSafeAreaInsetsDidChange()
+        let insets = view.safeAreaInsets
+        guard insets != lastSafeArea else { return }
+        lastSafeArea = insets
+        web.evaluateJavaScript("window.dispatchEvent(new Event('resize'))", completionHandler: nil)
+    }
+
     private func installBridge() {
         let ride = IOSRideService()
         let history = IOSHistoryService()
         let bluetooth = IOSBluetoothService.shared
         let system = IOSSystemService(controller: { [weak self] in self })
         let surfaces = IOSSystemSurfacesService()
-        let core = IOSBridge(webView: web, services: [IOSLocationService.shared, bluetooth, ride, history, system, surfaces])
+        let line = IOSPanelLineService()
+        let core = IOSBridge(webView: web, services: [IOSLocationService.shared, bluetooth, ride, history, system, surfaces, line])
         let scope: () -> IOSRideScope? = { [weak core] in core?.nativeSessionScope() }
         let presenter: () -> UIViewController? = { [weak self] in self }
         ride.configureScopeProvider(scope)
@@ -99,18 +237,14 @@ final class PanelController: UIViewController, WKNavigationDelegate, WKUIDelegat
     private func checkUpdate(manual: Bool) {
         guard !checkingUpdate else { return }
         checkingUpdate = true
-        navigationItem.rightBarButtonItem?.isEnabled = false
         Task { @MainActor in
-            defer {
-                checkingUpdate = false
-                navigationItem.rightBarButtonItem?.isEnabled = true
-            }
+            defer { checkingUpdate = false }
             do {
                 let release = try await IOSUpdater.latest()
                 let version = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? ""
                 let build = Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String ?? ""
                 guard try release.isNewer(version: version, build: build) else {
-                    if manual { updateMessage("当前 iOS 软件版本：\(version)（\(build)），已是最新。面板资源可通过“刷新面板”更新。") }
+                    if manual { updateMessage("当前 iOS 软件版本：\(version)（\(build)），已是最新。") }
                     return
                 }
                 let required = try IOSRelease.versionParts(release.minimumIOS)
@@ -131,34 +265,23 @@ final class PanelController: UIViewController, WKNavigationDelegate, WKUIDelegat
     private func downloadUpdate(_ release: IOSRelease) {
         guard !checkingUpdate else { return }
         checkingUpdate = true
-        navigationItem.rightBarButtonItem?.isEnabled = false
-        navigationItem.rightBarButtonItem?.title = "正在下载…"
         Task { @MainActor in
-            defer {
-                checkingUpdate = false
-                navigationItem.rightBarButtonItem?.isEnabled = true
-                navigationItem.rightBarButtonItem?.title = "软件更新"
-            }
+            defer { checkingUpdate = false }
             do {
                 let file = try await IOSUpdater.download(release)
-                guard presentedViewController == nil else {
-                    navigationItem.prompt = "IPA 已下载，请关闭弹窗后重试软件更新"
-                    return
-                }
+                guard presentedViewController == nil else { return }
                 let share = UIActivityViewController(activityItems: [file], applicationActivities: nil)
-                share.popoverPresentationController?.barButtonItem = navigationItem.rightBarButtonItem
                 present(share, animated: true)
             } catch { updateMessage(error.localizedDescription) }
         }
     }
 
     private func loadPanel() {
-        loading.setLoading(true)
+        BootHealth.failed(reason: "unfinished")
         preparePanel(PanelNavigation.home)
     }
 
     private func preparePanel(_ url: URL) {
-        loading.setLoading(true)
         web.stopLoading()
         guard let bridge = bridge else { return }
         bridge.prepareNavigation(to: url) { [weak self] result in
@@ -170,20 +293,29 @@ final class PanelController: UIViewController, WKNavigationDelegate, WKUIDelegat
             }
         }
     }
-    func webView(_ webView: WKWebView, didStartProvisionalNavigation navigation: WKNavigation!) { loading.setLoading(true) }
-    func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) { loading.setLoading(false) }
-    func webView(_ webView: WKWebView, didFailProvisionalNavigation navigation: WKNavigation!, withError error: Error) { showError(error) }
-    func webView(_ webView: WKWebView, didFail navigation: WKNavigation!, withError error: Error) { showError(error) }
-    func webViewWebContentProcessDidTerminate(_ webView: WKWebView) { loadPanel() }
+
+    func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
+        // 页面首帧就绪后清掉失败标记，下次冷启动直接进面板。
+        BootHealth.clear()
+    }
+
+    func webView(_ webView: WKWebView, didFailProvisionalNavigation navigation: WKNavigation!, withError error: Error) {
+        showError(error)
+    }
+
+    func webView(_ webView: WKWebView, didFail navigation: WKNavigation!, withError error: Error) {
+        showError(error)
+    }
+
+    func webViewWebContentProcessDidTerminate(_ webView: WKWebView) {
+        onBootFailure?("renderer")
+    }
 
     private func showError(_ error: Error) {
         guard (error as NSError).code != NSURLErrorCancelled else { return }
         bridge?.navigationFailed()
-        loading.setLoading(false)
-        guard presentedViewController == nil else { return }
-        let alert = UIAlertController(title: "面板加载失败", message: error.localizedDescription, preferredStyle: .alert)
-        alert.addAction(UIAlertAction(title: "重试", style: .default) { [weak self] _ in self?.loadPanel() })
-        present(alert, animated: true)
+        BootHealth.failed(reason: "load_failed")
+        onBootFailure?("load_failed")
     }
 
     func webView(_ webView: WKWebView, decidePolicyFor action: WKNavigationAction,
@@ -227,24 +359,24 @@ final class PanelController: UIViewController, WKNavigationDelegate, WKUIDelegat
 
     func webView(_ webView: WKWebView, runJavaScriptAlertPanelWithMessage message: String,
                  initiatedByFrame frame: WKFrameInfo, completionHandler: @escaping () -> Void) {
-        let alert = UIAlertController(title: "几何面板", message: message, preferredStyle: .alert)
+        let alert = UIAlertController(title: IOSStrings.appTitle, message: message, preferredStyle: .alert)
         alert.addAction(UIAlertAction(title: "好", style: .default) { _ in completionHandler() })
         present(alert, animated: true)
     }
     func webView(_ webView: WKWebView, runJavaScriptConfirmPanelWithMessage message: String,
                  initiatedByFrame frame: WKFrameInfo, completionHandler: @escaping (Bool) -> Void) {
-        let alert = UIAlertController(title: "几何面板", message: message, preferredStyle: .alert)
-        alert.addAction(UIAlertAction(title: "取消", style: .cancel) { _ in completionHandler(false) })
-        alert.addAction(UIAlertAction(title: "确定", style: .default) { _ in completionHandler(true) })
+        let alert = UIAlertController(title: IOSStrings.appTitle, message: message, preferredStyle: .alert)
+        alert.addAction(UIAlertAction(title: IOSStrings.cancel, style: .cancel) { _ in completionHandler(false) })
+        alert.addAction(UIAlertAction(title: IOSStrings.confirm, style: .default) { _ in completionHandler(true) })
         present(alert, animated: true)
     }
     func webView(_ webView: WKWebView, runJavaScriptTextInputPanelWithPrompt prompt: String,
                  defaultText: String?, initiatedByFrame frame: WKFrameInfo,
                  completionHandler: @escaping (String?) -> Void) {
-        let alert = UIAlertController(title: "几何面板", message: prompt, preferredStyle: .alert)
+        let alert = UIAlertController(title: IOSStrings.appTitle, message: prompt, preferredStyle: .alert)
         alert.addTextField { $0.text = defaultText }
-        alert.addAction(UIAlertAction(title: "取消", style: .cancel) { _ in completionHandler(nil) })
-        alert.addAction(UIAlertAction(title: "确定", style: .default) { _ in completionHandler(alert.textFields?.first?.text) })
+        alert.addAction(UIAlertAction(title: IOSStrings.cancel, style: .cancel) { _ in completionHandler(nil) })
+        alert.addAction(UIAlertAction(title: IOSStrings.confirm, style: .default) { _ in completionHandler(alert.textFields?.first?.text) })
         present(alert, animated: true)
     }
 }
