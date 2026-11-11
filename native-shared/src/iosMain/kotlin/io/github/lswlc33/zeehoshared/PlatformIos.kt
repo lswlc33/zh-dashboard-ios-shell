@@ -5,12 +5,15 @@ package io.github.lswlc33.zeehoshared
 import io.ktor.client.HttpClient
 import io.ktor.client.engine.darwin.Darwin
 import io.ktor.client.plugins.HttpTimeout
+import io.ktor.http.HttpHeaders
 import kotlinx.cinterop.addressOf
 import kotlinx.cinterop.alloc
 import kotlinx.cinterop.convert
+import kotlinx.cinterop.get
 import kotlinx.cinterop.memScoped
 import kotlinx.cinterop.ptr
 import kotlinx.cinterop.reinterpret
+import kotlinx.cinterop.set
 import kotlinx.cinterop.usePinned
 import platform.CoreCrypto.CCCrypt
 import platform.CoreCrypto.CC_SHA256
@@ -22,9 +25,11 @@ import platform.CoreCrypto.kCCSuccess
 import platform.Foundation.NSDate
 import platform.Foundation.NSRecursiveLock
 import platform.Foundation.NSURLRequestReloadIgnoringLocalCacheData
+import platform.Foundation.timeIntervalSince1970
 import platform.posix.size_tVar
 
-internal actual fun platformNowMillis(): Long = (NSDate().timeIntervalSince1970 * 1000).toLong()
+internal actual fun platformNowMillis(): Long =
+    (NSDate().timeIntervalSince1970 * 1000).toLong()
 internal actual class StateLock {
     private val lock = NSRecursiveLock()
     actual fun <T> withLock(block: () -> T): T {
@@ -42,8 +47,9 @@ internal actual fun platformSha256(bytes: ByteArray): ByteArray {
 }
 internal actual fun platformDecryptChallenge(encrypted: ByteArray, key: ByteArray): ByteArray = memScoped {
     val output = ByteArray(encrypted.size + 16)
+    // size_tVar 在 arm64 上是 ULongVarOf<ULong>：用 [0] 下标读写，不要用 .value。
     val written = alloc<size_tVar>()
-    written.value = 0.convert()
+    written[0] = 0u
     try {
         val status = key.usePinned { keyPtr -> encrypted.usePinned { source -> output.usePinned { target ->
             CCCrypt(
@@ -52,8 +58,9 @@ internal actual fun platformDecryptChallenge(encrypted: ByteArray, key: ByteArra
                 source.addressOf(0), encrypted.size.convert(), target.addressOf(0), output.size.convert(), written.ptr
             )
         } } }
-        require(status == kCCSuccess && written.value.toLong() <= output.size) { "challenge_decryption" }
-        output.copyOf(written.value.toInt())
+        val writtenBytes = written[0].toLong()
+        require(status == kCCSuccess && writtenBytes <= output.size) { "challenge_decryption" }
+        output.copyOf(writtenBytes.toInt())
     } finally { output.fill(0) }
 }
 internal actual fun platformHttpClient(): HttpClient = HttpClient(Darwin) {
@@ -70,7 +77,8 @@ internal actual fun platformHttpClient(): HttpClient = HttpClient(Darwin) {
             requestCachePolicy = NSURLRequestReloadIgnoringLocalCacheData
         }
         configureRequest {
-            setValue("identity", forHTTPHeaderField = "Accept-Encoding")
+            // Darwin 引擎的 configureRequest 暴露的是 NSMutableURLRequest，用属性/方法而非 Ktor header DSL。
+            setValue("identity", forHTTPHeaderField = HttpHeaders.AcceptEncoding)
             setCachePolicy(NSURLRequestReloadIgnoringLocalCacheData)
         }
     }

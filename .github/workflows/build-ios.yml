@@ -63,6 +63,8 @@ jobs:
       - name: 构建 iOS 壳（含 KMP framework，ad-hoc 签名）
         run: |
           chmod +x native-shared/gradlew ios-shell/build.sh
+          # 用 pipefail 保住 build.sh 的退出码；否则 tee 会把失败吞成成功。
+          set -o pipefail
           bash ios-shell/build.sh --output-dir "$RUNNER_TEMP/out" 2>&1 | tee build.log
 
       - name: 记录源码指纹
