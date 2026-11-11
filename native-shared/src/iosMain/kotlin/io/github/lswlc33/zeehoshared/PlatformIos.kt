@@ -8,6 +8,7 @@ import io.ktor.client.plugins.HttpTimeout
 import kotlinx.cinterop.addressOf
 import kotlinx.cinterop.convert
 import kotlinx.cinterop.memScoped
+import kotlinx.cinterop.reinterpret
 import kotlinx.cinterop.usePinned
 import platform.CoreCrypto.CCCrypt
 import platform.CoreCrypto.CC_SHA256
@@ -19,6 +20,7 @@ import platform.CoreCrypto.kCCSuccess
 import platform.Foundation.NSDate
 import platform.Foundation.NSRecursiveLock
 import platform.Foundation.NSURLRequestReloadIgnoringLocalCacheData
+import platform.Foundation.timeIntervalSince1970
 
 internal actual fun platformNowMillis(): Long =
     (NSDate().timeIntervalSince1970 * 1000).toLong()
