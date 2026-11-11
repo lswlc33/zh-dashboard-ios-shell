@@ -83,6 +83,35 @@
       '\nUA=' + w.navigator.userAgent);
   }, 8000);
 
+  // 白屏取证：如果 6 秒后文档还在 loading，直接在页面最上层画一条诊断条。
+  // 这条不是给用户看的成品 UI，是用来区分「真的没渲染」和「渲染了但被遮挡」——
+  // 只要这条能看见，就说明绘制链路正常，问题在被遮挡或颜色；看不见就是更深的问题。
+  w.setTimeout(function () {
+    try {
+      var d = w.document;
+      if (!d || !d.body) return;
+      if (d.readyState === 'complete') return;
+      var bar = d.createElement('div');
+      bar.id = '__zeeho_ios_probe';
+      bar.setAttribute('style', [
+        'position:fixed', 'left:0', 'right:0', 'top:0', 'z-index:2147483646',
+        'background:#ff0', 'color:#000', 'font:12px/1.4 -apple-system,sans-serif',
+        'padding:8px', 'white-space:pre-wrap', 'word-break:break-all'
+      ].join(';'));
+      var stage = d.querySelector('.stage');
+      var cs = stage ? w.getComputedStyle(stage) : null;
+      bar.textContent = 'iOS 探针 readyState=' + d.readyState
+        + ' progress=' + Math.round((w.__zeehoIOS && w.__zeehoIOS.generation) || 0)
+        + '\nbodyChildren=' + d.body.children.length
+        + ' bodyLen=' + (d.body.innerHTML || '').length
+        + '\nstage.display=' + (cs ? cs.display : 'n/a')
+        + ' stage.opacity=' + (cs ? cs.opacity : 'n/a')
+        + ' stage.visibility=' + (cs ? cs.visibility : 'n/a')
+        + ' stage.zIndex=' + (cs ? cs.zIndex : 'n/a');
+      d.body.appendChild(bar);
+    } catch (e) { /* 取证失败就算了 */ }
+  }, 6000);
+
   if (w !== w.top || w.location.origin !== config.origin
     || config.paths.indexOf(w.location.pathname) < 0) {
     // 这里 return 会让整页没有原生桥，是最常见的白屏原因，必须报出来。
