@@ -28,15 +28,16 @@ final class RootRouter: UIViewController {
     override func viewDidLoad() {
         super.viewDidLoad()
         view.backgroundColor = .systemBackground
-    }
-
-    override func viewDidAppear(_ animated: Bool) {
-        super.viewDidAppear(animated)
-        guard !settled else { return }
+        // 在 viewDidLoad 就把内容装上：viewDidAppear 期间窗口是空白的，
+        // 冷启动会先闪一帧黑屏。约束布局不依赖 bounds，提前装没有副作用。
         settled = true
         // 持久化的线路要在任何导航之前应用，否则白名单与起始地址会不一致。
         IOSPanelLine.applyPersisted()
         route()
+    }
+
+    override func viewDidAppear(_ animated: Bool) {
+        super.viewDidAppear(animated)
     }
 
     private func route() {
@@ -62,9 +63,10 @@ final class RootRouter: UIViewController {
         let controller = PanelController()
         panel = controller
         addChild(controller)
-        controller.view.frame = view.bounds
-        controller.view.autoresizingMask = [.flexibleWidth, .flexibleHeight]
-        view.addSubview(controller.view)
+        // 用约束而不是 frame：RootRouter 是 window 的 rootViewController，
+        // route() 触发时 view.bounds 可能还是 zero，写死 frame 会让子视图永远 0×0，
+        // 表现就是「只有 toolbar 可见、所有按钮点不动」。
+        attach(controller.view)
         controller.didMove(toParent: self)
         controller.onBootFailure = { [weak self] reason in
             self?.switchToRecovery(reason: reason)
@@ -81,10 +83,20 @@ final class RootRouter: UIViewController {
             self.showPanel()
         }
         addChild(controller)
-        controller.view.frame = view.bounds
-        controller.view.autoresizingMask = [.flexibleWidth, .flexibleHeight]
-        view.addSubview(controller.view)
+        attach(controller.view)
         controller.didMove(toParent: self)
+    }
+
+    /// 子控制器铺满 RootRouter：约束到 view 四边，不依赖当时的 bounds。
+    private func attach(_ child: UIView) {
+        child.translatesAutoresizingMaskIntoConstraints = false
+        view.addSubview(child)
+        NSLayoutConstraint.activate([
+            child.topAnchor.constraint(equalTo: view.topAnchor),
+            child.bottomAnchor.constraint(equalTo: view.bottomAnchor),
+            child.leadingAnchor.constraint(equalTo: view.leadingAnchor),
+            child.trailingAnchor.constraint(equalTo: view.trailingAnchor)
+        ])
     }
 
     private func dismissRecovery() {

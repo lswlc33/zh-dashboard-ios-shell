@@ -57,11 +57,15 @@ final class RecoveryViewController: UIViewController {
 
     private func buildUI() {
         let toolbar = makeToolbar()
+        // 三个容器都必须关掉 autoresizing 转约束：漏掉的话它们保持 frame = .zero，
+        // 加上的约束会被忽略，整页只剩 toolbar 可见且点不动。
+        toolbar.translatesAutoresizingMaskIntoConstraints = false
         view.addSubview(toolbar)
 
         // 欢迎区滚动容器：fillViewport 等价，内容少时也能把欢迎区推到窗口中心。
         scrollView.alwaysBounceVertical = true
         scrollView.showsVerticalScrollIndicator = false
+        scrollView.translatesAutoresizingMaskIntoConstraints = false
         view.addSubview(scrollView)
         scrollContent.translatesAutoresizingMaskIntoConstraints = false
         scrollView.addSubview(scrollContent)
@@ -105,6 +109,7 @@ final class RecoveryViewController: UIViewController {
         // 底栏滚动容器：安卓限高 60% 屏高，大字体时滚动而不是挤掉欢迎区。
         footerScroll.alwaysBounceVertical = false
         footerScroll.showsVerticalScrollIndicator = false
+        footerScroll.translatesAutoresizingMaskIntoConstraints = false
         view.addSubview(footerScroll)
         footerStack.axis = .vertical
         footerStack.spacing = 0
@@ -115,16 +120,24 @@ final class RecoveryViewController: UIViewController {
         footerStack.addArrangedSubview(enterButton)
 
         // 系统栏与 home indicator 统一避让整个布局（等价安卓 root 的 insets listener）。
+        //
+        // 布局要点：底栏高度由内容自己撑开（不是靠 scrollView 的 contentLayoutGuide 反推），
+        // 欢迎区吃掉剩余空间并把内容居中。之前把 scrollView.bottom 绑到 footerScroll.top、
+        // 同时 footerScroll 只有 ≤60% 上限没有确定高度，两个都塌成 0，
+        // 结果整棵树被压扁：只剩 toolbar 可见且点不动。
         let guide = view.safeAreaLayoutGuide
         NSLayoutConstraint.activate([
             toolbar.topAnchor.constraint(equalTo: guide.topAnchor),
             toolbar.leadingAnchor.constraint(equalTo: view.leadingAnchor),
             toolbar.trailingAnchor.constraint(equalTo: view.trailingAnchor),
 
+            // 欢迎区：占据 toolbar 与底栏之间的全部剩余空间。
             scrollView.topAnchor.constraint(equalTo: toolbar.bottomAnchor),
             scrollView.leadingAnchor.constraint(equalTo: view.leadingAnchor),
             scrollView.trailingAnchor.constraint(equalTo: view.trailingAnchor),
             scrollView.bottomAnchor.constraint(equalTo: footerScroll.topAnchor),
+            // 保证欢迎区至少有一块可用高度，避免被底栏挤成 0。
+            scrollView.heightAnchor.constraint(greaterThanOrEqualToConstant: 120),
 
             scrollContent.topAnchor.constraint(equalTo: scrollView.contentLayoutGuide.topAnchor),
             scrollContent.leadingAnchor.constraint(equalTo: scrollView.contentLayoutGuide.leadingAnchor),
@@ -132,20 +145,19 @@ final class RecoveryViewController: UIViewController {
             scrollContent.bottomAnchor.constraint(equalTo: scrollView.contentLayoutGuide.bottomAnchor),
             // 内容宽度跟视口一致：fillViewport 的等价做法。
             scrollContent.widthAnchor.constraint(equalTo: scrollView.frameLayoutGuide.widthAnchor),
-            // 内容至少和视口一样高，欢迎区才能靠居中约束落在窗口中心。
+            // 内容至少和视口一样高，欢迎区才能靠居中约束落在视口中心。
             scrollContent.heightAnchor.constraint(greaterThanOrEqualTo: scrollView.frameLayoutGuide.heightAnchor),
 
             welcomeGroup.leadingAnchor.constraint(equalTo: scrollContent.leadingAnchor, constant: 24),
             welcomeGroup.trailingAnchor.constraint(equalTo: scrollContent.trailingAnchor, constant: -24),
-            // 以整个滚动视口的中心定位（安卓用窗口中心 + 底栏碰撞避让，这里等价）。
             welcomeGroup.centerYAnchor.constraint(equalTo: scrollView.frameLayoutGuide.centerYAnchor),
             welcomeGroup.topAnchor.constraint(greaterThanOrEqualTo: scrollContent.topAnchor, constant: 8),
             welcomeGroup.bottomAnchor.constraint(lessThanOrEqualTo: scrollContent.bottomAnchor, constant: -8),
 
+            // 底栏：贴底、由内容撑高，只加 60% 屏高上限（大字体时内部滚动）。
             footerScroll.leadingAnchor.constraint(equalTo: view.leadingAnchor),
             footerScroll.trailingAnchor.constraint(equalTo: view.trailingAnchor),
             footerScroll.bottomAnchor.constraint(equalTo: guide.bottomAnchor),
-            // 60% 屏高上限：大字体时底栏自己滚，不把欢迎区挤没。
             footerScroll.heightAnchor.constraint(lessThanOrEqualTo: view.heightAnchor, multiplier: 0.6),
 
             footerStack.topAnchor.constraint(equalTo: footerScroll.contentLayoutGuide.topAnchor),
@@ -154,6 +166,11 @@ final class RecoveryViewController: UIViewController {
             footerStack.bottomAnchor.constraint(equalTo: footerScroll.contentLayoutGuide.bottomAnchor, constant: -8),
             footerStack.widthAnchor.constraint(equalTo: footerScroll.frameLayoutGuide.widthAnchor, constant: -48)
         ])
+        // 底栏高度 = 内容高度（低优先级），上限约束生效时它会被压低并允许内部滚动。
+        let footerFit = footerScroll.heightAnchor.constraint(
+            equalTo: footerScroll.contentLayoutGuide.heightAnchor)
+        footerFit.priority = .defaultHigh
+        footerFit.isActive = true
     }
 
     private func makeToolbar() -> UIView {

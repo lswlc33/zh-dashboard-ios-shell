@@ -73,6 +73,15 @@ assert 'enterButton.isEnabled = ready && !busy' in recovery
 # 欢迎页不创建 WebView，也不调用 JS（文案里提到 WKWebView 是正常的，检查真实类型/调用）。
 assert 'WKWebView(' not in recovery and 'evaluateJavaScript' not in recovery
 assert 'import WebKit' not in recovery
+# 每个加约束的子视图都必须关掉 autoresizing 转约束，否则 frame 保持 .zero、
+# 约束被忽略，整页只剩 toolbar 可见且点不动（真机踩过）。
+for name in ('toolbar', 'scrollView', 'footerScroll', 'scrollContent', 'welcomeGroup', 'footerStack'):
+    assert f'{name}.translatesAutoresizingMaskIntoConstraints = false' in recovery, name
+# 底栏高度由内容撑开，只留 60% 屏高上限；不能只有上限没有确定高度（会塌成 0）。
+assert 'footerScroll.heightAnchor.constraint(lessThanOrEqualTo: view.heightAnchor, multiplier: 0.6)' in recovery
+assert 'footerScroll.contentLayoutGuide.heightAnchor' in recovery
+# 欢迎区要落在滚动视口中心（安卓以窗口中心定位）。
+assert 'welcomeGroup.centerYAnchor.constraint(equalTo: scrollView.frameLayoutGuide.centerYAnchor)' in recovery
 
 # 资源快照：清单与自定义 scheme 必须一致，否则本地页面缺资源。
 cache = (root / 'PanelCache.swift').read_text(encoding='utf-8')
