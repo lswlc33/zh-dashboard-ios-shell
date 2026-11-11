@@ -300,27 +300,38 @@ final class PanelController: UIViewController, WKNavigationDelegate, WKUIDelegat
     /// 有可用快照时把主文档改写到本地 scheme；否则返回 nil 表示走网络。
     /// 放在这里而不是 PanelNavigation，是因为它要读 IOSPanelCache，
     /// 而 Navigation.swift 必须能被 navigation-test.swift 单独编译。
+    /// 主文档**始终走线上 https**。
+    ///
+    /// 之前试过把主文档改写到 zeeho-panel:// 自定义 scheme 以便离线启动，但实测
+    /// 网页在非 http(s) scheme 下会白屏：WebKit 对自定义 scheme 的存储/安全上下文
+    /// 处理与 https 不同，产物里依赖这些的启动代码会静默失败。
+    /// 本地快照仍然下载、仍然保留（用于欢迎页的初始化进度与后续离线缓存方案），
+    /// 只是不再接管主文档。
     private static func localSnapshotURL(for url: URL) -> URL? {
-        guard IOSPanelCache.shared.snapshotDirectory() != nil else { return nil }
-        guard PanelNavigation.isPanel(url) else { return nil }
-        guard url.scheme?.lowercased() != PanelNavigation.localScheme else { return nil }
-        return PanelNavigation.localURL(matching: url)
+        return nil
     }
 
     private func preparePanel(_ url: URL) {
         web.stopLoading()
-        guard let bridge = bridge else { return }
+        guard let bridge = bridge else {
+            IOSDiagnostics.shared.log("preparePanel: bridge 未就绪")
+            return
+        }
         // 有本地快照就把主文档改写到 zeeho-panel://，弱网/离线也能进；
         // 没快照保持线上 https，行为与以前一致。
         let target = Self.localSnapshotURL(for: url) ?? url
         // 记录本轮是否走本地：本地加载失败要能自动回退线上，否则用户会看到白屏。
         usingLocalSnapshot = target.scheme?.lowercased() == PanelNavigation.localScheme
+        IOSDiagnostics.shared.log("preparePanel: url=\(url.absoluteString) target=\(target.absoluteString) local=\(usingLocalSnapshot)")
         bridge.prepareNavigation(to: target) { [weak self] result in
             guard let self = self else { return }
             switch result {
             case let .success(target):
+                IOSDiagnostics.shared.log("prepareNavigation OK -> \(target.absoluteString)")
                 self.web.load(URLRequest(url: target, cachePolicy: .reloadIgnoringLocalCacheData, timeoutInterval: 30))
-            case let .failure(error): self.showError(error)
+            case let .failure(error):
+                IOSDiagnostics.shared.log("prepareNavigation FAILED: \(error)")
+                self.showError(error)
             }
         }
     }
@@ -335,12 +346,44 @@ final class PanelController: UIViewController, WKNavigationDelegate, WKUIDelegat
         return true
     }
 
+    func webView(_ webView: WKWebView, didStartProvisionalNavigation navigation: WKNavigation!) {
+        IOSDiagnostics.shared.log("didStartProvisionalNavigation")
+    }
+
+    func webView(_ webView: WKWebView, didCommit navigation: WKNavigation!) {
+        IOSDiagnostics.shared.log("didCommit: \(webView.url?.absoluteString ?? "nil")")
+    }
+
     func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
+        IOSDiagnostics.shared.log("didFinish: \(webView.url?.absoluteString ?? "nil")")
         // 页面首帧就绪后清掉失败标记，下次冷启动直接进面板。
         BootHealth.clear()
         // 诊断：didFinish 只代表文档加载完，不代表网页画出了内容。
-        // 白屏时这里能把真实原因（桥没注入 / JS 抛错 / body 为空）挖出来。
         diagnoseIfBlank()
+    }
+
+    func webView(_ webView: WKWebView, didFailProvisionalNavigation navigation: WKNavigation!, withError error: Error) {
+        IOSDiagnostics.shared.log("didFailProvisionalNavigation: \(error.localizedDescription) (\((error as NSError).code))")
+        showError(error)
+    }
+
+    func webView(_ webView: WKWebView, didFail navigation: WKNavigation!, withError error: Error) {
+        IOSDiagnostics.shared.log("didFail: \(error.localizedDescription) (\((error as NSError).code))")
+        showError(error)
+    }
+
+    func webViewWebContentProcessDidTerminate(_ webView: WKWebView) {
+        IOSDiagnostics.shared.log("webContentProcessDidTerminate")
+        onBootFailure?("renderer")
+    }
+
+    private func showError(_ error: Error) {
+        guard (error as NSError).code != NSURLErrorCancelled else { return }
+        // 本地快照读不出来（文件被清、权限问题）先自动回退线上，别让用户看白屏。
+        if fallbackToNetwork() { return }
+        bridge?.navigationFailed()
+        BootHealth.failed(reason: "load_failed")
+        onBootFailure?("load_failed")
     }
 
     /// 文档加载完成后检查页面是否真的画出了东西；空的话把细节打印到日志。
@@ -373,10 +416,11 @@ final class PanelController: UIViewController, WKNavigationDelegate, WKUIDelegat
         web.evaluateJavaScript(probe) { [weak self] value, error in
             guard let self = self else { return }
             if let error = error {
-                NSLog("[ZeehoIOS] probe failed: %@", String(describing: error))
+                IOSDiagnostics.shared.log("probe FAILED: \(error)")
                 return
             }
-            NSLog("[ZeehoIOS] probe: %@", String(describing: value ?? "nil"))
+            let text = String(describing: value ?? "nil")
+            IOSDiagnostics.shared.log("probe: \(text)")
             // 探测到致命错误时，把它也贴到原生侧，方便用户截图反馈。
             guard let text = value as? String,
                   let data = text.data(using: .utf8),
@@ -391,9 +435,24 @@ final class PanelController: UIViewController, WKNavigationDelegate, WKUIDelegat
             // 直接切回线上 https，用户至少能进面板，而不是盯着白屏。
             let childCount = object["childCount"] as? Int ?? 0
             if childCount == 0, self.usingLocalSnapshot {
+                IOSDiagnostics.shared.log("body 为空且在用本地快照，回退线上")
                 self.fallbackToNetwork()
+                return
+            }
+            // 线上也空：这是真白屏，把日志弹给用户，让他能发给我。
+            if childCount == 0 {
+                IOSDiagnostics.shared.log("body 为空且已走线上——真白屏，弹出诊断")
+                self.presentDiagnostics()
             }
         }
+    }
+
+    /// 白屏兜底：把诊断日志做成可滚动文本 + 分享按钮，用户能直接发出去。
+    private func presentDiagnostics() {
+        guard presentedViewController == nil else { return }
+        let controller = DiagnosticsViewController()
+        controller.modalPresentationStyle = .pageSheet
+        present(controller, animated: true)
     }
 
     /// 把网页报告的致命错误显示成原生浮层，用户能直接截图。
@@ -409,26 +468,6 @@ final class PanelController: UIViewController, WKNavigationDelegate, WKUIDelegat
         present(alert, animated: true)
     }
 
-    func webView(_ webView: WKWebView, didFailProvisionalNavigation navigation: WKNavigation!, withError error: Error) {
-        showError(error)
-    }
-
-    func webView(_ webView: WKWebView, didFail navigation: WKNavigation!, withError error: Error) {
-        showError(error)
-    }
-
-    func webViewWebContentProcessDidTerminate(_ webView: WKWebView) {
-        onBootFailure?("renderer")
-    }
-
-    private func showError(_ error: Error) {
-        guard (error as NSError).code != NSURLErrorCancelled else { return }
-        // 本地快照读不出来（文件被清、权限问题）先自动回退线上，别让用户看白屏。
-        if fallbackToNetwork() { return }
-        bridge?.navigationFailed()
-        BootHealth.failed(reason: "load_failed")
-        onBootFailure?("load_failed")
-    }
 
     func webView(_ webView: WKWebView, decidePolicyFor action: WKNavigationAction,
                  decisionHandler: @escaping (WKNavigationActionPolicy) -> Void) {

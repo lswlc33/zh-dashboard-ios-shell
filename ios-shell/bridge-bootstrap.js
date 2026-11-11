@@ -7,6 +7,16 @@
   // 加载失败，直接把原因画在页面上——比白屏让用户猜好得多。
   // 正常运行时这个面板永远不显示，也不影响任何业务逻辑。
   function showFatal(title, detail) {
+    var full = title + '\n' + detail;
+    // 同时通过桥写进原生日志文件：用户能导出这份文件，比截图信息量大得多。
+    // 桥可能还没就绪（这本身就是一种失败原因），所以放在 try 里。
+    try {
+      var handler = w.webkit && w.webkit.messageHandlers && w.webkit.messageHandlers.zeehoIOS;
+      if (handler && w.__zeehoIOS) {
+        handler.postMessage({ version: 1, nonce: w.__zeehoIOS.nonce, id: 'diag-' + Date.now(),
+          method: 'app.diag', args: [{ message: full.slice(0, 3000) }] });
+      }
+    } catch (e) { /* 诊断通道失败不影响显示 */ }
     try {
       var paint = function () {
         if (!w.document || !w.document.body) return;

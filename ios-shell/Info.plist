@@ -29,5 +29,9 @@
         <string>location</string>
     </array>
     <key>NSSupportsLiveActivities</key><true/>
+    <!-- 诊断日志写在 Documents，开这两个键才能在「文件」App 里看到并导出。
+         白屏时用户需要把日志发给开发者，不连电脑也能做到。 -->
+    <key>UIFileSharingEnabled</key><true/>
+    <key>LSSupportsOpeningDocumentsInPlace</key><true/>
     <key>LSApplicationQueriesSchemes</key><array><string>iosamap</string></array>
 </dict></plist>

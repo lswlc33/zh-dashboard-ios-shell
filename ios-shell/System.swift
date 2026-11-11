@@ -26,7 +26,7 @@ final class IOSSystemService: NSObject, IOSBridgeCancellableService, IOSBridgeMe
 
     let methods = [
         "file.share", "file.save", "clipboard.write", "clipboard.read",
-        "app.info", "app.appearance", "app.settings", "notifications.status", "notifications.request",
+        "app.info", "app.appearance", "app.settings", "app.diag", "notifications.status", "notifications.request",
         "notifications.schedule", "notifications.cancel", "media.permission", "photos.save"
     ]
 
@@ -126,6 +126,16 @@ final class IOSSystemService: NSObject, IOSBridgeCancellableService, IOSBridgeMe
                 case "app.info":
                     guard options.isEmpty else { throw Failure(IOSStrings.invalidArguments) }
                     reply(self.appInfo(), nil)
+                case "app.diag":
+                    // 网页把自己的错误写进原生日志文件：白屏时用户导出这份文件即可。
+                    // 只接受一条短文本，不做任何解析，也没有副作用。
+                    guard Set(options.keys) == ["message"],
+                          let message = options["message"] as? String,
+                          message.utf8.count <= 4096 else {
+                        throw Failure(IOSStrings.invalidArguments)
+                    }
+                    IOSDiagnostics.shared.log("web: " + message)
+                    reply(["status": "logged"], nil)
                 case "app.appearance":
                     // 只接受 {dark: Bool}：网页切深浅色时同步状态栏与系统控件明暗。
                     // 不申请权限、不弹确认框——它只改本 App 的外观，没有副作用。

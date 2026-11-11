@@ -54,8 +54,6 @@ assert prepare.index('bridge.prepareNavigation(to: target)') < prepare.index('ca
 assert 'URLRequest(url: target' in prepare
 # 有本地快照时改写到自定义 scheme；没快照保持线上 https。
 assert 'Self.localSnapshotURL(for: url) ?? url' in prepare
-assert 'PanelNavigation.localURL(matching: url)' in controller
-assert 'IOSPanelCache.shared.snapshotDirectory() != nil' in controller
 failure = prepare.split('case let .failure(error):', 1)[1]
 assert 'self.showError(error)' in failure and 'web.load(' not in failure
 error = controller.split('private func showError', 1)[1].split('\n    }', 1)[0]
@@ -115,7 +113,19 @@ assert 'unknown_ticket' in line
 system = (root / 'System.swift').read_text(encoding='utf-8')
 assert '"safeArea": safeAreaJSON()' in system
 assert '"app.appearance"' in system
+assert '"app.diag"' in system
 assert 'overrideUserInterfaceStyle' in system
+
+# 诊断：日志落盘 + 文件共享 + 白屏兜底页，三者缺一用户就交不出线索。
+diagnostics = (root / 'Diagnostics.swift').read_text(encoding='utf-8')
+assert 'zeeho-ios-diagnostics.log' in diagnostics
+assert 'documentDirectory' in diagnostics
+diag_controller = (root / 'DiagnosticsViewController.swift').read_text(encoding='utf-8')
+assert 'UIActivityViewController' in diag_controller and 'IOSDiagnostics.shared.read()' in diag_controller
+assert info.get('UIFileSharingEnabled') is True and info.get('LSSupportsOpeningDocumentsInPlace') is True
+# 主文档必须始终走线上 https：自定义 scheme 下网页会白屏。
+assert 'return nil' in controller.split('private static func localSnapshotURL', 1)[1].split('\n    }', 1)[0]
+assert 'didFinish: ' in controller and 'didFailProvisionalNavigation: ' in controller
 
 # 全部 Swift 源文件都要进构建清单，新增文件漏了会静默不编译。
 # build.sh 从 build-support.py 的 inventory 读文件表，所以检查 inventory 而不是 shell 脚本。
