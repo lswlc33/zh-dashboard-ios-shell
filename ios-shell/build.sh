@@ -153,9 +153,20 @@ fi
 
 # 由 Xcode 扫描真实 executable/framework imports；需要的 Swift compatibility dylib 必须带齐。
 # 不按估计大小省略运行时。失败即阻塞，额外库按实际目标切薄 arm64 再签名。
-xcrun --sdk iphoneos swift-stdlib-tool --copy --platform iphoneos \
-    --scan-executable "$app_dir/Dashboard" --scan-executable "$widget_dir/DashboardWidgets" --scan-folder "$app_dir/Frameworks" \
-    --destination "$app_dir/Frameworks" --filter-for-swift-os
+#
+# --filter-for-swift-os 在部分 Xcode（实测 16.4）的 swift-stdlib-tool 里不存在，传了会直接
+# "Unknown argument" 退出。deployment target 15.4 高于 Swift ABI 稳定线（iOS 12.2），
+# 设备自带 Swift 运行时，通常没有库要拷；所以这里做参数探测：支持就带上，不支持就跳过，
+# 剩下的兼容性 dylib 仍由下面的扫描 + 签名循环兜住。
+stdlib_args=(--copy --platform iphoneos
+    --scan-executable "$app_dir/Dashboard" --scan-executable "$widget_dir/DashboardWidgets"
+    --scan-folder "$app_dir/Frameworks" --destination "$app_dir/Frameworks")
+if xcrun --sdk iphoneos swift-stdlib-tool --help 2>&1 | grep -q -- '--filter-for-swift-os'; then
+    stdlib_args+=(--filter-for-swift-os)
+else
+    printf 'note: swift-stdlib-tool 不支持 --filter-for-swift-os，跳过该过滤（deployment target 15.4 自带运行时）\n'
+fi
+xcrun --sdk iphoneos swift-stdlib-tool "${stdlib_args[@]}"
 while IFS= read -r -d '' dylib; do
     architectures="$(xcrun lipo -archs "$dylib")"
     if [[ "$architectures" != arm64 ]]; then
