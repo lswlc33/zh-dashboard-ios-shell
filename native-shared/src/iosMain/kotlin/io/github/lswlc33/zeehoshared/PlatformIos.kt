@@ -6,6 +6,7 @@ import io.ktor.client.HttpClient
 import io.ktor.client.engine.darwin.Darwin
 import io.ktor.client.plugins.HttpTimeout
 import io.ktor.http.HttpHeaders
+import kotlinx.cinterop.ULongVar
 import kotlinx.cinterop.addressOf
 import kotlinx.cinterop.alloc
 import kotlinx.cinterop.convert
@@ -47,16 +48,17 @@ internal actual fun platformSha256(bytes: ByteArray): ByteArray {
 }
 internal actual fun platformDecryptChallenge(encrypted: ByteArray, key: ByteArray): ByteArray = memScoped {
     val output = ByteArray(encrypted.size + 16)
-    // size_tVar 在 64 位 Apple 平台是 ULongVarOf<ULong>：用 .value 读写，
-    // 且必须显式给 ULong 字面量，不能依赖 convert() 推断。
-    val written = alloc<size_tVar>()
+    // 用 ULongVar 的 ptr 传给 CCCrypt，读回时通过 ptr[0] 取值；
+    // 不用 size_tVar 的 .value（Kotlin/Native 对 ULongVarOf 不暴露该属性）。
+    val written = alloc<ULongVar>()
     written.value = 0uL
     try {
         val status = key.usePinned { keyPtr -> encrypted.usePinned { source -> output.usePinned { target ->
             CCCrypt(
                 kCCDecrypt, kCCAlgorithmAES128, kCCOptionECBMode or kCCOptionPKCS7Padding,
                 keyPtr.addressOf(0), key.size.convert(), null,
-                source.addressOf(0), encrypted.size.convert(), target.addressOf(0), output.size.convert(), written.ptr
+                source.addressOf(0), encrypted.size.convert(), target.addressOf(0), output.size.convert(),
+                written.ptr.reinterpret()
             )
         } } }
         val writtenBytes = written.value.toLong()
@@ -78,10 +80,10 @@ internal actual fun platformHttpClient(): HttpClient = HttpClient(Darwin) {
             requestCachePolicy = NSURLRequestReloadIgnoringLocalCacheData
         }
         configureRequest {
-            // Darwin 引擎的 configureRequest 拿到的是 NSMutableURLRequest（平台类型），
-            // 直接调它的 setValue:forHTTPHeaderField: 与 setCachePolicy:，不走 Ktor 的 header DSL。
-            this.setValue("identity", forHTTPHeaderField = "Accept-Encoding")
-            this.setCachePolicy(NSURLRequestReloadIgnoringLocalCacheData)
+            // Ktor 官方示例就是在 configureRequest 里直接调 NSMutableURLRequest 的方法
+            // （如 setAllowsCellularAccess(true)），receiver 是平台类型，不加 this 也不走 Ktor header DSL。
+            setValue("identity", forHTTPHeaderField = "Accept-Encoding")
+            setCachePolicy(NSURLRequestReloadIgnoringLocalCacheData)
         }
     }
 }
