@@ -461,7 +461,7 @@ final class IOSHistoryService: IOSBridgeService {
               !synthetic(sample) else { return nil }
         // 只有「本轮原始充电证据与上一条已接受采样完全相同」才敢推断状态/供电无边沿；
         // 只要有一个字段变了，就必须交给 KMP 重新判定。
-        guard let previous = known.raw, previous == rawEvidence(snapshot, sample) else { return nil }
+        guard let previous = known.raw, previous == rawEvidence(snapshot, sample, at: at) else { return nil }
         if at <= known.pointAt {
             base["status"] = "out_of_order"; base["sampleAt"] = at
             return base
@@ -487,7 +487,10 @@ final class IOSHistoryService: IOSBridgeService {
         let sampleVehicleAt = integer(sample["vehicleAt"]) ?? 0
         let vehicleOwned = snapshot["vehicleFresh"] as? Bool == true && vehicleAt > 0
             && sampleVehicleAt == vehicleAt && abs(vehicleAt - at) <= 90_000
-        return RawEvidence(charging: integer(sample["charging"]) ?? -1,
+        // charging 字段在 RawEvidence 里是 Int（-1 表示未知），而 integer() 返回 Int64，
+        // 必须显式收敛，否则 Int64 不能隐式转 Int。
+        let charging = Int(integer(sample["charging"]) ?? -1)
+        return RawEvidence(charging: charging,
                            code: boundedText(sample["chargeCode"], limit: 32) ?? "",
                            source: boundedText(sample["chargeSource"], limit: 16) ?? "",
                            lock: vehicleOwned ? (integer(snapshot["lock"]) ?? -1) : -1,
@@ -553,7 +556,7 @@ final class IOSHistoryService: IOSBridgeService {
         report["degraded"] = writeError(request.owner) != nil
         // ⑦ 只回一份：public/js/app/shell.js 读的是 `reply.report || reply`，顶层不再展开同样的
         // report 字段，否则 IPC 体积凭空翻倍（电池点最多约 1MB）。
-        var result: Object = ["report": report, "storageRevision": state.revision]
+        let result: Object = ["report": report, "storageRevision": state.revision]
         return result
     }
 
@@ -579,7 +582,7 @@ final class IOSHistoryService: IOSBridgeService {
         history["healthEstimator"] = "not-implemented"
         // ⑦ 网页读 `reply.history || reply`（public/js/app.js），所以只保留 history 一份。
         // 不再把同一对象的字段展开到顶层：那会让「充电账本约 1MB」的回执直接翻成 2MB。
-        var result: Object = ["history": history, "storageRevision": state.revision]
+        let result: Object = ["history": history, "storageRevision": state.revision]
         return result
     }
 
@@ -975,7 +978,8 @@ final class IOSHistoryService: IOSBridgeService {
     // 目录 fsync 未确认时，回读目标文件核对是否已经是本次要写的内容。
     // 内容一致 = rename 已生效，可以当成功；不一致/读不出 = 真的没写成。
     private func commitConfirmed(_ file: URL, _ bytes: Data) throws -> Bool {
-        guard let current = try? readFile(file), let currentBytes = current else {
+        // readFile 返回 Data?（文件不存在时 nil），所以只做一层可选绑定。
+        guard let currentBytes = try? readFile(file), let currentBytes = currentBytes else {
             throw Failure("history_durability_unconfirmed")
         }
         guard currentBytes == bytes else { throw Failure("history_durability_unconfirmed") }
