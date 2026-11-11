@@ -313,8 +313,11 @@ final class RecoveryViewController: UIViewController {
         let busy = state.busy
         let ready = state.ready
 
-        if state.phase == .downloading, state.total > 0 {
-            let percent = max(0, min(100, Int(Double(state.done) * 100.0 / Double(state.total))))
+        // 百分比一律走 state.progress（以「已完成文件数」为主），
+        // 不再自己拿 done/total 算——Content-Length 在 CDN 压缩时不可信，
+        // 真机上曾因此卡在 90% 不动。
+        if state.phase == .downloading {
+            let percent = max(0, min(100, Int(state.progress * 100)))
             statusLabel.text = String(format: IOSStrings.recoveryStatusProgress, percent)
         } else if ready {
             statusLabel.text = IOSStrings.recoveryStatusDone
@@ -322,35 +325,24 @@ final class RecoveryViewController: UIViewController {
             statusLabel.text = IOSStrings.recoveryStatusPending
         }
 
-        let doneText = Self.formatBytes(state.done)
-        if state.phase == .downloading, state.total > 0 {
-            let bytes = String(format: IOSStrings.recoveryBytes, doneText, Self.formatBytes(state.total))
+        // 资源行：优先显示「已完成 N/M 个」，字节数只作为附加信息。
+        if state.phase == .downloading {
+            let doneText = Self.formatBytes(state.done)
+            let detail: String
+            if state.total > 0 {
+                detail = String(format: IOSStrings.recoveryBytes, doneText, Self.formatBytes(state.total))
+            } else {
+                detail = String(format: IOSStrings.recoveryBytesUnknown, doneText)
+            }
             bytesLabel.text = String(format: IOSStrings.recoveryResourceProgress,
-                                     max(1, state.resourceIndex), max(1, state.resourceCount), bytes)
-        } else if state.phase == .downloading {
-            // 并发下载时 Content-Length 还没回来，先显示已下字节与文件进度。
-            let base = String(format: IOSStrings.recoveryBytesUnknown, doneText)
-            bytesLabel.text = String(format: IOSStrings.recoveryResourceProgress,
-                                     max(1, state.resourceIndex), max(1, state.resourceCount), base)
+                                     state.completedFiles, max(1, state.resourceCount), detail)
         } else {
             bytesLabel.text = ready ? IOSStrings.recoveryReadyHint : ""
         }
         bytesLabel.isHidden = (bytesLabel.text ?? "").isEmpty
 
         progressBar.isHidden = !busy
-        if busy {
-            // 总量未知时用「已完成文件数 / 总数」当比例，别让进度条一直停在 0。
-            let ratio: Double
-            if state.total > 0 {
-                ratio = Double(state.done) / Double(state.total)
-            } else {
-                ratio = Double(state.resourceCount - max(0, state.resourceCount - state.resourceIndex))
-                    / Double(max(1, state.resourceCount))
-            }
-            progressBar.progress = Float(max(0, min(1, ratio)))
-        } else {
-            progressBar.progress = 0
-        }
+        progressBar.progress = busy ? Float(state.progress) : 0
 
         let message = state.error.isEmpty ? reasonMessage() : initErrorMessage(state.error)
         errorLabel.text = message

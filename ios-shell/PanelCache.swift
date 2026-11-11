@@ -39,12 +39,26 @@ final class IOSPanelCache {
         var phase: Phase = .idle
         var done: Int64 = 0
         var total: Int64 = 0
+        /// 已开始下载的资源序号（从 1 起），用于「资源 N/M」。
         var resourceIndex: Int = 0
+        /// 已落盘完成的文件数。进度条以它为准，不依赖 Content-Length。
+        var completedFiles: Int = 0
         var resourceCount: Int = IOSPanelCache.resources.count
         var error: String = ""
         var build: String = ""
         var busy: Bool { phase == .preparing || phase == .downloading }
         var ready: Bool { phase == .ready }
+        /// 进度比例。优先用「已完成文件数 / 总数」——字节数依赖 Content-Length，
+        /// CDN 压缩或缺少响应头时会算错（真机曾卡在 90%）。
+        var progress: Double {
+            if resourceCount > 0, completedFiles > 0 {
+                return min(1, Double(completedFiles) / Double(resourceCount))
+            }
+            if total > 0 {
+                return min(1, Double(done) / Double(total))
+            }
+            return 0
+        }
     }
 
     private enum Failure: Error {
@@ -265,6 +279,9 @@ final class IOSPanelCache {
         var finished = false
         /// 已经计入 totalBytes 的资源下标，避免重复累加 Content-Length。
         var knownSizes = Set<Int>()
+        /// 已完成（落盘成功）的文件数。进度条以它为主，字节数为辅——
+        /// 字节数依赖 Content-Length，CDN 压缩/缺头时不可靠。
+        var completedFiles = 0
         let completion: (Result<Void, Error>) -> Void
 
         init(ticket: Int, count: Int, completion: @escaping (Result<Void, Error>) -> Void) {
@@ -305,8 +322,14 @@ final class IOSPanelCache {
         }
     }
 
-    /// 用并行 HEAD 拿每个资源的大小。任何一项失败都当 0 处理，
-    /// 不影响下载本身——进度条退化到「按文件数」即可。
+    /// 用并行 HEAD 拿每个资源的真实大小。
+    ///
+    /// **必须禁用压缩**：GitHub Pages 对 html/js/json 会回 gzip，HEAD 的
+    /// Content-Length 是压缩后的长度（index.html 3.56MB → 1.02MB），
+    /// 而 URLSession 下载时给的是解压后的字节。两者混用会让进度条算到
+    /// 200%+ 然后卡住（真机实测卡在 90%）。
+    /// 这里显式 `Accept-Encoding: identity` 拿原始大小；拿不到就退回 0，
+    /// 由下载时的实测字节兜底。
     private func probeSizes(base: URL, ticket: Int,
                             completion: @escaping ([Int64]) -> Void) {
         let group = DispatchGroup()
@@ -316,10 +339,16 @@ final class IOSPanelCache {
             guard let url = URL(string: name, relativeTo: base) else { continue }
             var request = URLRequest(url: url, cachePolicy: .reloadIgnoringLocalCacheData, timeoutInterval: 12)
             request.httpMethod = "HEAD"
+            // 关键：要原始字节数，不要压缩后的长度。
+            request.setValue("identity", forHTTPHeaderField: "Accept-Encoding")
             group.enter()
             let job = Self.session.dataTask(with: request) { _, response, _ in
                 defer { group.leave() }
                 guard let http = response as? HTTPURLResponse,
+                      // 服务端仍可能压缩（部分 CDN 无视 identity），
+                      // 那种情况下 Content-Length 不可信，直接放弃这一项。
+                      (http.value(forHTTPHeaderField: "Content-Encoding") ?? "")
+                        .lowercased().contains("gzip") == false,
                       let length = http.value(forHTTPHeaderField: "Content-Length"),
                       let value = Int64(length), value > 0 else { return }
                 lock.lock(); sizes[index] = value; lock.unlock()
@@ -386,6 +415,9 @@ final class IOSPanelCache {
                                      at: destination.deletingLastPathComponent(),
                                      withIntermediateDirectories: true)
                                  try data.write(to: destination, options: [.atomic])
+                                 batch.completedFiles += 1
+                                 self.state.completedFiles = batch.completedFiles
+                                 self.emitState(batch.ticket)
                                  self.pullNext(base: base, staging: staging, batch: batch)
                              } catch {
                                  self.failBatch(batch, Failure.reason("panel_write_failed"))

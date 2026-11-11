@@ -453,9 +453,17 @@ final class IOSSystemService: NSObject, IOSBridgeCancellableService, IOSBridgeMe
         ]
     }
 
-    /// 当前窗口安全区。取不到时返回全 0，网页会回退到 CSS env()。
+    /// 当前窗口安全区。
+    ///
+    /// 视图还没完成首次布局时 `safeAreaInsets` 全是 0——那不是「没有安全区」，
+    /// 而是「还不知道」。这时返回空字典，网页看到缺字段会回退到 CSS env()；
+    /// 若返回 {top:0,bottom:0}，网页会把 --sat/--sab 写成 0px，
+    /// 结果就是进面板后安全区消失（真机反馈）。
     private func safeAreaJSON() -> [String: Any] {
-        let insets = controller()?.view.safeAreaInsets ?? .zero
+        guard let view = controller()?.view else { return [:] }
+        let insets = view.safeAreaInsets
+        // bounds 为 0 说明还没布局；insets 全 0 且窗口有尺寸时才是真的没有安全区。
+        guard view.bounds.width > 0, view.bounds.height > 0 else { return [:] }
         return [
             "top": Double(max(0, insets.top)),
             "bottom": Double(max(0, insets.bottom)),
