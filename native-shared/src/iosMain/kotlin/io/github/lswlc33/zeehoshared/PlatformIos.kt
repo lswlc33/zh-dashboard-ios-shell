@@ -5,16 +5,9 @@ package io.github.lswlc33.zeehoshared
 import io.ktor.client.HttpClient
 import io.ktor.client.engine.darwin.Darwin
 import io.ktor.client.plugins.HttpTimeout
-import io.ktor.http.HttpHeaders
-import kotlinx.cinterop.LongVar
 import kotlinx.cinterop.addressOf
-import kotlinx.cinterop.alloc
 import kotlinx.cinterop.convert
-import kotlinx.cinterop.get
 import kotlinx.cinterop.memScoped
-import kotlinx.cinterop.ptr
-import kotlinx.cinterop.reinterpret
-import kotlinx.cinterop.set
 import kotlinx.cinterop.usePinned
 import platform.CoreCrypto.CCCrypt
 import platform.CoreCrypto.CC_SHA256
@@ -26,8 +19,6 @@ import platform.CoreCrypto.kCCSuccess
 import platform.Foundation.NSDate
 import platform.Foundation.NSRecursiveLock
 import platform.Foundation.NSURLRequestReloadIgnoringLocalCacheData
-import platform.Foundation.timeIntervalSince1970
-import platform.posix.size_tVar
 
 internal actual fun platformNowMillis(): Long =
     (NSDate().timeIntervalSince1970 * 1000).toLong()
@@ -48,22 +39,27 @@ internal actual fun platformSha256(bytes: ByteArray): ByteArray {
 }
 internal actual fun platformDecryptChallenge(encrypted: ByteArray, key: ByteArray): ByteArray = memScoped {
     val output = ByteArray(encrypted.size + 16)
-    // CCCrypt 的 dataOutMoved 在 64 位平台是 size_t = 无符号 64 位；用 LongVar 承接
-    // （LongVarOf<Long> 在 Kotlin/Native 一定暴露 .value），再按位数 reinterpret 成 size_t 指针。
-    val written = alloc<LongVar>()
-    written.value = 0L
+    // CCCrypt 的最后一个参数 dataOutMoved 可为 null（调用方不需要实际写出长度）：
+    // 这里直接传 null，避免依赖 cinterop 的 Var 类型读写 API（ULongVarOf/LongVarOf 在本版
+    // Kotlin/Native 都不暴露 .value），随后用 PKCS7 去填充算出真实长度。
+    val status = key.usePinned { keyPtr -> encrypted.usePinned { source -> output.usePinned { target ->
+        CCCrypt(
+            kCCDecrypt, kCCAlgorithmAES128, kCCOptionECBMode or kCCOptionPKCS7Padding,
+            keyPtr.addressOf(0), key.size.convert(), null,
+            source.addressOf(0), encrypted.size.convert(), target.addressOf(0), output.size.convert(),
+            null
+        )
+    } } }
     try {
-        val status = key.usePinned { keyPtr -> encrypted.usePinned { source -> output.usePinned { target ->
-            CCCrypt(
-                kCCDecrypt, kCCAlgorithmAES128, kCCOptionECBMode or kCCOptionPKCS7Padding,
-                keyPtr.addressOf(0), key.size.convert(), null,
-                source.addressOf(0), encrypted.size.convert(), target.addressOf(0), output.size.convert(),
-                written.ptr.reinterpret()
-            )
-        } } }
-        val writtenBytes = written.value
-        require(status == kCCSuccess && writtenBytes in 0..output.size.toLong()) { "challenge_decryption" }
-        output.copyOf(writtenBytes.toInt())
+        require(status == kCCSuccess) { "challenge_decryption" }
+        // PKCS7 去填充：末字节即填充长度（1..16）；不合法就说明密文/密钥不对。
+        val pad = output.last().toInt() and 0xff
+        require(pad in 1..16 && pad <= output.size) { "challenge_decryption" }
+        val plain = output.copyOf(output.size - pad)
+        require(pad == 1 || (output.size - pad until output.size).all { (output[it].toInt() and 0xff) == pad }) {
+            "challenge_decryption"
+        }
+        plain
     } finally { output.fill(0) }
 }
 internal actual fun platformHttpClient(): HttpClient = HttpClient(Darwin) {
@@ -71,20 +67,18 @@ internal actual fun platformHttpClient(): HttpClient = HttpClient(Darwin) {
     followRedirects = false
     install(HttpTimeout)
     engine {
-        // Ktor 3.6.1 的 KtorNSURLSessionDelegate 明确 completionHandler(null) 禁止 NSURLSession 自带redirect；
-        // 上面的 followRedirects=false 同时关闭 Ktor 层。没有 Retry/ContentNegotiation 插件。
+        // Ktor 3.6.1 的 KtorNSURLSessionDelegate 明确 completionHandler(null) 禁止 NSURLSession 自带 redirect；
+        // 上面的 followRedirects = false 同时关闭 Ktor 层。没有 Retry / ContentNegotiation 插件。
+        //
+        // 这里只做 session 级配置；不再用 configureRequest 设置 Accept-Encoding / cachePolicy：
+        // 该 lambda 的 receiver 是平台类型 NSMutableURLRequest，但 setValue:forHTTPHeaderField: 与
+        // Kotlin 的 KMutableProperty.setValue 扩展重载同名，cachePolicy 又是只读属性，写不出可编译的调用。
+        // 请求级 Cache-Control 由调用方在 headers 里显式给出（TxnPolicy 白名单允许 content-type/accept）。
         configureSession {
             HTTPShouldSetCookies = false
             HTTPCookieStorage = null
             URLCache = null
             requestCachePolicy = NSURLRequestReloadIgnoringLocalCacheData
-        }
-        configureRequest {
-            // 注意：这里不能写 setValue(...)——Kotlin 的 KMutableProperty.setValue 重载会遮蔽
-            // NSMutableURLRequest.setValue:forHTTPHeaderField:。改用 addValue 避免同名冲突，
-            // 缓存策略走属性赋值（cachePolicy 是可变属性）。
-            addValue("identity", forHTTPHeaderField = "Accept-Encoding")
-            cachePolicy = NSURLRequestReloadIgnoringLocalCacheData
         }
     }
 }
