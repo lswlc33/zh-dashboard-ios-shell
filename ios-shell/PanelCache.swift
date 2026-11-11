@@ -49,8 +49,16 @@ final class IOSPanelCache {
     }
 
     private let queue = DispatchQueue(label: "io.github.lswlc33.dashboard.ios.panel-cache", qos: .utility)
+    /// 复用同一个 ephemeral session：每次下载新建一个会漏连接池，也不利于统一取消。
+    private static let session: URLSession = {
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.requestCachePolicy = .reloadIgnoringLocalCacheData
+        configuration.urlCache = nil
+        configuration.httpCookieStorage = nil
+        return URLSession(configuration: configuration)
+    }()
     private var state = State()
-    private var task: URLSessionDownloadTask?
+    private var task: URLSessionDataTask?
     private var generation = 0
     private var cancelled = false
 
@@ -215,72 +223,83 @@ final class IOSPanelCache {
 
     // MARK: - 下载
 
-    private func downloadAll(into staging: URL, ticket: Int,
-                             completion: @escaping (Result<Void, Error>) -> Void) {
-        let base = IOSPanelLine.baseURL()
+    /// 下载进度在闭包间共享，用引用类型而不是闭包捕获 var：
+    /// Swift 6 对「在 @Sendable 闭包里改捕获的可变局部变量」有限制，
+    /// 而且串行队列上的可变状态本来就该是显式对象。
+    private final class DownloadProgress {
         var index = 0
         var totalBytes: Int64 = 0
         var doneBytes: Int64 = 0
         var failed: Error?
+    }
 
-        func step() {
-            guard !cancelled, generation == ticket else {
-                completion(.failure(Failure.reason("panel_cache_cancelled")))
-                return
-            }
-            guard failed == nil else {
-                completion(.failure(failed!))
-                return
-            }
-            guard index < Self.resources.count else {
-                completion(.success(()))
-                return
-            }
-            let name = Self.resources[index]
-            guard let url = URL(string: name, relativeTo: base) else {
-                failed = Failure.reason("panel_resource_url_invalid")
-                step()
-                return
-            }
-            state.phase = .downloading
-            state.resourceIndex = index + 1
-            state.resourceCount = Self.resources.count
+    private func downloadAll(into staging: URL, ticket: Int,
+                             completion: @escaping (Result<Void, Error>) -> Void) {
+        let base = IOSPanelLine.baseURL()
+        let progress = DownloadProgress()
+        stepDownload(base: base, staging: staging, ticket: ticket, progress: progress, completion: completion)
+    }
 
-            download(url) { result in
-                queue.async {
-                    switch result {
-                    case let .failure(error):
-                        failed = error
-                        step()
-                    case let .success(data):
-                        let destination = staging.appendingPathComponent(name, isDirectory: false)
-                        do {
-                            try FileManager.default.createDirectory(at: destination.deletingLastPathComponent(),
-                                                                    withIntermediateDirectories: true)
-                            try data.write(to: destination, options: [.atomic])
-                            totalBytes += Int64(data.count)
-                            doneBytes += Int64(data.count)
-                            state.total = totalBytes
-                            state.done = doneBytes
-                            index += 1
-                            step()
-                        } catch {
-                            failed = Failure.reason("panel_write_failed")
-                            step()
-                        }
+    private func stepDownload(base: URL, staging: URL, ticket: Int,
+                              progress: DownloadProgress,
+                              completion: @escaping (Result<Void, Error>) -> Void) {
+        guard !cancelled, generation == ticket else {
+            completion(.failure(Failure.reason("panel_cache_cancelled")))
+            return
+        }
+        if let failed = progress.failed {
+            completion(.failure(failed))
+            return
+        }
+        guard progress.index < Self.resources.count else {
+            completion(.success(()))
+            return
+        }
+        let name = Self.resources[progress.index]
+        guard let url = URL(string: name, relativeTo: base) else {
+            completion(.failure(Failure.reason("panel_resource_url_invalid")))
+            return
+        }
+        state.phase = .downloading
+        state.resourceIndex = progress.index + 1
+        state.resourceCount = Self.resources.count
+
+        self.download(url) { [weak self] result in
+            guard let self = self else { return }
+            // 回调已在 URLSession 队列上，切回自己的串行队列再改状态。
+            self.queue.async {
+                guard self.generation == ticket else {
+                    completion(.failure(Failure.reason("panel_cache_cancelled")))
+                    return
+                }
+                switch result {
+                case let .failure(error):
+                    completion(.failure(error))
+                case let .success(data):
+                    let destination = staging.appendingPathComponent(name, isDirectory: false)
+                    do {
+                        try FileManager.default.createDirectory(at: destination.deletingLastPathComponent(),
+                                                                withIntermediateDirectories: true)
+                        try data.write(to: destination, options: [.atomic])
+                        progress.totalBytes += Int64(data.count)
+                        progress.doneBytes += Int64(data.count)
+                        self.state.total = progress.totalBytes
+                        self.state.done = progress.doneBytes
+                        progress.index += 1
+                        self.stepDownload(base: base, staging: staging, ticket: ticket,
+                                          progress: progress, completion: completion)
+                    } catch {
+                        completion(.failure(Failure.reason("panel_write_failed")))
                     }
                 }
             }
         }
-        step()
     }
 
     private func download(_ url: URL, completion: @escaping (Result<Data, Error>) -> Void) {
         var request = URLRequest(url: url, cachePolicy: .reloadIgnoringLocalCacheData, timeoutInterval: 30)
         request.setValue("no-cache", forHTTPHeaderField: "Cache-Control")
-        let session = URLSession(configuration: .ephemeral)
-        let job = session.dataTask(with: request) { data, response, error in
-            defer { session.finishTasksAndInvalidate() }
+        let job = Self.session.dataTask(with: request) { data, response, error in
             if let error = error {
                 completion(.failure(Failure.reason((error as NSError).code == NSURLErrorCancelled
                     ? "panel_cache_cancelled" : "panel_download_failed")))
