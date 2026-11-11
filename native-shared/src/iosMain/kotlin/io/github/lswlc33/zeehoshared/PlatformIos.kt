@@ -6,7 +6,7 @@ import io.ktor.client.HttpClient
 import io.ktor.client.engine.darwin.Darwin
 import io.ktor.client.plugins.HttpTimeout
 import io.ktor.http.HttpHeaders
-import kotlinx.cinterop.ULongVar
+import kotlinx.cinterop.LongVar
 import kotlinx.cinterop.addressOf
 import kotlinx.cinterop.alloc
 import kotlinx.cinterop.convert
@@ -48,10 +48,10 @@ internal actual fun platformSha256(bytes: ByteArray): ByteArray {
 }
 internal actual fun platformDecryptChallenge(encrypted: ByteArray, key: ByteArray): ByteArray = memScoped {
     val output = ByteArray(encrypted.size + 16)
-    // 用 ULongVar 的 ptr 传给 CCCrypt，读回时通过 ptr[0] 取值；
-    // 不用 size_tVar 的 .value（Kotlin/Native 对 ULongVarOf 不暴露该属性）。
-    val written = alloc<ULongVar>()
-    written.value = 0uL
+    // CCCrypt 的 dataOutMoved 在 64 位平台是 size_t = 无符号 64 位；用 LongVar 承接
+    // （LongVarOf<Long> 在 Kotlin/Native 一定暴露 .value），再按位数 reinterpret 成 size_t 指针。
+    val written = alloc<LongVar>()
+    written.value = 0L
     try {
         val status = key.usePinned { keyPtr -> encrypted.usePinned { source -> output.usePinned { target ->
             CCCrypt(
@@ -61,8 +61,8 @@ internal actual fun platformDecryptChallenge(encrypted: ByteArray, key: ByteArra
                 written.ptr.reinterpret()
             )
         } } }
-        val writtenBytes = written.value.toLong()
-        require(status == kCCSuccess && writtenBytes <= output.size) { "challenge_decryption" }
+        val writtenBytes = written.value
+        require(status == kCCSuccess && writtenBytes in 0..output.size.toLong()) { "challenge_decryption" }
         output.copyOf(writtenBytes.toInt())
     } finally { output.fill(0) }
 }
@@ -80,10 +80,11 @@ internal actual fun platformHttpClient(): HttpClient = HttpClient(Darwin) {
             requestCachePolicy = NSURLRequestReloadIgnoringLocalCacheData
         }
         configureRequest {
-            // Ktor 官方示例就是在 configureRequest 里直接调 NSMutableURLRequest 的方法
-            // （如 setAllowsCellularAccess(true)），receiver 是平台类型，不加 this 也不走 Ktor header DSL。
-            setValue("identity", forHTTPHeaderField = "Accept-Encoding")
-            setCachePolicy(NSURLRequestReloadIgnoringLocalCacheData)
+            // 注意：这里不能写 setValue(...)——Kotlin 的 KMutableProperty.setValue 重载会遮蔽
+            // NSMutableURLRequest.setValue:forHTTPHeaderField:。改用 addValue 避免同名冲突，
+            // 缓存策略走属性赋值（cachePolicy 是可变属性）。
+            addValue("identity", forHTTPHeaderField = "Accept-Encoding")
+            cachePolicy = NSURLRequestReloadIgnoringLocalCacheData
         }
     }
 }
