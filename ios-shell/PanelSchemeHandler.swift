@@ -29,8 +29,11 @@ final class IOSPanelSchemeHandler: NSObject, WKURLSchemeHandler {
             return
         }
         // 只暴露快照目录内的普通文件：拒绝 `..`、绝对路径与符号链接。
-        let relative = url.path.hasPrefix("/") ? String(url.path.dropFirst()) : url.path
-        guard !relative.isEmpty, !relative.contains(".."), !relative.hasPrefix("/") else {
+        // 空路径与 `/` 都映射到 index.html：主文档请求的是 `zeeho-panel://panel/`，
+        // 不处理的话首屏直接 404。
+        let raw = url.path.hasPrefix("/") ? String(url.path.dropFirst()) : url.path
+        let relative = raw.isEmpty ? "index.html" : raw
+        guard !relative.contains(".."), !relative.hasPrefix("/") else {
             fail(urlSchemeTask, code: NSURLErrorBadURL)
             return
         }

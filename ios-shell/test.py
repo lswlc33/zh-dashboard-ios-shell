@@ -139,7 +139,15 @@ diag_controller = (root / 'DiagnosticsViewController.swift').read_text(encoding=
 assert 'UIActivityViewController' in diag_controller and 'IOSDiagnostics.shared.read()' in diag_controller
 assert info.get('UIFileSharingEnabled') is True and info.get('LSSupportsOpeningDocumentsInPlace') is True
 # 主文档必须始终走线上 https：自定义 scheme 下网页会白屏。
-assert 'return nil' in controller.split('private static func localSnapshotURL', 1)[1].split('\n    }', 1)[0]
+# 主文档必须优先走本地快照：线上产物 3.56MB，window.APP 定义在 82%、
+# startBoot 在 99%，移动网络下首屏要等十几秒，期间 readyState 一直 loading
+# 不触发布局 → 用户看到可缩放拖动的白屏（真机日志实测）。
+snapshot_fn = controller.split('private static func localSnapshotURL', 1)[1].split('\n    }', 1)[0]
+assert 'return PanelNavigation.localURL(matching: url)' in snapshot_fn
+assert 'IOSPanelCache.shared.snapshotDirectory() != nil' in snapshot_fn
+# 加载进度要可观测，否则 didFinish 不触发时无从判断卡在哪。
+assert 'estimatedProgress' in controller
+assert 'beginBootWatch' in controller
 assert 'didFinish: ' in controller and 'didFailProvisionalNavigation: ' in controller
 
 # 全部 Swift 源文件都要进构建清单，新增文件漏了会静默不编译。

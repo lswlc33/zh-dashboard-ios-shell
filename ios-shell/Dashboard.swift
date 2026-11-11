@@ -159,7 +159,17 @@ final class PanelController: UIViewController, WKNavigationDelegate, WKUIDelegat
         // 本地快照走自定义 scheme；没有快照时这个 handler 不会被用到。
         configuration.setURLSchemeHandler(IOSPanelSchemeHandler(rootProvider: { IOSPanelCache.shared.snapshotDirectory() }),
                                           forURLScheme: IOSPanelSchemeHandler.scheme)
+        // 允许内联播放（充电动画等视频素材），并让页面能自动播放。
+        configuration.allowsInlineMediaPlayback = true
+        configuration.mediaTypesRequiringUserActionForPlayback = []
+        // 本地快照的持久化：默认用非持久 store 会让 localStorage 每次冷启动清零，
+        // 账号 token 就丢了。显式用 default() 保证与线上同源行为。
+        configuration.websiteDataStore = .default()
         let view = WKWebView(frame: .zero, configuration: configuration)
+        // 自定义 scheme 在 WK 里默认不是 secure context，localStorage / crypto.subtle
+        // 会抛 SecurityError。注册成「可被当作安全来源」需要私有 API，
+        // 这里不碰私有 API；网页的 store.js 已对 localStorage 做了 try/catch，
+        // 真跑不通时下面的 fallbackToNetwork 会兜住。
         return view
     }()
     private var bridge: IOSBridge?
@@ -313,18 +323,22 @@ final class PanelController: UIViewController, WKNavigationDelegate, WKUIDelegat
         preparePanel(PanelNavigation.home)
     }
 
-    /// 有可用快照时把主文档改写到本地 scheme；否则返回 nil 表示走网络。
-    /// 放在这里而不是 PanelNavigation，是因为它要读 IOSPanelCache，
-    /// 而 Navigation.swift 必须能被 navigation-test.swift 单独编译。
-    /// 主文档**始终走线上 https**。
+    /// 有可用本地快照就把主文档改写到 zeeho-panel://；没有才走线上。
     ///
-    /// 之前试过把主文档改写到 zeeho-panel:// 自定义 scheme 以便离线启动，但实测
-    /// 网页在非 http(s) scheme 下会白屏：WebKit 对自定义 scheme 的存储/安全上下文
-    /// 处理与 https 不同，产物里依赖这些的启动代码会静默失败。
-    /// 本地快照仍然下载、仍然保留（用于欢迎页的初始化进度与后续离线缓存方案），
-    /// 只是不再接管主文档。
+    /// 走本地是必须的：线上产物是 3.56MB 单文件，`window.APP` 定义在 82%、
+    /// `startBoot()` 在 99%，移动网络下首屏要等十几秒；期间 WebKit 一直停在
+    /// readyState=loading，不触发布局，用户看到的就是可缩放拖动的白屏
+    /// （真机日志实测：estimatedProgress 卡在 30%，didFinish 永不触发）。
+    /// 本地读取是 0 延迟，readyState 立刻 complete。
+    ///
+    /// 之前这里返回 nil 是因为自定义 scheme 下 bootstrap 的 origin 校验失败
+    /// （写死 https://host 而实际是 zeeho-panel://panel），那个 bug 已在
+    /// Bridge.swift 里改成从实际 target 推导 origin 修掉了。
     private static func localSnapshotURL(for url: URL) -> URL? {
-        return nil
+        guard IOSPanelCache.shared.snapshotDirectory() != nil else { return nil }
+        guard PanelNavigation.isPanel(url) else { return nil }
+        guard url.scheme?.lowercased() != PanelNavigation.localScheme else { return nil }
+        return PanelNavigation.localURL(matching: url)
     }
 
     private func preparePanel(_ url: URL) {
