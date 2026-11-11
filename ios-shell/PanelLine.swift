@@ -11,7 +11,9 @@ enum IOSPanelLine: String {
 
     private static let defaultsKey = "io.github.lswlc33.dashboard.ios.panel-line"
 
-    /// 当前选中的线路。默认 GitHub Pages（与历史行为一致）。
+    /// 当前选中的线路。默认 GitHub Pages。
+    /// 注意：用户一旦在更新面板里选过，就会持久化在 UserDefaults 里——
+    /// 换版本后不会自动回到 GitHub，这是有意的（尊重用户选择）。
     static var current: IOSPanelLine {
         get {
             let raw = UserDefaults.standard.string(forKey: defaultsKey) ?? ""

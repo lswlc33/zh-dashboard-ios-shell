@@ -22,6 +22,27 @@ enum PanelNavigation {
         return [String(root.dropLast()), root, root + "index.html"]
     }
 
+    /// 规范化 origin 用于比较。
+    ///
+    /// 不能直接比 `URLComponents.host` 字符串：Cloudflare 线路用的是国际化域名
+    /// `zhb.xn--fiqz59cpva341l.top`，Foundation 在不同入口可能给出 punycode
+    /// 或 Unicode 两种形式，字符串不等就会把自家首页判成「非面板」——
+    /// 真机上表现为点「进入面板」后 navigation_not_allowed 直接白屏。
+    /// 统一走 `URL` 的绝对字符串（Foundation 会做规范化）再比。
+    private static func originKey(_ url: URL) -> String {
+        guard let parts = URLComponents(url: url, resolvingAgainstBaseURL: false) else { return "" }
+        let scheme = (parts.scheme ?? "").lowercased()
+        // 优先用 percentEncodedHost（punycode 原样），退化到 host。
+        let host = (parts.percentEncodedHost ?? parts.host ?? "").lowercased()
+        // 国际化域名再兜一层：转成 punycode 形式比较。
+        let canonical = URL(string: "https://\(host)")?.host?.lowercased() ?? host
+        let port = (parts.port == nil || parts.port == 443) ? "" : ":\(parts.port!)"
+        return "\(scheme)://\(canonical)\(port)"
+    }
+
+    /// 主文档 origin（基准）。
+    private static var homeOriginKey: String { originKey(home) }
+
     static func isPanel(_ url: URL) -> Bool {
         // 本地快照：zeeho-panel://panel/... 只有主文档可拥有原生桥。
         if url.scheme?.lowercased() == localScheme {
@@ -32,9 +53,13 @@ enum PanelNavigation {
         }
         guard let parts = URLComponents(url: url, resolvingAgainstBaseURL: false) else { return false }
         // Pages 同域还托管产物等页面；只有面板主文档可拥有原生桥。
-        return parts.scheme?.lowercased() == "https" && parts.host?.lowercased() == home.host?.lowercased()
-            && (parts.port == nil || parts.port == 443) && parts.user == nil && parts.password == nil
-            && allowedPaths().contains(parts.percentEncodedPath)
+        guard parts.scheme?.lowercased() == "https",
+              parts.user == nil, parts.password == nil,
+              parts.port == nil || parts.port == 443 else { return false }
+        // origin 比较走规范化后的 key，避免国际化域名两种形态被当成不同站点。
+        guard originKey(url) == homeOriginKey else { return false }
+        // 路径按 base 的相对根判断，支持任意线路基址。
+        return allowedPaths().contains(parts.percentEncodedPath)
     }
 
     static func navigationID(in url: URL) -> String {
