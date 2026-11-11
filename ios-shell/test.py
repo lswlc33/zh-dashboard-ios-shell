@@ -147,10 +147,20 @@ assert 'didFinish: ' in controller and 'didFailProvisionalNavigation: ' in contr
 # inventory 里的路径带 `ios-shell/` 前缀（相对仓库根）。
 listed = set(inputs['swiftSources'])
 for name in ('RecoveryView.swift', 'PanelCache.swift', 'PanelSchemeHandler.swift',
-             'PanelLine.swift', 'PanelLineService.swift', 'Dashboard.swift'):
+             'PanelLine.swift', 'PanelLineService.swift', 'Dashboard.swift',
+             'Diagnostics.swift', 'DiagnosticsViewController.swift', 'UpdatePanelViewController.swift'):
     assert f'ios-shell/{name}' in listed, name
 # 首屏骨架已由欢迎页取代，不能留孤儿文件。
 assert not (root / 'PanelLoadingView.swift').exists()
+
+# App 图标必须用「满出血、无圆角」的 iOS 专用源：
+# 普通 icon-512 自带 radius=0.28 的透明圆角，iOS 底下衬白底 → 四角白边。
+build_sh = (root / 'build.sh').read_text(encoding='utf-8')
+assert 'public/icons/icon-ios-1024.png' in build_sh
+assert 'public/icons/icon-512.png' not in build_sh
+assert 'public/icons/apple-touch-icon.png' not in build_sh
+# 图标源必须真的存在，缺失时 build.sh 会 BLOCKED 退出。
+assert (root.parent / 'public/icons/icon-ios-1024.png').is_file()
 if len(sys.argv) > 1:
     report = helper.verify_artifacts(sys.argv[1], expected_info=info if pathlib.Path(sys.argv[1]).name == helper.IPA_NAME else None)
     print('Real IPA ZIP/Mach-O/appex/SDK/signature structure/hash checks passed; cryptographic verification depends on the recorded build backend')

@@ -144,8 +144,15 @@ python3 -I "$support" prepare-plist "${plist_args[@]}"
 python3 -I "$script_dir/XtoolSupport/xtool-support.py" prepare-widget --source "$script_dir/Widgets/Info.plist" \
     --host-info "$app_dir/Info.plist" --output "$widget_dir/Info.plist"
 cp "$script_dir/bridge-bootstrap.js" "$app_dir/bridge-bootstrap.js"
+# iOS 自己会给 App 图标切圆角，源图必须是「满出血」的正方形：
+# 用普通 icon-512.png 会在四角留透明区（iOS 底下衬白/黑底 → 四角白边），
+# 而且图中自带的圆角会和系统圆角叠成双层。
+# icon-ios-1024.png 由 tools/make-icons.mjs 的 ios 模式产出：radius=0、内容满幅，
+# 取景与安卓 App 图标一致（普通图标是 radius=0.28，maskable 是内容缩 80%，都不合适）。
+icon_source="$repo_dir/public/icons/icon-ios-1024.png"
+[[ -f "$icon_source" ]] || { printf 'BLOCKED: missing iOS icon source: %s\n' "$icon_source" >&2; exit 2; }
 for size in 120 152 167 180; do
-    sips -z "$size" "$size" "$repo_dir/public/icons/icon-512.png" --out "$app_dir/Icon${size}.png" >/dev/null
+    sips -z "$size" "$size" "$icon_source" --out "$app_dir/Icon${size}.png" >/dev/null
 done
 if [[ "$shared_kind" == dynamic ]]; then
     cp -R "$shared_framework" "$app_dir/Frameworks/ZeehoShared.framework"
