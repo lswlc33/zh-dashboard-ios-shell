@@ -168,6 +168,12 @@ final class PanelController: UIViewController, WKNavigationDelegate, WKUIDelegat
     private var lastSafeArea = UIEdgeInsets.zero
     /// 当前这轮是否在用本地快照；失败时用它决定要不要自动回退线上。
     private var usingLocalSnapshot = false
+    private var bootWatchTimer: Timer?
+    private var bootWatchTick = 0
+    /// 白屏诊断页只弹一次，别在每次看门狗探测时都弹。
+    private var diagnosticsShown = false
+    private var progressToken: NSKeyValueObservation?
+    private var lastLoggedProgress = -10
 
     /// 启动失败回调：交给 RootRouter 切到恢复页。
     var onBootFailure: ((String) -> Void)?
@@ -185,6 +191,16 @@ final class PanelController: UIViewController, WKNavigationDelegate, WKUIDelegat
         web.allowsBackForwardNavigationGestures = true
         // 页面自己按原生给出的 safeArea 留白，不需要 WebView 再叠一层 inset。
         web.scrollView.contentInsetAdjustmentBehavior = .never
+        // 观察加载进度：didFinish 不触发时，至少能知道卡在哪个百分比。
+        progressToken = web.observe(\.estimatedProgress, options: [.new]) { [weak self] webView, _ in
+            guard let self = self else { return }
+            let percent = Int(webView.estimatedProgress * 100)
+            // 每 10% 记一次，避免日志被刷满。
+            if percent >= self.lastLoggedProgress + 10 {
+                self.lastLoggedProgress = percent
+                IOSDiagnostics.shared.log("estimatedProgress: \(percent)% url=\(webView.url?.absoluteString ?? "nil")")
+            }
+        }
         web.translatesAutoresizingMaskIntoConstraints = false
         view.addSubview(web)
         // 四边贴 view 而不是 safeAreaLayoutGuide：内容延伸到状态栏与 home indicator 下面。
@@ -347,7 +363,8 @@ final class PanelController: UIViewController, WKNavigationDelegate, WKUIDelegat
     }
 
     func webView(_ webView: WKWebView, didStartProvisionalNavigation navigation: WKNavigation!) {
-        IOSDiagnostics.shared.log("didStartProvisionalNavigation")
+        IOSDiagnostics.shared.log("didStartProvisionalNavigation: \(webView.url?.absoluteString ?? "nil")")
+        beginBootWatch()
     }
 
     func webView(_ webView: WKWebView, didCommit navigation: WKNavigation!) {
@@ -358,18 +375,52 @@ final class PanelController: UIViewController, WKNavigationDelegate, WKUIDelegat
         IOSDiagnostics.shared.log("didFinish: \(webView.url?.absoluteString ?? "nil")")
         // 页面首帧就绪后清掉失败标记，下次冷启动直接进面板。
         BootHealth.clear()
+        stopBootWatch()
         // 诊断：didFinish 只代表文档加载完，不代表网页画出了内容。
         diagnoseIfBlank()
     }
 
     func webView(_ webView: WKWebView, didFailProvisionalNavigation navigation: WKNavigation!, withError error: Error) {
         IOSDiagnostics.shared.log("didFailProvisionalNavigation: \(error.localizedDescription) (\((error as NSError).code))")
+        stopBootWatch()
         showError(error)
     }
 
     func webView(_ webView: WKWebView, didFail navigation: WKNavigation!, withError error: Error) {
         IOSDiagnostics.shared.log("didFail: \(error.localizedDescription) (\((error as NSError).code))")
+        stopBootWatch()
         showError(error)
+    }
+
+    // MARK: - 启动看门狗
+
+    /// 导航开始后每 2 秒探一次页面状态，最多 10 次（20 秒）。
+    ///
+    /// 为什么不能只靠 didFinish：真机上出现过 didCommit 成功、didFinish 永不触发
+    /// 的情况（页面一直没进 load 完成态），那时所有挂在 didFinish 上的诊断都不会跑，
+    /// 用户只看到一片可缩放拖动的白屏。看门狗不依赖任何 delegate 回调。
+    private func beginBootWatch() {
+        stopBootWatch()
+        bootWatchTick = 0
+        scheduleBootWatch()
+    }
+
+    private func scheduleBootWatch() {
+        guard bootWatchTick < 10 else {
+            IOSDiagnostics.shared.log("bootWatch: 20 秒内未收到 didFinish，停止探测")
+            return
+        }
+        bootWatchTick += 1
+        bootWatchTimer = Timer.scheduledTimer(withTimeInterval: 2.0, repeats: false) { [weak self] _ in
+            guard let self = self else { return }
+            self.diagnoseIfBlank(tag: "bootWatch#\(self.bootWatchTick)")
+            self.scheduleBootWatch()
+        }
+    }
+
+    private func stopBootWatch() {
+        bootWatchTimer?.invalidate()
+        bootWatchTimer = nil
     }
 
     func webViewWebContentProcessDidTerminate(_ webView: WKWebView) {
@@ -386,9 +437,9 @@ final class PanelController: UIViewController, WKNavigationDelegate, WKUIDelegat
         onBootFailure?("load_failed")
     }
 
-    /// 文档加载完成后检查页面是否真的画出了东西；空的话把细节打印到日志。
-    /// 只读探测，不改页面状态。
-    private func diagnoseIfBlank() {
+    /// 检查页面是否真的画出了东西；空的话把细节写进日志。
+    /// 只读探测，不改页面状态。`tag` 用来区分触发时机（didFinish / bootWatch#N）。
+    private func diagnoseIfBlank(tag: String = "didFinish") {
         let probe = """
         (function () {
           try {
@@ -396,8 +447,13 @@ final class PanelController: UIViewController, WKNavigationDelegate, WKUIDelegat
             var info = {
               hasBody: !!b,
               childCount: b ? b.children.length : 0,
+              bodyLen: b ? (b.innerHTML || '').length : 0,
+              readyState: document.readyState,
+              docHeight: Math.round(document.documentElement.scrollHeight || 0),
+              viewportH: Math.round(window.innerHeight || 0),
               hasBootstrap: typeof window.__zeehoIOS !== 'undefined',
               hasIOSBR: typeof window.IOSBR !== 'undefined',
+              iosbrCandidate: !!(window.IOSBR && window.IOSBR.candidate && window.IOSBR.candidate()),
               iosbrAvailable: !!(window.IOSBR && window.IOSBR.available && window.IOSBR.available()),
               preview: window.__zeehoWebPreview === true,
               hasZeehoShell: typeof window.ZeehoShell !== 'undefined',
@@ -416,11 +472,11 @@ final class PanelController: UIViewController, WKNavigationDelegate, WKUIDelegat
         web.evaluateJavaScript(probe) { [weak self] value, error in
             guard let self = self else { return }
             if let error = error {
-                IOSDiagnostics.shared.log("probe FAILED: \(error)")
+                IOSDiagnostics.shared.log("[\(tag)] probe FAILED: \(error)")
                 return
             }
             let text = String(describing: value ?? "nil")
-            IOSDiagnostics.shared.log("probe: \(text)")
+            IOSDiagnostics.shared.log("[\(tag)] probe: \(text)")
             // 探测到致命错误时，把它也贴到原生侧，方便用户截图反馈。
             guard let text = value as? String,
                   let data = text.data(using: .utf8),
@@ -435,13 +491,14 @@ final class PanelController: UIViewController, WKNavigationDelegate, WKUIDelegat
             // 直接切回线上 https，用户至少能进面板，而不是盯着白屏。
             let childCount = object["childCount"] as? Int ?? 0
             if childCount == 0, self.usingLocalSnapshot {
-                IOSDiagnostics.shared.log("body 为空且在用本地快照，回退线上")
+                IOSDiagnostics.shared.log("[\(tag)] body 为空且在用本地快照，回退线上")
                 self.fallbackToNetwork()
                 return
             }
-            // 线上也空：这是真白屏，把日志弹给用户，让他能发给我。
-            if childCount == 0 {
-                IOSDiagnostics.shared.log("body 为空且已走线上——真白屏，弹出诊断")
+            // 线上也空：这是真白屏，把日志弹给用户，让他能发给我。只弹一次。
+            if childCount == 0, !self.diagnosticsShown {
+                self.diagnosticsShown = true
+                IOSDiagnostics.shared.log("[\(tag)] body 为空且已走线上——真白屏，弹出诊断")
                 self.presentDiagnostics()
             }
         }
