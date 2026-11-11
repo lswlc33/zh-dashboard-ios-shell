@@ -100,9 +100,13 @@ def main():
     for name in ('ios-shell/build.sh', 'ios-shell/build-xtool.sh', 'native-shared/gradlew'):
         data = (repo / name).read_bytes()
         assert b'\r\n' not in data, name + ' 含 CRLF：bash 会把反斜杠续行打断'
-    attributes = (repo / '.gitattributes').read_text(encoding='utf-8')
-    for rule in ('*.sh text eol=lf', '*/gradlew text eol=lf', 'ios-shell/*.py text eol=lf'):
-        assert rule in attributes, rule
+    # .gitattributes 只在私有仓库根存在（公开镜像仓库是白名单复制，不带它）。
+    # 缺文件不算失败：字节检查已经直接验了工作树；有文件时再核对规则齐全。
+    attributes_path = repo / '.gitattributes'
+    if attributes_path.exists():
+        attributes = attributes_path.read_text(encoding='utf-8')
+        for rule in ('*.sh text eol=lf', '*/gradlew text eol=lf', 'ios-shell/*.py text eol=lf'):
+            assert rule in attributes, rule
 
     package = (root / 'Package.swift').read_text(encoding='utf-8')
     assert '// swift-tools-version: 6.0' in package and 'swiftLanguageModes: [.v5]' in package
