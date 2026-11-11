@@ -67,6 +67,17 @@ jobs:
           set -o pipefail
           bash ios-shell/build.sh --output-dir "$RUNNER_TEMP/out" 2>&1 | tee build.log
 
+      - name: 摘要编译错误
+        if: failure()
+        run: |
+          # 把 Swift/Kotlin 编译错误直接写进 job summary，省得去翻整包日志。
+          {
+            echo '## 构建失败：编译错误摘要'
+            echo '```'
+            grep -aE '\.swift:[0-9]+:[0-9]+: error:|e: file.*\.kt:' build.log 2>/dev/null | head -40 || echo '(no compiler error lines found)'
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
       - name: 记录源码指纹
         if: always()
         run: |
