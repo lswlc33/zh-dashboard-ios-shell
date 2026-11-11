@@ -134,40 +134,41 @@ final class IOSHistoryService: IOSBridgeService {
                                   frame: frame, ownerUID: uid, reply: reply)
             requests[ObjectIdentifier(request)] = request
             queuedWork += 1
-            worker.async { [self] in
-                defer { DispatchQueue.main.async { [self] in queuedWork -= 1 } }
+            self.worker.async { [self] in
+                // Swift 6 要求闭包内显式 self. 才能明确捕获语义（嵌套闭包同样）。
+                defer { DispatchQueue.main.async { [self] in self.queuedWork -= 1 } }
                 autoreleasepool {
                     do {
-                        try requireCurrent(request)
-                        let loaded = try load(owner, now: nowMillis())
+                        try self.requireCurrent(request)
+                        let loaded = try self.load(owner, now: self.nowMillis())
                         if method == "history.status" {
-                            complete(request, status(loaded, request)); return
+                            self.complete(request, self.status(loaded, request)); return
                         }
                         if method == "history.clear" {
                             let target = arguments["target"] as? String ?? "charge"
                             guard ["charge", "battery", "all"].contains(target) else {
                                 throw Failure("history_invalid_clear_target")
                             }
-                            try checkExpectedWatermark(arguments, loaded)
-                            DispatchQueue.main.async { [self] in presentClear(request, arguments, loaded, target) }
+                            try self.checkExpectedWatermark(arguments, loaded)
+                            DispatchQueue.main.async { [self] in self.presentClear(request, arguments, loaded, target) }
                             return
                         }
                         guard loaded.readError == nil, let state = loaded.state else {
                             throw Failure(loaded.readError ?? "history_read_failed")
                         }
                         switch method {
-                        case "history.record": try record(arguments, state, loaded, request)
+                        case "history.record": try self.record(arguments, state, loaded, request)
                         case "history.battery":
                             let range = arguments["range"] as? String ?? "24h"
                             guard ["24h", "3d", "7d", "30d"].contains(range) else {
                                 throw Failure("history_invalid_range")
                             }
-                            complete(request, try batteryResponse(state, range, request))
-                        case "history.charge": complete(request, try chargeResponse(state, request))
+                            self.complete(request, try self.batteryResponse(state, range, request))
+                        case "history.charge": self.complete(request, try self.chargeResponse(state, request))
                         default: throw Failure("history_unsupported_method")
                         }
                     } catch {
-                        complete(request, nil, code(error))
+                        self.complete(request, nil, self.code(error))
                     }
                 }
             }
@@ -422,12 +423,13 @@ final class IOSHistoryService: IOSBridgeService {
             guard self.queuedWork < Limit.pending else { self.finish(request, error: "history_queue_full"); return }
             self.queuedWork += 1
             self.worker.async { [self] in
-                defer { DispatchQueue.main.async { [self] in queuedWork -= 1 } }
+                // 嵌套闭包里即使已 [self] 捕获，Swift 6 仍要求显式 self. 才明确捕获语义。
+                defer { DispatchQueue.main.async { [self] in self.queuedWork -= 1 } }
                 autoreleasepool {
-                    do { try commitClear(clear) }
+                    do { try self.commitClear(clear) }
                     catch {
-                        lastWriteError = code(error); lastWriteOwner = request.owner.stableID
-                        complete(request, nil, code(error))
+                        self.lastWriteError = self.code(error); self.lastWriteOwner = request.owner.stableID
+                        self.complete(request, nil, self.code(error))
                     }
                 }
             }
