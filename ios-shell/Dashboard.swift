@@ -338,6 +338,75 @@ final class PanelController: UIViewController, WKNavigationDelegate, WKUIDelegat
     func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
         // 页面首帧就绪后清掉失败标记，下次冷启动直接进面板。
         BootHealth.clear()
+        // 诊断：didFinish 只代表文档加载完，不代表网页画出了内容。
+        // 白屏时这里能把真实原因（桥没注入 / JS 抛错 / body 为空）挖出来。
+        diagnoseIfBlank()
+    }
+
+    /// 文档加载完成后检查页面是否真的画出了东西；空的话把细节打印到日志。
+    /// 只读探测，不改页面状态。
+    private func diagnoseIfBlank() {
+        let probe = """
+        (function () {
+          try {
+            var b = document.body;
+            var info = {
+              hasBody: !!b,
+              childCount: b ? b.children.length : 0,
+              hasBootstrap: typeof window.__zeehoIOS !== 'undefined',
+              hasIOSBR: typeof window.IOSBR !== 'undefined',
+              iosbrAvailable: !!(window.IOSBR && window.IOSBR.available && window.IOSBR.available()),
+              preview: window.__zeehoWebPreview === true,
+              hasZeehoShell: typeof window.ZeehoShell !== 'undefined',
+              stage: !!document.querySelector('.stage'),
+              phone: !!document.querySelector('.phone'),
+              scroll: !!document.querySelector('#scroll'),
+              fatal: !!document.getElementById('__zeeho_ios_fatal'),
+              fatalText: (document.getElementById('__zeeho_ios_fatal') || {}).textContent || '',
+              origin: location.origin, path: location.pathname,
+              title: document.title || ''
+            };
+            return JSON.stringify(info);
+          } catch (e) { return '{"probeError":"' + String(e && e.message || e) + '"}'; }
+        })()
+        """
+        web.evaluateJavaScript(probe) { [weak self] value, error in
+            guard let self = self else { return }
+            if let error = error {
+                NSLog("[ZeehoIOS] probe failed: %@", String(describing: error))
+                return
+            }
+            NSLog("[ZeehoIOS] probe: %@", String(describing: value ?? "nil"))
+            // 探测到致命错误时，把它也贴到原生侧，方便用户截图反馈。
+            guard let text = value as? String,
+                  let data = text.data(using: .utf8),
+                  let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return }
+            let fatal = object["fatal"] as? Bool ?? false
+            if fatal, let detail = object["fatalText"] as? String, !detail.isEmpty {
+                self.showDiagnosticBanner(detail)
+                return
+            }
+            // 本地快照加载完但 body 是空的：多半是自定义 scheme 下某些能力不可用
+            // （WebKit 对非 http(s) scheme 的存储/安全上下文限制）。
+            // 直接切回线上 https，用户至少能进面板，而不是盯着白屏。
+            let childCount = object["childCount"] as? Int ?? 0
+            if childCount == 0, self.usingLocalSnapshot {
+                self.fallbackToNetwork()
+            }
+        }
+    }
+
+    /// 把网页报告的致命错误显示成原生浮层，用户能直接截图。
+    private func showDiagnosticBanner(_ detail: String) {
+        guard presentedViewController == nil else { return }
+        let alert = UIAlertController(title: "面板加载异常",
+                                      message: String(detail.prefix(1200)),
+                                      preferredStyle: .alert)
+        alert.addAction(UIAlertAction(title: "重试", style: .default) { [weak self] _ in
+            self?.loadPanel()
+        })
+        alert.addAction(UIAlertAction(title: "好", style: .cancel))
+        present(alert, animated: true)
     }
 
     func webView(_ webView: WKWebView, didFailProvisionalNavigation navigation: WKNavigation!, withError error: Error) {
