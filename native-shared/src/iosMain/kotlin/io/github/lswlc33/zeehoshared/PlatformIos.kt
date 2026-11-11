@@ -47,9 +47,10 @@ internal actual fun platformSha256(bytes: ByteArray): ByteArray {
 }
 internal actual fun platformDecryptChallenge(encrypted: ByteArray, key: ByteArray): ByteArray = memScoped {
     val output = ByteArray(encrypted.size + 16)
-    // size_tVar 在 arm64 上是 ULongVarOf<ULong>：用 [0] 下标读写，不要用 .value。
+    // size_tVar 在 64 位 Apple 平台是 ULongVarOf<ULong>：用 .value 读写，
+    // 且必须显式给 ULong 字面量，不能依赖 convert() 推断。
     val written = alloc<size_tVar>()
-    written[0] = 0u
+    written.value = 0uL
     try {
         val status = key.usePinned { keyPtr -> encrypted.usePinned { source -> output.usePinned { target ->
             CCCrypt(
@@ -58,7 +59,7 @@ internal actual fun platformDecryptChallenge(encrypted: ByteArray, key: ByteArra
                 source.addressOf(0), encrypted.size.convert(), target.addressOf(0), output.size.convert(), written.ptr
             )
         } } }
-        val writtenBytes = written[0].toLong()
+        val writtenBytes = written.value.toLong()
         require(status == kCCSuccess && writtenBytes <= output.size) { "challenge_decryption" }
         output.copyOf(writtenBytes.toInt())
     } finally { output.fill(0) }
@@ -77,9 +78,10 @@ internal actual fun platformHttpClient(): HttpClient = HttpClient(Darwin) {
             requestCachePolicy = NSURLRequestReloadIgnoringLocalCacheData
         }
         configureRequest {
-            // Darwin 引擎的 configureRequest 暴露的是 NSMutableURLRequest，用属性/方法而非 Ktor header DSL。
-            setValue("identity", forHTTPHeaderField = HttpHeaders.AcceptEncoding)
-            setCachePolicy(NSURLRequestReloadIgnoringLocalCacheData)
+            // Darwin 引擎的 configureRequest 拿到的是 NSMutableURLRequest（平台类型），
+            // 直接调它的 setValue:forHTTPHeaderField: 与 setCachePolicy:，不走 Ktor 的 header DSL。
+            this.setValue("identity", forHTTPHeaderField = "Accept-Encoding")
+            this.setCachePolicy(NSURLRequestReloadIgnoringLocalCacheData)
         }
     }
 }
