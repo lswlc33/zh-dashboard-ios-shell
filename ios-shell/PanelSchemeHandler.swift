@@ -99,14 +99,8 @@ final class IOSPanelSchemeHandler: NSObject, WKURLSchemeHandler {
     }
 
     /// 把 https 主文档地址映射到同路径的自定义 scheme 地址。
+    /// 实现在 PanelNavigation（纯字符串变换，可单测），这里只做转发避免两份逻辑漂移。
     static func localURL(matching remote: URL) -> URL? {
-        var parts = URLComponents()
-        parts.scheme = scheme
-        parts.host = host
-        let path = remote.path.isEmpty ? "/index.html" : remote.path
-        parts.path = path
-        // 查询串要保留：`_shellNav` 是桥的文档身份，丢了握手就失败。
-        parts.query = remote.query
-        return parts.url
+        PanelNavigation.localURL(matching: remote)
     }
 }

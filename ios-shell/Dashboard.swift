@@ -34,6 +34,8 @@ final class RootRouter: UIViewController {
         super.viewDidAppear(animated)
         guard !settled else { return }
         settled = true
+        // 持久化的线路要在任何导航之前应用，否则白名单与起始地址会不一致。
+        IOSPanelLine.applyPersisted()
         route()
     }
 
@@ -281,10 +283,23 @@ final class PanelController: UIViewController, WKNavigationDelegate, WKUIDelegat
         preparePanel(PanelNavigation.home)
     }
 
+    /// 有可用快照时把主文档改写到本地 scheme；否则返回 nil 表示走网络。
+    /// 放在这里而不是 PanelNavigation，是因为它要读 IOSPanelCache，
+    /// 而 Navigation.swift 必须能被 navigation-test.swift 单独编译。
+    private static func localSnapshotURL(for url: URL) -> URL? {
+        guard IOSPanelCache.shared.snapshotDirectory() != nil else { return nil }
+        guard PanelNavigation.isPanel(url) else { return nil }
+        guard url.scheme?.lowercased() != PanelNavigation.localScheme else { return nil }
+        return PanelNavigation.localURL(matching: url)
+    }
+
     private func preparePanel(_ url: URL) {
         web.stopLoading()
         guard let bridge = bridge else { return }
-        bridge.prepareNavigation(to: url) { [weak self] result in
+        // 有本地快照就把主文档改写到 zeeho-panel://，弱网/离线也能进；
+        // 没快照保持线上 https，行为与以前一致。
+        let target = Self.localSnapshotURL(for: url) ?? url
+        bridge.prepareNavigation(to: target) { [weak self] result in
             guard let self = self else { return }
             switch result {
             case let .success(target):

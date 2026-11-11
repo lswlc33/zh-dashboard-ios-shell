@@ -17,7 +17,16 @@ enum IOSPanelLine: String {
             let raw = UserDefaults.standard.string(forKey: defaultsKey) ?? ""
             return IOSPanelLine(rawValue: raw) ?? .github
         }
-        set { UserDefaults.standard.set(newValue.rawValue, forKey: defaultsKey) }
+        set {
+            UserDefaults.standard.set(newValue.rawValue, forKey: defaultsKey)
+            // 导航白名单与起始地址都跟着线路走，改完立刻同步。
+            PanelNavigation.base = baseURL(for: newValue)
+        }
+    }
+
+    /// 启动时把持久化的线路应用到导航基址。
+    static func applyPersisted() {
+        PanelNavigation.base = baseURL(for: current)
     }
 
     /// 面板主文档所在基址（以 `/` 结尾）。iOS 只从这两个 HTTPS 源加载。

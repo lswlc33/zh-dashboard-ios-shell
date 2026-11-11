@@ -50,8 +50,12 @@ assert 'RootRouter' in controller and 'RecoveryViewController' in controller
 assert 'BootHealth.needsWelcome()' in controller
 # 新文档先异步准备可信快照，只有成功才 load；失败显示错误，不绕过桥门禁启动网页。
 prepare = controller.split('private func preparePanel(_ url: URL)', 1)[1].split('\n    }', 1)[0]
-assert prepare.index('bridge.prepareNavigation(to: url)') < prepare.index('case let .success(target):') < prepare.index('self.web.load(')
+assert prepare.index('bridge.prepareNavigation(to: target)') < prepare.index('case let .success(target):') < prepare.index('self.web.load(')
 assert 'URLRequest(url: target' in prepare
+# 有本地快照时改写到自定义 scheme；没快照保持线上 https。
+assert 'Self.localSnapshotURL(for: url) ?? url' in prepare
+assert 'PanelNavigation.localURL(matching: url)' in controller
+assert 'IOSPanelCache.shared.snapshotDirectory() != nil' in controller
 failure = prepare.split('case let .failure(error):', 1)[1]
 assert 'self.showError(error)' in failure and 'web.load(' not in failure
 error = controller.split('private func showError', 1)[1].split('\n    }', 1)[0]
@@ -76,7 +80,13 @@ assert 'static let resources' in cache and '"index.html"' in cache
 assert 'zeeho-panel' in scheme
 assert 'didFailWithError' in scheme and 'resolvingSymlinksInPath' in scheme
 navigation = (root / 'Navigation.swift').read_text(encoding='utf-8')
-assert 'IOSPanelSchemeHandler.scheme' in navigation
+# Navigation 必须能被 navigation-test.swift 单独编译：只用字面量 scheme，
+# 不 import PanelSchemeHandler / PanelCache / PanelLine 的类型。
+assert 'static let localScheme = "zeeho-panel"' in navigation
+assert 'IOSPanelSchemeHandler' not in navigation.replace('`IOSPanelLine.baseURL()`', '')
+assert 'IOSPanelCache' not in navigation
+# 线上基址可被线路切换覆写，但默认值仍是 GitHub Pages。
+assert 'https://lswlc33.github.io/zeeho-3d-models/' in navigation
 
 # 线路选择：五个同步方法齐全，begin 同步完成（与安卓现状一致）。
 line = (root / 'PanelLineService.swift').read_text(encoding='utf-8')
