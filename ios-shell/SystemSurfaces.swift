@@ -40,10 +40,18 @@ private actor IOSLiveActivityManager {
         for activity in old { await finish(activity) }
     }
 
+    // .stale 是 iOS 16.2 才有的 ActivityState；deployment target 15.4 必须用可用性分支，
+    // 否则整文件编译失败（CI 实测）。
+    private static func isLive(_ state: ActivityState) -> Bool {
+        if state == .active { return true }
+        if #available(iOS 16.2, *) { return state == .stale }
+        return false
+    }
+
     func running(owner expected: SystemSnapshotOwner?) -> [IOSRunningSystemActivity] {
         guard let expected = expected, owner == expected else { return [] }
         return Activity<ZeehoActivityAttributes>.activities.filter {
-            $0.attributes.owner == expected && ($0.activityState == .active || $0.activityState == .stale)
+            $0.attributes.owner == expected && Self.isLive($0.activityState)
         }.map { IOSRunningSystemActivity(id: $0.id, kind: $0.attributes.kind) }
     }
 
@@ -88,7 +96,7 @@ private actor IOSLiveActivityManager {
         let targets = Activity<ZeehoActivityAttributes>.activities.filter {
             $0.attributes.owner == snapshot.owner && (id == nil || $0.id == id)
                 && !($0.attributes.kind == .ride && snapshot.ride?.state == .ended)
-                && ($0.activityState == .active || $0.activityState == .stale)
+                && Self.isLive($0.activityState)
         }
         guard !targets.isEmpty else { throw SystemSnapshotError("live_activity_not_running") }
         for activity in targets {
