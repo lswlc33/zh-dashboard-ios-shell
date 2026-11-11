@@ -265,7 +265,8 @@ private enum IOSRideDisk {
             remaining -= size
             guard let id = UUID(uuidString: item.deletingPathExtension().lastPathComponent) else { continue }
             do { summaries.append(summary(try read(owner: owner, id: id))) }
-            catch { if error.isEmpty { error = (error as? Failure)?.code ?? "records_read_failed" } }
+            // catch 的隐式变量名是 error，会遮蔽外层同名的 String 变量；显式命名避免歧义。
+            catch let failure { if error.isEmpty { error = (failure as? Failure)?.code ?? "records_read_failed" } }
         }
         return ["ok": error.isEmpty, "records": summaries, "recordsReady": true, "recordsError": error,
                 "storage": ["files": entries.count, "bytes": used, "maxFiles": maxFiles,
