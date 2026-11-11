@@ -92,6 +92,12 @@ enum IOSRideJSON {
     }
 }
 
+// 骑行桥回执里要用的人读文案。IOSStrings 是独立文件，本次修复限定只改 Ride.swift，
+// 先就近定义；后续统一迁到 IOSStrings 时删掉这里。
+private enum IOSRideText {
+    static let notRecorded = "本次没有采集到数据"
+}
+
 private enum IOSRideDisk {
     static let maxSamples = 20000
     static let maxFileBytes = 8 * 1024 * 1024
@@ -100,10 +106,36 @@ private enum IOSRideDisk {
     static let maxFiles = 100
     static let maxOwners = 64
     static let parseBudget = 16 * 1024 * 1024
+    /// 全库用量缓存的有效期。checkpoint 每 15 秒一轮，每次都遍历最多 64 个 owner 目录
+    /// × 100 个文件，会在串行落盘队列上堆出明显延迟；60 秒内的旧值足够当提前拒绝的依据。
+    static let usageTTL: TimeInterval = 60
 
     struct Failure: Error {
         let code: String
         init(_ code: String) { self.code = code }
+    }
+
+    struct Orphan {
+        let id: String
+        let at: Int64?
+    }
+
+    // save 既跑在串行 worker 上，也可能被 deinit 的独立队列调用，缓存必须自己加锁。
+    private static let usageLock = NSLock()
+    private static var usageCache: [String: (bytes: Int, at: Date)] = [:]
+
+    private static func cachedUsage(_ key: String, now: Date) -> Int? {
+        usageLock.lock(); defer { usageLock.unlock() }
+        guard let entry = usageCache[key], now.timeIntervalSince(entry.at) < usageTTL else { return nil }
+        return entry.bytes
+    }
+
+    private static func storeUsage(_ key: String, bytes: Int, now: Date) {
+        usageLock.lock(); usageCache[key] = (bytes, now); usageLock.unlock()
+    }
+
+    private static func usagesInvalidate(_ key: String) {
+        usageLock.lock(); usageCache.removeValue(forKey: key); usageLock.unlock()
     }
 
     private static func directory(owner: String, create: Bool) throws -> URL {
@@ -167,19 +199,33 @@ private enum IOSRideDisk {
         }
         guard bytes + data.count <= maxOwnerBytes else { throw Failure("storage_limit_reached") }
         let root = target.deletingLastPathComponent().deletingLastPathComponent()
+        let targetDirectory = target.deletingLastPathComponent().path
+        let targetSize = (try? target.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0
+        let stamp = Date()
         var total = 0
         let scopes = try FileManager.default.contentsOfDirectory(at: root, includingPropertiesForKeys: [.isDirectoryKey, .isSymbolicLinkKey], options: [.skipsHiddenFiles])
         guard scopes.count <= maxOwners else { throw Failure("storage_limit_reached") }
         for scope in scopes {
             let attributes = try scope.resourceValues(forKeys: [.isDirectoryKey, .isSymbolicLinkKey])
             guard attributes.isDirectory == true, attributes.isSymbolicLink != true else { throw Failure("unsafe_storage_path") }
-            let entries = try FileManager.default.contentsOfDirectory(at: scope, includingPropertiesForKeys: [.fileSizeKey], options: [.skipsHiddenFiles])
-            guard entries.count <= maxFiles + 1 else { throw Failure("storage_limit_reached") }
-            for item in entries where item != target {
-                total += try item.resourceValues(forKeys: [.fileSizeKey]).fileSize ?? 0
-                guard total + data.count <= maxTotalBytes else { throw Failure("storage_limit_reached") }
+            // 每次 checkpoint 都全库重扫会在落盘队列上堆出明显延迟；60 秒内的目录用量直接复用。
+            // 目标文件自身的旧大小要扣掉：这次写入会原子替换它，不能重复计入。
+            let key = scope.path
+            let scopeBytes: Int
+            if let cached = cachedUsage(key, now: stamp) {
+                scopeBytes = cached
+            } else {
+                let entries = try FileManager.default.contentsOfDirectory(at: scope, includingPropertiesForKeys: [.fileSizeKey], options: [.skipsHiddenFiles])
+                guard entries.count <= maxFiles + 1 else { throw Failure("storage_limit_reached") }
+                var sum = 0
+                for item in entries { sum += try item.resourceValues(forKeys: [.fileSizeKey]).fileSize ?? 0 }
+                storeUsage(key, sum, stamp)
+                scopeBytes = sum
             }
+            total += max(0, scopeBytes - (key == targetDirectory ? targetSize : 0))
         }
+        // 之前是边加边判，现在按目录聚合后再判：同等拒绝能力，但少了一堆 syscall。
+        guard total + data.count <= maxTotalBytes else { throw Failure("storage_limit_reached") }
         if FileManager.default.fileExists(atPath: target.path) {
             let attributes = try target.resourceValues(forKeys: [.isRegularFileKey, .isSymbolicLinkKey])
             guard attributes.isRegularFile == true, attributes.isSymbolicLink != true else { throw Failure("unsafe_storage_path") }
@@ -196,7 +242,48 @@ private enum IOSRideDisk {
         let synced = fsync(descriptor)
         let closed = Darwin.close(descriptor)
         guard synced == 0, closed == 0 else { throw Failure("save_sync_failed") }
+        // 本目录用量已变，缓存作废；其他目录的旧值仍然有效。
+        usagesInvalidate(targetDirectory)
         return data.count
+    }
+
+    /// 8 MiB 单文件上限兜底：保留最早的样本，按比例丢尾部。
+    /// 整条记录因为超限永远写不进去时，宁可少存尾部也不能让用户整趟骑行丢失；
+    /// 每次尝试都重新序列化确认真的落到上限内，避免凭估算再次超限。
+    static func trimmed(_ record: [String: Any]) -> [String: Any]? {
+        guard let gps = record["rawGPS"] as? [[String: Any]],
+              let telemetry = record["telemetry"] as? [[String: Any]] else { return nil }
+        let total = gps.count + telemetry.count
+        guard total > 1 else { return nil }
+        var ratio = 0.9
+        while ratio >= 0.05 {
+            let keep = max(1, Int(Double(total) * ratio))
+            // 按各自占比等比例保留，避免只砍掉 GPS 或只砍掉 BLE 导致某一类样本全缺。
+            let keepGPS = min(gps.count, Int((Double(keep) * Double(gps.count) / Double(total)).rounded(.down)))
+            let keepBLE = min(telemetry.count, keep - keepGPS)
+            guard keepGPS + keepBLE < total else { ratio -= 0.1; continue }
+            var value = record
+            value["rawGPS"] = Array(gps.prefix(keepGPS))
+            value["telemetry"] = Array(telemetry.prefix(keepBLE))
+            // read() 要求 samples 与两类样本总数严格一致，截断后必须同步。
+            value["samples"] = keepGPS + keepBLE
+            if var report = value["report"] as? [String: Any] {
+                report["gpsSamples"] = keepGPS
+                report["bleSamples"] = keepBLE
+                value["report"] = report
+            }
+            var gaps = value["gaps"] as? [[String: Any]] ?? []
+            if gaps.count < 1024 {
+                gaps.append(["at": Int64(Date().timeIntervalSince1970 * 1000),
+                             "elapsedMs": IOSRideJSON.integer(record["elapsedMs"]) ?? 0,
+                             "source": "storage", "reason": "trimmed_for_size"])
+                value["gaps"] = gaps
+            }
+            if let data = try? JSONSerialization.data(withJSONObject: value, options: [.sortedKeys]),
+               data.count <= maxFileBytes { return value }
+            ratio -= 0.2
+        }
+        return nil
     }
 
     static func read(owner: String, id: UUID) throws -> [String: Any] {
@@ -213,15 +300,34 @@ private enum IOSRideDisk {
               let gaps = record["gaps"] as? [[String: Any]], gps.count + telemetry.count <= maxSamples, gaps.count <= 1024,
               IOSRideJSON.integer(record["samples"]) == Int64(gps.count + telemetry.count),
               IOSRideJSON.integer(record["startedAt"], minimum: 1) != nil else { throw Failure("invalid_record") }
+        var lastGPSAt: Int64 = 0
+        var lastGPSSeq: Int64 = 0
+        var lastBLEAt: Int64 = 0
+        var lastBLESeq: Int64 = 0
         for sample in gps {
             guard sample["provider"] as? String == "corelocation",
                   IOSRideJSON.integer(sample["at"], minimum: 1) != nil,
                   IOSRideJSON.integer(sample["seq"], minimum: 1) != nil,
                   IOSRideJSON.integer(sample["elapsedMs"]) != nil else { throw Failure("invalid_record") }
-            if let lat = IOSRideJSON.number(sample["lat"]), let lng = IOSRideJSON.number(sample["lng"]) {
+            // lat/lng 只在定位成功时成对写入；单边存在说明文件被截断或改写过，
+            // 放行会让详情页画出半个坐标（之前 lat 有值、lng 缺失就直接跳过校验）。
+            let lat = IOSRideJSON.number(sample["lat"])
+            let lng = IOSRideJSON.number(sample["lng"])
+            guard (lat == nil) == (lng == nil) else { throw Failure("invalid_record") }
+            if let lat = lat, let lng = lng {
                 guard (-90...90).contains(lat), (-180...180).contains(lng) else { throw Failure("invalid_record") }
             }
+            if let accuracy = IOSRideJSON.number(sample["accuracy"]), accuracy < 0 { throw Failure("invalid_record") }
             if let speed = IOSRideJSON.number(sample["speedKph"]), !(0...400).contains(speed) { throw Failure("invalid_record") }
+            // at/seq 是时间线与去重的基础；不是严格递增就意味着乱序样本，读完会污染统计。
+            if let at = IOSRideJSON.integer(sample["at"], minimum: 1) {
+                guard at >= lastGPSAt else { throw Failure("invalid_record") }
+                lastGPSAt = at
+            }
+            if let seq = IOSRideJSON.integer(sample["seq"], minimum: 1) {
+                guard seq >= lastGPSSeq else { throw Failure("invalid_record") }
+                lastGPSSeq = seq
+            }
         }
         for sample in telemetry {
             guard let values = sample["values"] as? [String: Any], !values.isEmpty,
@@ -229,7 +335,13 @@ private enum IOSRideDisk {
                   let times = sample["times"] as? [String: Any], times.count == values.count,
                   times.values.allSatisfy({ IOSRideJSON.integer($0, minimum: 1) != nil }),
                   ["ble_period", "ble_dash"].contains(sample["source"] as? String ?? ""),
-                  IOSRideJSON.integer(sample["at"], minimum: 1) != nil else { throw Failure("invalid_record") }
+                  let at = IOSRideJSON.integer(sample["at"], minimum: 1) else { throw Failure("invalid_record") }
+            guard at >= lastBLEAt else { throw Failure("invalid_record") }
+            lastBLEAt = at
+            if let seq = IOSRideJSON.integer(sample["seq"], minimum: 1) {
+                guard seq >= lastBLESeq else { throw Failure("invalid_record") }
+                lastBLESeq = seq
+            }
         }
         return record
     }
@@ -257,21 +369,43 @@ private enum IOSRideDisk {
         var summaries: [[String: Any]] = []
         var error = ""
         var used = 0
+        var failed = 0
         for item in entries {
             let size = try item.resourceValues(forKeys: [.fileSizeKey]).fileSize ?? 0
             used += size
             guard summaries.count < 30 else { continue }
-            guard size <= remaining else { if error.isEmpty { error = "records_parse_limit" }; continue }
+            guard size <= remaining else { if error.isEmpty { error = "records_parse_limit" }; failed += 1; continue }
             remaining -= size
             guard let id = UUID(uuidString: item.deletingPathExtension().lastPathComponent) else { continue }
             do { summaries.append(summary(try read(owner: owner, id: id))) }
             // catch 的隐式变量名是 error，会遮蔽外层同名的 String 变量；显式命名避免歧义。
-            catch let failure { if error.isEmpty { error = (failure as? Failure)?.code ?? "records_read_failed" } }
+            catch let failure { failed += 1; if error.isEmpty { error = (failure as? Failure)?.code ?? "records_read_failed" } }
         }
-        return ["ok": error.isEmpty, "records": summaries, "recordsReady": true, "recordsError": error,
+        // ok 只表示「这次调用本身成功」：坏一条不该让整页列表拿不到。
+        // 只有目录里确实有文件、却一条都读不出来时才判失败——否则网页会当成「记录被清空」。
+        let nothingReadable = used > 0 && summaries.isEmpty && failed > 0
+        return ["ok": !nothingReadable, "records": summaries, "recordsReady": true, "recordsError": error,
                 "storage": ["files": entries.count, "bytes": used, "maxFiles": maxFiles,
                             "maxOwnerBytes": maxOwnerBytes, "maxFileBytes": maxFileBytes, "maxSamples": maxSamples],
-                "partial": !error.isEmpty]
+                "partial": !nothingReadable && !error.isEmpty]
+    }
+
+    /// 启动扫盘：找出本 owner 目录里 endedAt 为空的历史文件（上次录制被系统杀掉/崩溃）。
+    /// 只做提示，不自动续记——没有活跃的 Location/Bluetooth 上下文，续记会写出假样本。
+    /// 这里刻意只做浅解析：init 阶段不该为几十个文件跑完整样本校验。
+    static func orphans(owner: String) throws -> [Orphan] {
+        var result: [Orphan] = []
+        for item in try files(owner: owner) {
+            guard result.count < maxFiles else { break }
+            guard let size = try item.resourceValues(forKeys: [.fileSizeKey]).fileSize, size > 0, size <= maxFileBytes,
+                  let data = try? Data(contentsOf: item),
+                  let record = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { continue }
+            guard record["endedAt"] == nil || record["endedAt"] is NSNull else { continue }
+            guard let id = UUID(uuidString: item.deletingPathExtension().lastPathComponent) else { continue }
+            let at = IOSRideJSON.integer(record["startedAt"], minimum: 1)
+            result.append(Orphan(id: id.uuidString.lowercased(), at: at))
+        }
+        return result
     }
 
     static func delete(owner: String, id: UUID) throws {
@@ -304,6 +438,14 @@ final class IOSRideService: NSObject, IOSBridgeService, IOSBridgeCancellableServ
     private weak var confirmationAlert: UIAlertController?
     private var sharing: Consent?
     private weak var activity: UIActivityViewController?
+    /// 上次扫盘发现的未结束记录（被系统杀掉/崩溃留下）。只有最新一份对外提示，不做自动续记。
+    private var orphanCount = 0
+    private var orphanLatestAt: Int64?
+    /// 扫盘并入同一个 worker 串行执行，避免和 checkpoint 抢磁盘；结果回主线程才写状态。
+    private var scanInFlight = false
+    private var scannedScope: String?
+    /// 已销毁的 0 采样记录（只用于让 end/poll 幂等回终态）。带 owner，避免提示泄漏给别的账号。
+    private var emptyFinals: [(id: UUID, owner: String, at: Int64)] = []
 
     private final class Consent {
         let page: UInt64
@@ -353,7 +495,13 @@ final class IOSRideService: NSObject, IOSBridgeService, IOSBridgeCancellableServ
         var saveInFlight = false
         var userPaused = false
         var saveFailed = false
+        /// 结束保存已经自动重试过一次；再失败才真正置 save_failed。
+        var saveRetried = false
         var savedBytes = 0
+        /// 0 采样的终态标记：没有文件可写，但这条记录已经收尾（saved 必须为 true）。
+        var empty = false
+        /// 上次成功落盘的真实字节/样本数；0 表示还没测到，admit 先用调用方的粗估。
+        var bytesPerSample = 0.0
         var saveWaiters: [(UInt64, IOSRideScope?, (Any?, String?) -> Void)] = []
         var lastRoute: IOSGPSFix?
         var distanceM = 0.0
@@ -397,8 +545,38 @@ final class IOSRideService: NSObject, IOSBridgeService, IOSBridgeCancellableServ
         clock?.invalidate()
         if let token = gpsObserver { gps.removeObserver(token) }
         if let token = bleObserver { bluetooth.removeObserver(token) }
-        if let run = active { gps.endRecording(id: run.id); bluetooth.setRecordingContext(id: nil, background: false, scope: nil) }
+        let run = active
+        let location = gps
+        let remote = bluetooth
+        // 释放采样上下文必须回主线程：IOSLocationService.endRecording / setRecordingContext
+        // 都带主线程 precondition，而 deinit 由最后一个强引用释放决定，可能在后台队列或
+        // autorelease 池里发生（真机 swap WebView 时踩过崩溃）。这里只捕获具体服务对象，
+        // 不捕获 self——deinit 里捕获 self 的逃逸闭包不合法。
+        let detach = {
+            guard let run = run else { return }
+            location.endRecording(id: run.id)
+            remote.setRecordingContext(id: nil, background: false, scope: nil)
+        }
+        if Thread.isMainThread { detach() } else { DispatchQueue.main.async(execute: detach) }
+        // 走到 deinit 说明服务被替换（换 WebView/重启）。正在录制的 run 如果只靠 15 秒一轮
+        // 的 checkpoint，进程退出就会丢掉尾巴；这里补一次最终 checkpoint。
+        // 不能调 checkpoint()：它带 active === run / checkpointing 等实例状态判定，也会读
+        // gps/bluetooth 的主线程快照；deinit 里只取 run 的纯值字段，交给独立队列落盘。
+        // 用 final:false：这条记录并没有被用户结束，写成 endedAt 会让下次启动误判为已保存；
+        // 留空则 list 会标 incomplete，正好对上启动扫盘的孤儿提示。
+        if let run = run, run.samples > 0, !run.saveFailed, !run.ending, !run.completed {
+            let value = record(run, final: false)
+            let owner = run.scope.ownerHash
+            let id = run.id
+            Self.teardownQueue.async {
+                // 失败也不抛：deinit 里没人能处理错误，写不进去就留给 list 兜底。
+                _ = try? IOSRideDisk.save(value, owner: owner, id: id)
+            }
+        }
     }
+
+    /// deinit 专用落盘队列：不能用 worker（它由实例持有，deinit 后即将失效），也不能同步等。
+    private static let teardownQueue = DispatchQueue(label: "io.github.lswlc33.dashboard.rides.teardown", qos: .utility)
 
     func configureScopeProvider(_ provider: @escaping () -> IOSRideScope?) {
         precondition(Thread.isMainThread)
@@ -422,6 +600,37 @@ final class IOSRideService: NSObject, IOSBridgeService, IOSBridgeCancellableServ
         cancelConsent("stale_session")
         cancelShare("stale_session")
         checkScope()
+        // 账号/车辆切换后，旧 owner 的 0 采样标记与孤儿提示都不该再对新会话可见。
+        if let scope = scopeProvider?() {
+            emptyFinals.removeAll { $0.owner != scope.ownerHash }
+        } else { emptyFinals.removeAll() }
+        scanOrphans()
+    }
+
+    /// 进前台/切账号后扫一次本 owner 目录，找出 `endedAt` 为空的记录（进程被杀、崩溃留下的）。
+    /// 只提示不续记：没有活跃的 Location/Bluetooth 上下文，续记会凭空造出样本。
+    /// 扫盘放在 worker 上，结果回主线程才改状态（否则 snapshot() 可能读到半更新的计数）。
+    private func scanOrphans() {
+        guard let scope = scopeProvider?(), scope.valid else {
+            // 没身份就清掉旧提示，避免把上一个账号的孤儿数报给新账号。
+            orphanCount = 0; orphanLatestAt = nil; scannedScope = nil
+            return
+        }
+        let owner = scope.ownerHash
+        guard !scanInFlight, scannedScope != owner else { return }
+        scanInFlight = true
+        worker.async { [weak self] in
+            let found = (try? IOSRideDisk.orphans(owner: owner)) ?? []
+            DispatchQueue.main.async {
+                guard let self = self else { return }
+                self.scanInFlight = false
+                // 扫盘期间可能已经切账号；不是同一个 owner 就丢弃结果，等下一轮重扫。
+                guard self.scopeProvider?().map({ $0.valid && $0.ownerHash == owner }) == true else { return }
+                self.scannedScope = owner
+                self.orphanCount = found.count
+                self.orphanLatestAt = found.compactMap { $0.at }.max()
+            }
+        }
     }
 
     func navigationChanged() {
@@ -431,6 +640,10 @@ final class IOSRideService: NSObject, IOSBridgeService, IOSBridgeCancellableServ
         cancelShare("stale_navigation")
         // 没有 WK observer；已明确录制与页面生命周期分离，仍由 scope/系统权限守护。
         checkScope()
+        // 每次重新进面板都补扫一次（scannedScope 去重，同一 owner 不会重复扫），
+        // 否则上次会话留下的孤儿记录在切账号/重启前都不对用户可见。
+        scannedScope = nil
+        scanOrphans()
     }
 
     func applicationBackgrounded() {
@@ -469,12 +682,21 @@ final class IOSRideService: NSObject, IOSBridgeService, IOSBridgeCancellableServ
         case "ride.begin": begin(scope: scope, options: options, reply: reply)
         case "ride.poll":
             if let id = requestedID(options) {
-                guard let run = active?.id == id ? active : finals[id], run.scope.ownerHash == scope.ownerHash else {
-                    reply(failure("stale_ticket"), nil); return
-                }
-                reply(snapshot(run), nil)
+                if let run = active?.id == id ? active : finals[id], run.scope.ownerHash == scope.ownerHash {
+                    reply(snapshot(run), nil)
+                } else if let empty = emptyFinals.first(where: { $0.id == id && $0.owner == scope.ownerHash }) {
+                    // 网页轮询会一直跟到 saved===true；0 采样的终态也必须能被 poll 到，
+                    // 否则它只会在 end 的回执里出现一次，刷新面板后又变成「等待数据」。
+                    reply(["ok": true, "accepted": false, "id": id.uuidString.lowercased(),
+                           "ticket": id.uuidString.lowercased(), "recordingId": id.uuidString.lowercased(),
+                           "state": "not_recorded", "recordState": "not_recorded", "reason": "no_samples",
+                           "summary": IOSRideText.notRecorded, "saved": true, "samples": 0,
+                           "elapsedMs": 0, "durationMs": 0, "endedAt": empty.at,
+                           "retryAvailable": false, "gps": gps.snapshot()], nil)
+                } else { reply(failure("stale_ticket"), nil) }
             } else if let run = active, run.scope == scope { reply(snapshot(run), nil) }
-            else { reply(["ok": true, "state": "idle", "samples": 0, "gps": gps.snapshot()], nil) }
+            else { reply(["ok": true, "state": "idle", "samples": 0, "gps": gps.snapshot(),
+                          "orphans": orphanSummary()], nil) }
         case "ride.end": end(scope: scope, options: options, reply: reply)
         case "ride.action": action(scope: scope, options: options, reply: reply)
         case "ride.list": list(scope: scope, reply: reply)
@@ -488,7 +710,18 @@ final class IOSRideService: NSObject, IOSBridgeService, IOSBridgeCancellableServ
     private func begin(scope: IOSRideScope, options: [String: Any], reply: @escaping (Any?, String?) -> Void) {
         guard options["confirmed"] as? Bool == true else { reply(failure("user_action_required"), nil); return }
         if let run = active, !run.completed {
-            reply(run.scope == scope ? snapshot(run) : failure("recording_busy"), nil); return
+            if run.ending {
+                // 正在保存的旧 run 不是「当前会话」：把它当幂等结果返回会让网页以为
+                // 还有一条可继续记录的会话，并且拿到的快照缺 accepted。明确回 busy + 状态。
+                reply(["ok": false, "reason": "recording_busy", "state": "saving",
+                       "recordState": "saving", "accepted": false], nil); return
+            }
+            guard run.scope == scope else { reply(failure("recording_busy"), nil); return }
+            // 同一 run 的幂等 begin：网页重放（重连/重开面板）拿到的那条也要带 accepted，
+            // 否则它无法区分「这次 begin 被受理」和「只是抖了个快照」。
+            var value = snapshot(run)
+            value["accepted"] = true
+            reply(value, nil); return
         }
         if let owner = Self.leaseOwner, owner !== self { reply(failure("recording_busy"), nil); return }
         guard pendingSaveCapacity else { reply(failure("pending_save_limit"), nil); return }
@@ -574,20 +807,43 @@ final class IOSRideService: NSObject, IOSBridgeService, IOSBridgeCancellableServ
         run.lastGPSUptime = fix.receivedUptime - fix.ageAtReceipt
         run.gapReasons.removeValue(forKey: "gps")
         if let speed = fix.speedKph { run.maxGPSSpeed = max(run.maxGPSSpeed ?? speed, speed) }
-        if let previous = run.lastRoute, let lat = fix.latitude, let lng = fix.longitude,
-           let previousLat = previous.latitude, let previousLng = previous.longitude,
-           let accuracy = fix.accuracy, let previousAccuracy = previous.accuracy,
-           accuracy <= 50, previousAccuracy <= 50 {
-            let seconds = Double(fix.at - previous.at) / 1000
-            if seconds > 0 && seconds <= 10 {
-                let distance = CLLocation(latitude: lat, longitude: lng).distance(from: CLLocation(latitude: previousLat, longitude: previousLng))
-                if distance.isFinite && distance >= 0 && distance / seconds * 3.6 <= 400 {
-                    run.distanceM += distance; run.distanceSegments += 1
-                }
-            }
-        }
+        accumulateDistance(run, fix)
         run.lastRoute = fix
         sampleAccepted(run)
+    }
+
+    /// 距离只累加"可信段"。
+    /// distanceFilter=3 意味着静止时 GPS 漂移 3 米就产生一个新点，全额累加会攒出幽灵里程。
+    /// 两道闸：① 段长不小于 max(3, min(两侧精度)*0.5)——精度越好，可接受的最短段越短；
+    /// ② 隐含速度不超过 100 km/h 的业务阈值（两轮车），超了就丢弃该段并记 gap，不失败整条记录。
+    /// 存储层的 400 边界不动：老文件校验仍按它，这里只做业务过滤。
+    private func accumulateDistance(_ run: Run, _ fix: IOSGPSFix) {
+        guard let previous = run.lastRoute, let lat = fix.latitude, let lng = fix.longitude,
+              let previousLat = previous.latitude, let previousLng = previous.longitude else { return }
+        let seconds = Double(fix.at - previous.at) / 1000
+        guard seconds > 0 && seconds <= 10 else { return }
+        let distance = CLLocation(latitude: lat, longitude: lng)
+            .distance(from: CLLocation(latitude: previousLat, longitude: previousLng))
+        guard distance.isFinite, distance >= 0 else { return }
+        // 精度已知但超过 50 米说明这一段本身不可信（老代码直接跳过）；未知时才退到 3 米下限。
+        if let accuracy = fix.accuracy, accuracy > 50 { return }
+        if let previousAccuracy = previous.accuracy, previousAccuracy > 50 { return }
+        let floor: Double
+        if let accuracy = fix.accuracy, let previousAccuracy = previous.accuracy {
+            floor = max(3.0, min(accuracy, previousAccuracy) * 0.5)
+        } else {
+            floor = 3.0
+        }
+        // 抖动：低于最小段长视为同一位置的重复定位，不计入也不报错。
+        guard distance >= floor else { return }
+        guard distance / seconds * 3.6 <= 100 else {
+            // 跳点（隧道后首个 fix、定位漂移）会让单段速度离谱；只丢这段并留痕，路程继续。
+            // 参考点由调用方无条件推进，所以丢段不会让后面每一段都跟着被丢。
+            markGap(run, source: "distance", reason: "stale_fix", force: true)
+            return
+        }
+        run.distanceM += distance
+        run.distanceSegments += 1
     }
 
     private func recordBLE(_ sample: IOSBLETelemetrySample) {
@@ -609,14 +865,32 @@ final class IOSRideService: NSObject, IOSBridgeService, IOSBridgeCancellableServ
         sampleAccepted(run)
     }
 
+    /// 接收闸门。字节估算优先用「上次真实序列化大小 / 样本数」× 1.1：
+    /// 固定 480/1000 的粗估在字段多时偏低，会让 estimatedBytes 迟迟不靠近 8 MiB，
+    /// 直到真正序列化时才超限；反过来在字段少时又白丢可写空间。
+    /// 还没成功落过盘时（bytesPerSample == 0）仍退回调用方的粗估，行为与旧版一致。
     private func admit(_ run: Run, bytes: Int) -> Bool {
-        guard run.samples < IOSRideDisk.maxSamples, run.estimatedBytes + bytes + 4096 <= IOSRideDisk.maxFileBytes else {
+        let estimate = run.bytesPerSample > 0 ? Int((run.bytesPerSample * 1.1).rounded(.up)) : bytes
+        guard run.samples < IOSRideDisk.maxSamples, run.estimatedBytes + estimate + 4096 <= IOSRideDisk.maxFileBytes else {
             stop(run, state: "interrupted", reason: "record_limit_reached", reply: nil)
             return false
         }
         run.samples += 1
-        run.estimatedBytes += bytes
+        run.estimatedBytes += estimate
         return true
+    }
+
+    /// 每次真实落盘后更新「字节/样本」滑动值。
+    /// 分母用落盘那一刻的样本数（不能读 run.samples：截断后主线程可能已经改过它）。
+    /// 文件头（version/id/owner/report 等）是固定开销，estimatedBytes 初值 2048 已覆盖，
+    /// 这里先扣掉再除，否则样本少的时候会把固定开销重复算成每样本成本。
+    private func observeSaved(_ run: Run, _ saved: Saved) {
+        run.savedBytes = saved.bytes
+        guard saved.samples > 0, saved.bytes > 2048 else { return }
+        let measured = Double(saved.bytes - 2048) / Double(saved.samples)
+        guard measured.isFinite, measured > 0 else { return }
+        // 0.5 的滑动系数：单次异常样本（带了很多 fields）不会立刻把预算抬到上限。
+        run.bytesPerSample = run.bytesPerSample > 0 ? run.bytesPerSample * 0.5 + measured * 0.5 : measured
     }
 
     private func sampleAccepted(_ run: Run) {
@@ -695,8 +969,11 @@ final class IOSRideService: NSObject, IOSBridgeService, IOSBridgeCancellableServ
         return age >= 0 && age < 10
     }
 
-    private func markGap(_ run: Run, source: String, reason: String) {
-        guard run.samples > 0, run.gaps.count < 1024, run.gapReasons[source] != reason else { return }
+    /// force=true 用于"同一来源同一个 reason 也要留一条痕迹"的场景（例如距离段被丢弃），
+    /// 默认 false 保持原有去重：同源的连续失联只记一次，避免 1024 条上限被同一条噪声吃满。
+    private func markGap(_ run: Run, source: String, reason: String, force: Bool = false) {
+        guard run.samples > 0, run.gaps.count < 1024 else { return }
+        if !force, run.gapReasons[source] == reason { return }
         run.gapReasons[source] = reason
         run.gaps.append(["at": Int64(Date().timeIntervalSince1970 * 1000), "elapsedMs": run.elapsedMs,
                          "source": source, "reason": safeReason(reason)])
@@ -711,7 +988,8 @@ final class IOSRideService: NSObject, IOSBridgeService, IOSBridgeCancellableServ
             "background_recording_disabled", "background_mode_missing", "always_permission_required", "background_interrupted",
             "stale_session", "record_limit_reached", "user_pause", "gps_disabled", "navigation_changed",
             "subscription_failed", "notification_failed", "services_invalidated", "powered_off", "not_authorised",
-            "bluetooth_resetting", "write_timeout", "read_timeout", "discovery_timeout", "location_failed", "no_fix"]
+            "bluetooth_resetting", "write_timeout", "read_timeout", "discovery_timeout", "location_failed", "no_fix",
+            "trimmed_for_size"]
         return codes.contains(value) ? value : "source_unavailable"
     }
 
@@ -750,7 +1028,10 @@ final class IOSRideService: NSObject, IOSBridgeService, IOSBridgeCancellableServ
     private func snapshot(_ run: Run) -> [String: Any] {
         let gpsValue = active === run && !run.ending ? gps.snapshot() : ["ok": true, "state": "disabled", "speedKph": NSNull(), "lat": NSNull(), "lng": NSNull()]
         let ble = active === run && !run.ending ? bluetooth.snapshot() : ["connected": false, "telemetry": [:], "telemetryTimes": [:]]
-        return ["ok": true, "id": run.id.uuidString.lowercased(), "ticket": run.id.uuidString.lowercased(),
+        // not_recorded 是终态：没有文件可写，但这条记录已经收尾，网页不能再等 saved。
+        // 网页 `s.saved !== true` 同时控制「结束并保存」按钮和 throw 分支，回 false 会让它无限重试。
+        let saved = (run.completed && !run.saveFailed) || run.empty
+        var value: [String: Any] = ["ok": true, "id": run.id.uuidString.lowercased(), "ticket": run.id.uuidString.lowercased(),
             "recordingId": run.id.uuidString.lowercased(), "state": run.state, "recordState": run.recordState,
             "reason": run.reason, "startedAt": run.startedAt, "endedAt": run.endedAt as Any? ?? NSNull(),
             "samples": run.samples, "recordedSamples": run.samples, "elapsedMs": run.elapsedMs, "durationMs": run.durationMs,
@@ -758,8 +1039,20 @@ final class IOSRideService: NSObject, IOSBridgeService, IOSBridgeCancellableServ
             "telemetry": ble["telemetry"] ?? [:], "telemetryTimes": ble["telemetryTimes"] ?? [:], "fields": ble["fields"] ?? [:],
             "authenticated": false, "automaticUnlock": false, "backgroundRequested": run.backgroundWanted,
             "backgroundEnabled": active === run && !run.ending && gps.backgroundAllowed, "backgroundGuaranteed": false,
-            "saved": run.completed && !run.saveFailed, "retryAvailable": run.saveFailed, "savedBytes": run.savedBytes,
-            "report": report(run)]
+            "saved": saved, "retryAvailable": run.saveFailed, "savedBytes": run.savedBytes,
+            "orphans": orphanSummary(), "report": report(run)]
+        if run.empty {
+            // 0 采样：让网页能把「没采到数据」和「保存失败」区分开，给各自的人读提示。
+            value["reason"] = "no_samples"
+            value["summary"] = IOSRideText.notRecorded
+        }
+        return value
+    }
+
+    /// 孤儿记录只报数量与最近一条的开始时间，不带 id/身份；数量为 0 时也保持字段存在，
+    /// 网页不用判 undefined。扫盘在 configureScopeProvider 之后异步补上，所以这里读的是内存副本。
+    private func orphanSummary() -> [String: Any] {
+        ["count": orphanCount, "latestAt": orphanLatestAt as Any? ?? NSNull()]
     }
 
     private func report(_ run: Run) -> [String: Any] {
@@ -787,16 +1080,19 @@ final class IOSRideService: NSObject, IOSBridgeService, IOSBridgeCancellableServ
         run.checkpointDirty = false
         run.lastCheckpoint = now
         let value = record(run, final: false)
+        let owner = run.scope.ownerHash
         worker.async { [weak self, weak run] in
             guard let run = run else { return }
-            let result: Result<Int, Error>
-            do { result = .success(try IOSRideDisk.save(value, owner: run.scope.ownerHash, id: run.id)) }
+            let result: Result<Self.Saved, Error>
+            do { result = .success(try Self.persist(value, owner: owner, id: run.id)) }
             catch { result = .failure(error) }
             DispatchQueue.main.async {
                 guard let self = self else { return }
                 run.checkpointing = false
                 switch result {
-                case .success(let bytes): run.savedBytes = bytes
+                case .success(let saved):
+                    self.observeSaved(run, saved)
+                    if let kept = saved.keptSamples { self.applyTrim(run, kept: kept) }
                 case .failure(let error):
                     run.saveFailed = true
                     run.recordState = "save_failed"
@@ -813,6 +1109,14 @@ final class IOSRideService: NSObject, IOSBridgeService, IOSBridgeCancellableServ
             stop(run, state: "completed", reason: "user_stop", reply: reply)
         } else if let run = finals[id], run.scope.ownerHash == scope.ownerHash {
             reply(snapshot(run), nil)
+        } else if let empty = emptyFinals.first(where: { $0.id == id && $0.owner == scope.ownerHash }) {
+            // 0 采样记录已经销毁，但 end 的重复调用必须幂等回终态；
+            // 之前这里落到 stale_ticket，网页只看到「重试」而看不到「本次没记录到数据」。
+            reply(["ok": true, "accepted": false, "id": id.uuidString.lowercased(),
+                   "ticket": id.uuidString.lowercased(), "recordingId": id.uuidString.lowercased(),
+                   "state": "not_recorded", "recordState": "not_recorded", "reason": "no_samples",
+                   "summary": IOSRideText.notRecorded, "saved": true, "samples": 0,
+                   "endedAt": empty.at, "retryAvailable": false, "acceptedAt": empty.at], nil)
         } else { reply(failure("stale_ticket"), nil) }
     }
 
@@ -834,10 +1138,13 @@ final class IOSRideService: NSObject, IOSBridgeService, IOSBridgeCancellableServ
         removeObservers()
         clock?.invalidate(); clock = nil
         if run.samples == 0 {
+            // 0 采样不是失败：没有文件可写，但这条记录到此为止。
+            // empty=true 让 snapshot()/replySaved 回 saved:true，否则网页会一直卡在「保存尚未确认」。
             run.state = "not_recorded"
             run.recordState = "not_recorded"
             run.reason = "no_samples"
-            run.completed = false
+            run.empty = true
+            run.completed = true
             retire(run)
             replySaved(run)
             return
@@ -847,21 +1154,82 @@ final class IOSRideService: NSObject, IOSBridgeService, IOSBridgeCancellableServ
         saveFinal(run)
     }
 
+    /// 落盘结果。keptSamples 非空表示这次保存为压到 8 MiB 以内截断过尾部。
+    private struct Saved {
+        let bytes: Int
+        let samples: Int
+        let keptSamples: Int?
+    }
+
+    /// 统一的落盘入口：先正常写；单文件超 8 MiB 时截断尾部（保留最早样本）再写一次，
+    /// 并把 trimmed_for_size 记进 gaps。整条记录因为超限永远存不下会把 saveFailed 永久钉住，
+    /// 之后所有 checkpoint 都被跳过，所以这里必须兜住，而不是把 record_limit_reached 抛出去。
+    private static func persist(_ record: [String: Any], owner: String, id: UUID) throws -> Saved {
+        let samples = Int(IOSRideJSON.integer(record["samples"]) ?? 0)
+        do {
+            return Saved(bytes: try IOSRideDisk.save(record, owner: owner, id: id), samples: samples, keptSamples: nil)
+        } catch let failure as IOSRideDisk.Failure where failure.code == "record_limit_reached" {
+            guard let trimmed = IOSRideDisk.trimmed(record) else { throw failure }
+            let bytes = try IOSRideDisk.save(trimmed, owner: owner, id: id)
+            let kept = Int(IOSRideJSON.integer(trimmed["samples"]) ?? 0)
+            return Saved(bytes: bytes, samples: max(kept, 1), keptSamples: kept)
+        }
+    }
+
+    /// 截断后主线程内存里的 run 也要跟着裁，否则下一次 checkpoint 又把尾部塞回去、
+    /// 再超限再截断，形成「写成功但内容反复回弹」的死循环。
+    private func applyTrim(_ run: Run, kept: Int) {
+        guard kept > 0, kept < run.samples else { return }
+        let total = run.rawGPS.count + run.telemetry.count
+        guard total > 0 else { return }
+        let keepGPS = min(run.rawGPS.count, Int((Double(kept) * Double(run.rawGPS.count) / Double(total)).rounded(.down)))
+        let keepBLE = min(run.telemetry.count, kept - keepGPS)
+        run.rawGPS = Array(run.rawGPS.prefix(keepGPS))
+        run.telemetry = Array(run.telemetry.prefix(keepBLE))
+        run.gpsSamples = keepGPS
+        run.bleSamples = keepBLE
+        run.samples = keepGPS + keepBLE
+        // 截断只影响落盘体积；estimatedBytes 跟着缩，避免闸门继续按旧体积拒绝新样本。
+        run.estimatedBytes = max(2048, run.savedBytes)
+        markGap(run, source: "storage", reason: "trimmed_for_size", force: true)
+    }
+
     private func saveFinal(_ run: Run) {
         guard !run.saveInFlight else { return }
         run.saveInFlight = true
         let value = record(run, final: true)
+        let owner = run.scope.ownerHash
         worker.async { [weak self, weak run] in
             guard let run = run else { return }
-            let result: Result<Int, Error>
-            do { result = .success(try IOSRideDisk.save(value, owner: run.scope.ownerHash, id: run.id)) }
+            var result: Result<Self.Saved, Error>
+            do { result = .success(try Self.persist(value, owner: owner, id: run.id)) }
             catch { result = .failure(error) }
+            // iOS 侧原来没有 save_failed 的出口：网页从不发 ride.action{retry}，
+            // 用户看到「保存失败」就再也回不到 completed。这里在同一个 worker 上
+            // 停 300ms 自动补一次（常见诱因是瞬时磁盘压力/文件保护未就绪），
+            // 仍失败才真正置 save_failed，并让回执带 retryAvailable=true。
+            if case .failure = result {
+                // saveRetried 归主线程所有：这里回主线程取「这次由我重试」的权利再同步回来。
+                // 用 sync 而不是再派发一个 async，是为了让重试仍然留在同一个 worker 上，
+                // 不与用户发起的 retry 抢同一个文件。
+                let alreadyRetried = DispatchQueue.main.sync { () -> Bool in
+                    if run.saveRetried { return true }
+                    run.saveRetried = true
+                    return false
+                }
+                if !alreadyRetried {
+                    Thread.sleep(forTimeInterval: 0.3)
+                    do { result = .success(try Self.persist(value, owner: owner, id: run.id)) }
+                    catch { result = .failure(error) }
+                }
+            }
             DispatchQueue.main.async {
                 guard let self = self else { return }
                 run.saveInFlight = false
                 switch result {
-                case .success(let bytes):
-                    run.savedBytes = bytes
+                case .success(let saved):
+                    self.observeSaved(run, saved)
+                    if let kept = saved.keptSamples { self.applyTrim(run, kept: kept) }
                     run.saveFailed = false
                     run.completed = true
                     run.state = run.targetState
@@ -888,6 +1256,13 @@ final class IOSRideService: NSObject, IOSBridgeService, IOSBridgeCancellableServ
 
     private func retire(_ run: Run) {
         if active === run { active = nil; if Self.leaseOwner === self { Self.leaseOwner = nil } }
+        if run.empty {
+            // 0 采样没有文件也没有可重试的数据，不能占 finals 的 4 个保存槽位。
+            // 但网页重复调用 end 时仍应拿到终态回执，所以在内存里留一个短标记（只存 id/owner）。
+            emptyFinals.append((id: run.id, owner: run.scope.ownerHash, at: run.endedAt ?? run.startedAt))
+            if emptyFinals.count > 8 { emptyFinals.removeFirst(emptyFinals.count - 8) }
+            return
+        }
         finals[run.id] = run
         while finals.count > 4 {
             guard let remove = finals.values.filter({ !$0.saveFailed && !$0.saveInFlight && $0 !== run })
@@ -902,8 +1277,12 @@ final class IOSRideService: NSObject, IOSBridgeService, IOSBridgeCancellableServ
         for (revision, captured, reply) in waiters {
             guard revision == page, captured != nil, scopeProvider?() == captured else { reply(nil, "stale_navigation"); continue }
             var value = snapshot(run)
+            // not_recorded（empty）也算收尾成功：网页用这一条回执决定按钮文案和是否 throw，
+            // 回 ok=false 会让它一直重试同一条已经不存在的记录。
             value["ok"] = !run.saveFailed
             value["accepted"] = true
+            // retryAvailable 现在与 snapshot 语义一致：只有真的 saveFailed 才提示可重试。
+            value["retryAvailable"] = run.saveFailed
             reply(value, nil)
         }
     }
@@ -920,6 +1299,8 @@ final class IOSRideService: NSObject, IOSBridgeService, IOSBridgeCancellableServ
             guard run.state != "saving" else { reply(failure("save_busy"), nil); return }
             run.state = "saving"
             run.recordState = "saving"
+            // 手动重试是新的一次机会，重置自动重试标记：否则这次再失败就不会补尝试了。
+            run.saveRetried = false
             run.saveWaiters.append((page, scopeProvider?(), reply))
             saveFinal(run) // 同一 UUID 原子替换，不追加第二条历史。
             return
@@ -1009,14 +1390,24 @@ final class IOSRideService: NSObject, IOSBridgeService, IOSBridgeCancellableServ
             reply(failure("user_action_required"), nil); return
         }
         guard active?.id != id, finals[id]?.saveInFlight != true else { reply(failure("recording_busy"), nil); return }
+        // 切换账号后 finals 里可能还留着上一个 owner 的 save_failed 副本（同一 UUID 理论上不跨账号，
+        // 但一旦出现，删掉的是别人唯一可重试的数据）。这里先按 owner 校验，再看磁盘。
+        if let cached = finals[id], cached.scope.ownerHash != scope.ownerHash {
+            reply(failure("stale_ticket"), nil); return
+        }
         confirm(method: "ride.delete", id: id, scope: scope, title: IOSStrings.rideDeleteTitle,
                 message: IOSStrings.rideDeleteMessage, reply: reply) { [weak self] consent in
             guard let self = self else { return }
             self.io(scope: scope, reply: { [weak self] value, error in
                 guard let self = self else { return }
-                if error == nil, (value as? [String: Any])?["ok"] as? Bool == true { self.finals.removeValue(forKey: id) }
+                if error == nil, (value as? [String: Any])?["ok"] as? Bool == true {
+                    self.finals.removeValue(forKey: id)
+                    self.emptyFinals.removeAll { $0.id == id }
+                }
                 self.finish(consent, value as? [String: Any] ?? self.failure(error ?? "delete_failed"))
             }) {
+                // 磁盘路径按 scope.ownerHash 拼，越界不了；finals 归属已在上面主线程校验过。
+                // 这里不碰 finals：work 闭包跑在 worker 上，读实例的主线程状态会引入竞争。
                 try IOSRideDisk.delete(owner: scope.ownerHash, id: id)
                 return ["ok": true, "id": id.uuidString.lowercased(), "deleted": true]
             }

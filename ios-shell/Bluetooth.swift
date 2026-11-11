@@ -21,6 +21,10 @@ final class IOSBluetoothService: NSObject, IOSBridgeService, IOSBridgeCancellabl
     static let serviceUUID = CBUUID(string: "0000B354-D6D8-C7EC-BDF0-EAB1BFC6BCBC")
     static let writeUUID = CBUUID(string: "0000B356-D6D8-C7EC-BDF0-EAB1BFC6BCBC")
     static let notifyUUID = CBUUID(string: "0000B357-D6D8-C7EC-BDF0-EAB1BFC6BCBC")
+    // 通知连续失败到这个次数才判定链路失效；单次错误只记到快照里。
+    private static let notifyFailureLimit = 3
+    // 系统断开/取消连接的回调可能丢失；超过这个时长就让 UUID 允许重新连接。
+    private static let retiringStaleAfter: TimeInterval = 5
 
     let methods = ["ble.status", "ble.scan", "ble.stopScan", "ble.connect", "ble.disconnect",
                    "ble.services", "ble.read", "ble.subscribe", "ble.write", "ble.poll"]
@@ -41,7 +45,7 @@ final class IOSBluetoothService: NSObject, IOSBridgeService, IOSBridgeCancellabl
         let restored: Bool
     }
 
-    private enum Kind { case connect, services, characteristics, initialNotify, read, subscribe, write }
+    private enum Kind { case connect, services, characteristics, initialNotify, subscribe, write }
     private final class Operation {
         let kind: Kind
         let epoch: UUID
@@ -61,10 +65,17 @@ final class IOSBluetoothService: NSObject, IOSBridgeService, IOSBridgeCancellabl
         var offset = 0
         var chunkBytes = 0
         var chunks = 0
+        var timeout: DispatchWorkItem?
         init(kind: Kind, call: Call, characteristic: CBCharacteristic, enabled: Bool = false, data: Data = Data()) {
             self.kind = kind; self.call = call; self.characteristic = characteristic
             self.enabled = enabled; self.data = data
         }
+    }
+
+    // 待排空的旧连接：带时间戳，回调丢失时可以按时间兜底清理。
+    private struct Retiring {
+        let peripheral: CBPeripheral
+        let at: TimeInterval
     }
 
     private struct Observer {
@@ -84,7 +95,7 @@ final class IOSBluetoothService: NSObject, IOSBridgeService, IOSBridgeCancellabl
     private var reason = ""
     private var seen: [UUID: Seen] = [:]
     private var restoredIdentifiers = Set<UUID>()
-    private var retiring: [UUID: CBPeripheral] = [:]
+    private var retiring: [UUID: Retiring] = [:]
     private var scanCall: Call?
     private var scanRequested = false
     private var scanDeadline: TimeInterval = 0
@@ -106,6 +117,9 @@ final class IOSBluetoothService: NSObject, IOSBridgeService, IOSBridgeCancellabl
     private var telemetryUptime: [String: TimeInterval] = [:]
     private var telemetryFields: [String: Any] = [:]
     private var values: [[String: Any]] = []
+    private var lastNotifyValue: [String: Any]?
+    private var notifyFailures = 0
+    private var lastNotifyError = ""
     private var sequence: Int64 = 0
     private var droppedValues = 0
     private var streamRejected: Int64 = 0
@@ -119,6 +133,9 @@ final class IOSBluetoothService: NSObject, IOSBridgeService, IOSBridgeCancellabl
         ) { [weak self] _ in
             guard let self = self else { return }
             self.checkScope()
+            // 蓝牙授权框期间系统会先变 .inactive：那时 startScan 主动放弃，回到前台必须补扫，
+            // 否则首次扫描整段空转到 deadline。didBecomeActive 时 applicationState 已是 .active。
+            self.startScan()
             self.publish()
         }
     }
@@ -208,20 +225,33 @@ final class IOSBluetoothService: NSObject, IOSBridgeService, IOSBridgeCancellabl
             }
             reply(["ok": true, "id": peripheral!.identifier.uuidString.lowercased(), "services": serviceList()], nil)
         case "ble.read", "ble.subscribe":
-            guard let characteristic = resolve(options) else { reply(failure("characteristic_unavailable"), nil); return }
             if method == "ble.read" {
-                guard characteristic.properties.contains(.read) else { reply(failure("read_not_supported"), nil); return }
-                // CoreBluetooth 的通知与 read 使用同一个回调。已订阅时不把一条通知冒充读回执。
-                guard !characteristic.isNotifying else { reply(failure("read_while_subscribed"), nil); return }
-                enqueue(Request(kind: .read, call: Call(page: page, reply: reply), characteristic: characteristic))
-            } else {
-                guard userAction(options) else { reply(failure("user_action_required"), nil); return }
-                guard characteristic.properties.contains(.notify) || characteristic.properties.contains(.indicate) else {
-                    reply(failure("notify_not_supported"), nil); return
+                // 只读仪表的 notify 特征一直订阅着，而 CoreBluetooth 的通知和 GATT read 走同一个回调，
+                // 真做 readValue 也无法区分回执是不是旧通知。这里把语义定为「取最近一次通知缓存」，
+                // 不临时停订阅、不伪造一次 read 回执；没收到过通知就如实报 no_cached_value。
+                guard let characteristic = resolve(options, fallback: Self.notifyUUID) else {
+                    reply(failure("characteristic_unavailable"), nil); return
                 }
-                let enabled = options["enabled"] as? Bool ?? true
-                enqueue(Request(kind: .subscribe, call: Call(page: page, reply: reply), characteristic: characteristic, enabled: enabled))
+                guard characteristic === notifyCharacteristic else { reply(failure("read_not_supported"), nil); return }
+                guard let cached = lastNotifyValue else { reply(failure("no_cached_value"), nil); return }
+                var value = snapshot()
+                value["source"] = "notify_cache"
+                value["valueB64"] = cached["valueB64"] as Any? ?? NSNull()
+                value["at"] = cached["at"] as Any? ?? NSNull()
+                value["service"] = cached["service"] as Any? ?? Self.serviceUUID.uuidString.lowercased()
+                value["characteristic"] = cached["characteristic"] as Any? ?? Self.notifyUUID.uuidString.lowercased()
+                reply(value, nil)
+                return
             }
+            guard let characteristic = resolve(options, fallback: Self.notifyUUID) else {
+                reply(failure("characteristic_unavailable"), nil); return
+            }
+            guard userAction(options) else { reply(failure("user_action_required"), nil); return }
+            guard characteristic.properties.contains(.notify) || characteristic.properties.contains(.indicate) else {
+                reply(failure("notify_not_supported"), nil); return
+            }
+            let enabled = options["enabled"] as? Bool ?? true
+            enqueue(Request(kind: .subscribe, call: Call(page: page, reply: reply), characteristic: characteristic, enabled: enabled))
         case "ble.write": confirmWrite(options, reply: reply)
         default: reply(nil, "unsupported_method")
         }
@@ -231,7 +261,8 @@ final class IOSBluetoothService: NSObject, IOSBridgeService, IOSBridgeCancellabl
         precondition(Thread.isMainThread)
         if method == "ble.scan" { finishScan(reason: "operation_cancelled", ok: false) }
         if method == "ble.write" { cancelConfirmation("operation_cancelled") }
-        if ["ble.connect", "ble.read", "ble.subscribe", "ble.write"].contains(method),
+        // ble.read 现在只读通知缓存、同步返回，不占用连接；撤销它不该顺手关掉别人的连接。
+        if ["ble.connect", "ble.subscribe", "ble.write"].contains(method),
            connectCall != nil || currentRequest != nil || !requests.isEmpty {
             closeConnection("operation_cancelled")
         }
@@ -249,11 +280,13 @@ final class IOSBluetoothService: NSObject, IOSBridgeService, IOSBridgeCancellabl
             closeConnection("navigation_changed")
         }
         values.removeAll()
+        lastNotifyValue = nil
     }
 
     func applicationBackgrounded() {
         precondition(Thread.isMainThread)
-        finishScan(reason: "background_interrupted")
+        // 后台打断不等于扫到 deadline：ok:false，网页才能把「中途中止」和正常收尾区分开。
+        finishScan(reason: "background_interrupted", ok: false)
         cancelConfirmation("foreground_required")
         if operation != nil || currentRequest != nil || !requests.isEmpty || connectCall != nil || !canKeepInBackground {
             closeConnection("background_interrupted")
@@ -289,6 +322,9 @@ final class IOSBluetoothService: NSObject, IOSBridgeService, IOSBridgeCancellabl
             "protocol": "captured_ble1_small_frames", "iosVehicleVerification": "not_performed",
             "maxWriteBytes": peripheral.map { $0.maximumWriteValueLength(for: .withResponse) as Any } ?? NSNull(),
             "attMTU": NSNull(), "notifyEnabled": notifyCharacteristic?.isNotifying ?? false,
+            // 通知错误不再只写 reason：连续失败计数和最后一条错误都要能在轮询里看到，网页才好显示异常。
+            "notifyFailures": notifyFailures, "lastNotifyError": lastNotifyError,
+            "lastNotifyAt": lastNotifyValue?["at"] as Any? ?? NSNull(),
             "devices": devices(), "telemetry": fresh, "telemetryTimes": times,
             "fields": telemetryFields, "seq": sequence,
             "stream": ["buffered": streamBuffered, "rejected": streamRejected, "skipped": streamSkipped],
@@ -372,7 +408,9 @@ final class IOSBluetoothService: NSObject, IOSBridgeService, IOSBridgeCancellabl
               UIApplication.shared.applicationState == .active,
               ProcessInfo.processInfo.systemUptime < scanDeadline else { return }
         // iOS 不提供 MAC；只扫真实车辆服务，默认不重复广播，无无界附近设备收集。
-        central?.scanForPeripherals(withServices: [Self.serviceUUID], options: [CBCentralManagerScanOptionAllowDuplicatesKey: false])
+        if central?.isScanning != true {
+            central?.scanForPeripherals(withServices: [Self.serviceUUID], options: [CBCentralManagerScanOptionAllowDuplicatesKey: false])
+        }
         if !connected { state = "scanning"; reason = "" }
         publish()
     }
@@ -396,11 +434,12 @@ final class IOSBluetoothService: NSObject, IOSBridgeService, IOSBridgeCancellabl
         if let role = options["role"] as? NSNumber, role.intValue != 1 { reply(failure("unsupported_ble2"), nil); return }
         if connected && peripheral?.identifier == id && connectionScope == scope { reply(snapshot(), nil); return }
         guard peripheral == nil, connectCall == nil else { reply(failure("connection_busy"), nil); return }
+        pruneSeen()
         if retiring[id] != nil {
             // 必须等 didDisconnect/didFailToConnect 排空旧连接，不能只看 state 后复用同一对象。
+            // pruneSeen 里会按 5 秒兜底清掉回调丢失的条目，所以这里不会永久卡住。
             reply(failure("connection_closing"), nil); return
         }
-        pruneSeen()
         guard let known = seen[id], known.restored || ProcessInfo.processInfo.systemUptime - known.seenAt <= 60 else {
             reply(failure("identifier_not_seen_or_restored"), nil); return
         }
@@ -414,6 +453,9 @@ final class IOSBluetoothService: NSObject, IOSBridgeService, IOSBridgeCancellabl
         writeCharacteristic = nil
         notifyCharacteristic = nil
         clearTelemetry()
+        // 新连接从零开始统计通知失败，避免上次连接的错误影响新会话。
+        notifyFailures = 0
+        lastNotifyError = ""
         known.peripheral.delegate = self
         connectCall = Call(page: page, reply: reply)
         state = "connecting"
@@ -429,14 +471,23 @@ final class IOSBluetoothService: NSObject, IOSBridgeService, IOSBridgeCancellabl
         return CBUUID(string: text) == expected
     }
 
-    private func resolve(_ options: [String: Any]) -> CBCharacteristic? {
-        guard connected, validID(options, optional: true), checkScope(),
-              let service = options["service"] as? String,
-              let characteristic = options["characteristic"] as? String,
-              matchesUUID(service, expected: Self.serviceUUID) else { return nil }
-        if matchesUUID(characteristic, expected: Self.writeUUID) { return writeCharacteristic }
-        if matchesUUID(characteristic, expected: Self.notifyUUID) { return notifyCharacteristic }
-        return nil
+    // 服务/特征本来就在类常量里写死，网页不需要（也从不）传 UUID：
+    // 缺省时按调用方语义回落到固定 UUID（写路径 writeUUID / 通知路径 notifyUUID），
+    // 只有网页显式给出时才做严格匹配，避免悄悄接受别的特征。
+    private func resolve(_ options: [String: Any], fallback: CBUUID) -> CBCharacteristic? {
+        guard connected, validID(options, optional: true), checkScope() else { return nil }
+        if let service = options["service"] as? String, !matchesUUID(service, expected: Self.serviceUUID) { return nil }
+        let characteristic: CBCharacteristic?
+        if let text = options["characteristic"] as? String {
+            if matchesUUID(text, expected: Self.writeUUID) { characteristic = writeCharacteristic }
+            else if matchesUUID(text, expected: Self.notifyUUID) { characteristic = notifyCharacteristic }
+            else { return nil }
+        } else if fallback == Self.writeUUID {
+            characteristic = writeCharacteristic
+        } else {
+            characteristic = notifyCharacteristic
+        }
+        return characteristic
     }
 
     private func validID(_ options: [String: Any], optional: Bool) -> Bool {
@@ -448,7 +499,9 @@ final class IOSBluetoothService: NSObject, IOSBridgeService, IOSBridgeCancellabl
     private func confirmWrite(_ options: [String: Any], reply: @escaping (Any?, String?) -> Void) {
         guard userAction(options) else { reply(failure("user_action_required"), nil); return }
         guard options["withResponse"] as? Bool != false else { reply(failure("write_response_required"), nil); return }
-        guard let target = resolve(options), target.uuid == Self.writeUUID, target.properties.contains(.write) else {
+        // 网页只传 { command, payloadHex }，不带 UUID；写路径缺省回落到固定的写特征。
+        guard let target = resolve(options, fallback: Self.writeUUID),
+              target.uuid == Self.writeUUID, target.properties.contains(.write) else {
             reply(failure("write_characteristic_unavailable"), nil); return
         }
         // 不提供任意 raw 车辆写入。124 的开/关周期遥测是 Android 实捕的安全只读请求；
@@ -520,13 +573,10 @@ final class IOSBluetoothService: NSObject, IOSBridgeService, IOSBridgeCancellabl
         guard requests.count + (currentRequest == nil ? 0 : 1) < 16 else {
             finish(request.call, failure("queue_full")); return
         }
+        // 超时不在这里起算：排队等待的时间不算执行超时，否则第 16 条会被队伍自己耗死。
+        // 但要清掉 write 确认框留下的旧定时器，执行期超时改由 pump 重新 arm。
         request.call.timeout?.cancel()
-        let timer = DispatchWorkItem { [weak self, weak request] in
-            guard let self = self, let request = request, request.call.reply != nil else { return }
-            self.closeConnection("operation_timeout")
-        }
-        request.call.timeout = timer
-        DispatchQueue.main.asyncAfter(deadline: .now() + 30, execute: timer)
+        request.call.timeout = nil
         requests.append(request)
         pumpLater()
     }
@@ -539,17 +589,31 @@ final class IOSBluetoothService: NSObject, IOSBridgeService, IOSBridgeCancellabl
         }
     }
 
+    // 请求真正开始执行时才 arm 超时；到期只结束这一条，不关闭连接影响队头其他请求。
+    private func armRequestTimeout(_ request: Request) {
+        request.timeout?.cancel()
+        let timer = DispatchWorkItem { [weak self, weak request] in
+            guard let self = self, let request = request, self.currentRequest === request else { return }
+            self.clearOperation()
+            self.currentRequest = nil
+            self.finish(request.call, self.failure("operation_timeout"))
+            self.pumpLater()
+        }
+        request.timeout = timer
+        DispatchQueue.main.asyncAfter(deadline: .now() + 30, execute: timer)
+    }
+
     private func pump() {
         guard connected, checkScope(), operation == nil, let value = peripheral else { return }
         guard UIApplication.shared.applicationState == .active else { closeConnection("foreground_required"); return }
-        if currentRequest == nil, !requests.isEmpty { currentRequest = requests.removeFirst() }
+        if currentRequest == nil, !requests.isEmpty {
+            let next = requests.removeFirst()
+            currentRequest = next
+            armRequestTimeout(next)
+        }
         guard let request = currentRequest else { return }
         guard request.call.page == page else { completeRequest(failure("stale_navigation")); return }
         switch request.kind {
-        case .read:
-            guard !request.characteristic.isNotifying else { completeRequest(failure("read_while_subscribed")); return }
-            beginOperation(.read, seconds: 6, characteristic: request.characteristic)
-            value.readValue(for: request.characteristic)
         case .subscribe:
             if request.characteristic.isNotifying == request.enabled {
                 completeRequest(["ok": true, "enabled": request.enabled, "state": "connected"])
@@ -575,6 +639,8 @@ final class IOSBluetoothService: NSObject, IOSBridgeService, IOSBridgeCancellabl
     private func completeRequest(_ value: [String: Any]) {
         guard let request = currentRequest else { return }
         currentRequest = nil
+        request.timeout?.cancel()
+        request.timeout = nil
         clearOperation()
         finish(request.call, value)
         pumpLater()
@@ -591,7 +657,6 @@ final class IOSBluetoothService: NSObject, IOSBridgeService, IOSBridgeCancellabl
             case .connect: code = "connect_timeout"
             case .services, .characteristics: code = "discovery_timeout"
             case .initialNotify, .subscribe: code = "subscription_timeout"
-            case .read: code = "read_timeout"
             case .write: code = "write_timeout"
             }
             self.closeConnection(code)
@@ -621,6 +686,8 @@ final class IOSBluetoothService: NSObject, IOSBridgeService, IOSBridgeCancellabl
         let queued = requests
         connectCall = nil
         currentRequest = nil
+        current?.timeout?.cancel()
+        requests.forEach { $0.timeout?.cancel() }
         requests.removeAll()
         epoch = UUID()
         clearOperation()
@@ -633,7 +700,7 @@ final class IOSBluetoothService: NSObject, IOSBridgeService, IOSBridgeCancellabl
         reason = code
         if let old = old {
             if old.state != .disconnected {
-                retiring[old.identifier] = old
+                retiring[old.identifier] = Retiring(peripheral: old, at: ProcessInfo.processInfo.systemUptime)
                 central?.cancelPeripheralConnection(old)
             }
             // 不调用移除 bond/配对/解绑；iOS 本来就没有面向 App 的 MAC/bond 管理接口。
@@ -667,10 +734,33 @@ final class IOSBluetoothService: NSObject, IOSBridgeService, IOSBridgeCancellabl
         telemetryUptime.removeAll()
         telemetryFields.removeAll()
         values.removeAll()
+        // 通知缓存与连接同生命周期；失败计数不在这里清，断开后仍要让网页看到上次的 lastNotifyError。
+        lastNotifyValue = nil
         streamBuffered = 0
     }
 
+    // 系统断开/取消连接的回调不保证每次都到；超过时限的条目按已排空处理，
+    // 否则一个丢掉的回调会让该 UUID 在本次进程内再也连不上。
+    private func pruneRetiring() {
+        guard !retiring.isEmpty else { return }
+        let now = ProcessInfo.processInfo.systemUptime
+        retiring = retiring.filter { now - $0.value.at < Self.retiringStaleAfter }
+    }
+
+    // 通知错误先累计到快照；连续到阈值才判定链路失效并断开，让网页能显示异常、骑行也能记 gap。
+    private func noteNotifyFailure() {
+        protocolCodec.clearStream()
+        notifyFailures += 1
+        lastNotifyError = "notification_failed"
+        if notifyFailures >= Self.notifyFailureLimit {
+            closeConnection("notification_failed")
+        } else {
+            publish()
+        }
+    }
+
     private func pruneSeen() {
+        pruneRetiring()
         let now = ProcessInfo.processInfo.systemUptime
         seen = seen.filter { $0.value.restored || now - $0.value.seenAt <= 60 || $0.key == peripheral?.identifier }
         if seen.count > 64 {
@@ -761,6 +851,8 @@ final class IOSBluetoothService: NSObject, IOSBridgeService, IOSBridgeCancellabl
     }
 
     private func appendValue(_ value: [String: Any]) {
+        // 最近一条安全原始帧同时作为 ble.read 的缓存来源；ble.poll 清队列时不清它。
+        lastNotifyValue = value
         if values.count >= 64 { values.removeFirst(); droppedValues += 1 }
         values.append(value)
     }
@@ -796,7 +888,7 @@ final class IOSBluetoothService: NSObject, IOSBridgeService, IOSBridgeCancellabl
             seen[value.identifier] = Seen(peripheral: value, name: value.name.map { String($0.prefix(80)) },
                 rssi: nil, connectable: nil, seenAt: ProcessInfo.processInfo.systemUptime, restored: true)
             if value.state != .disconnected {
-                retiring[value.identifier] = value
+                retiring[value.identifier] = Retiring(peripheral: value, at: ProcessInfo.processInfo.systemUptime)
                 central.cancelPeripheralConnection(value)
             }
             value.delegate = nil
@@ -888,26 +980,15 @@ final class IOSBluetoothService: NSObject, IOSBridgeService, IOSBridgeCancellabl
 
     func peripheral(_ peripheral: CBPeripheral, didUpdateValueFor characteristic: CBCharacteristic, error: Error?) {
         guard owned(peripheral) else { return }
-        let pending = operation
-        if pending?.kind == .read, pending?.characteristic === characteristic {
-            guard error == nil, let data = characteristic.value, data.count <= 2048 else { closeConnection("read_failed"); return }
-            let at = Int64(Date().timeIntervalSince1970 * 1000)
-            let frame = IOSRideJSON.object(protocolCodec.decodeTelemetryJSON(frameHex: data.hexString, at: at))
-            if let frame = frame, safeRaw(frame) {
-                completeRequest(["ok": true, "valueB64": data.base64EncodedString(), "at": at,
-                                 "service": Self.serviceUUID.uuidString.lowercased(),
-                                 "characteristic": characteristic.uuid.uuidString.lowercased()])
-            } else {
-                // 分片/认证/未知 bytes 不回显。返回失败，而不是伪造一个“读到的值”。
-                completeRequest(failure("private_or_fragmented_value"))
-            }
-            if characteristic === notifyCharacteristic { receive(data, characteristic: characteristic) }
-            return
-        }
+        // 不再有 GATT read 操作：这个回调只承载通知。错误时累计失败次数，
+        // 连续到阈值才断开（进骑行 gap、网页能看到断开），单次错误只记进快照。
         guard characteristic === notifyCharacteristic, characteristic.isNotifying, connected else { return }
+        // 单条异常（error 或拿不到值）只累计；超大帧仍交给 receive 按既有规则丢弃。
         guard error == nil, let data = characteristic.value else {
-            reason = "notification_failed"; protocolCodec.clearStream(); publish(); return
+            noteNotifyFailure(); return
         }
+        notifyFailures = 0
+        lastNotifyError = ""
         receive(Data(data), characteristic: characteristic)
     }
 

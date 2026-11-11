@@ -50,14 +50,17 @@ public enum SystemSnapshotStore {
             if let current = try owner(at: root), current != expectedOwner {
                 throw SystemSnapshotError("snapshot_owner_mismatch")
             }
-            // 先完整原子写数据，再原子发布 owner；崩溃中断时最多读不到，绝不读到另一账号的数据。
+            // orphan 清理排在实际发布之前：旧快照先删掉，目录里就不会因为残留的
+            // 临时文件/未知条目把下面的原子写卡死在 snapshot_storage_invalid。
+            // （清理本身只删「本 store 命名的旧快照」与临时文件，不碰别的文件。）
             let target = path(root, owner: expectedOwner)
+            try removeOrphans(root, keeping: [target.lastPathComponent, markerName, lockName])
+            // 先完整原子写数据，再原子发布 owner；崩溃中断时最多读不到，绝不读到另一账号的数据。
             try ensureRegularFile(target, missingAllowed: true)
             try protectedWrite(data, to: target)
             let marker = root.appendingPathComponent(markerName, isDirectory: false)
             try ensureRegularFile(marker, missingAllowed: true)
             try protectedWrite(try encoder.encode(expectedOwner), to: marker)
-            try removeOrphans(root, keeping: target.lastPathComponent)
         }
     }
 
@@ -159,12 +162,26 @@ public enum SystemSnapshotStore {
         try protected.setResourceValues(resource)
     }
 
-    private static func removeOrphans(_ root: URL, keeping name: String) throws {
-        let entries = try FileManager.default.contentsOfDirectory(at: root, includingPropertiesForKeys: [.isRegularFileKey], options: [])
-        guard entries.count <= 8 else { throw SystemSnapshotError("snapshot_storage_limit") }
-        for entry in entries where ![name, markerName, lockName].contains(entry.lastPathComponent) {
+    /// 删除本 store 不再需要的旧快照与残留临时文件。
+    ///
+    /// `keeping` 里是要保留的条目名（本次要写的目标、owner marker、跨进程锁）。
+    ///
+    /// 为什么要容忍临时文件：`Data.write(.atomic)` 会先在同目录写一个临时文件再 rename；
+    /// 进程被杀（或 extension 被系统回收）就会留下 `.dat.nosyncXXXX` 这类条目。
+    /// 旧实现遇到不认识的名字直接抛 `snapshot_storage_invalid`，于是一个残留临时文件
+    /// 就能让后续每一次写入永久失败——只能删 App 才能恢复。临时文件没有保留价值，直接删。
+    private static func removeOrphans(_ root: URL, keeping names: Set<String>) throws {
+        let entries = try FileManager.default.contentsOfDirectory(at: root, includingPropertiesForKeys: [.isRegularFileKey],
+                                                                  options: [])
+        for entry in entries where !names.contains(entry.lastPathComponent) {
+            let name = entry.lastPathComponent
+            // 原子写留下的临时条目：以 "." 开头（`.dat.nosync...`）或含 `.nosync`。
+            if name.hasPrefix(".") || name.contains(".nosync") {
+                try? FileManager.default.removeItem(at: entry)
+                continue
+            }
             // 不枚举账号历史；仅清理由此 store 命名的旧匿名快照。
-            let parts = entry.lastPathComponent.split(separator: ".")
+            let parts = name.split(separator: ".")
             guard parts.count == 3, parts[2] == "json",
                   SystemSnapshotOwner(scopeID: String(parts[1]), accountVINHash: String(parts[0])).isValid else {
                 throw SystemSnapshotError("snapshot_storage_invalid")
@@ -172,6 +189,10 @@ public enum SystemSnapshotStore {
             try ensureRegularFile(entry, missingAllowed: false)
             try FileManager.default.removeItem(at: entry)
         }
+        // 数量上限放在清理之后：目录里堆了多个旧快照时，先删再判断才有机会自愈；
+        // 放在前面会让「条目过多」变成永久失败。`coordinated` 入口仍有一道同样的闸门。
+        let remaining = try FileManager.default.contentsOfDirectory(atPath: root.path).count
+        guard remaining <= 8 else { throw SystemSnapshotError("snapshot_storage_limit") }
     }
 
     private static func coordinated<T>(create: Bool, action: (URL) throws -> T) throws -> T {
@@ -207,7 +228,10 @@ public enum SystemSnapshotStore {
         guard locked else { throw SystemSnapshotError("snapshot_store_busy") }
         defer { _ = flock(descriptor, LOCK_UN) }
         let entries = try manager.contentsOfDirectory(at: root, includingPropertiesForKeys: nil, options: [])
-        guard entries.count <= 8 else { throw SystemSnapshotError("snapshot_storage_limit") }
+        // 写路径放宽到 64：目录里堆了旧快照 + 原子写临时文件时，必须能进到
+        // removeOrphans 才有机会删干净并自愈；8 条硬门槛会把这种状态锁死成永久失败。
+        // 仍然有硬上限，避免被异常目录拖进无界枚举。读路径保持严格的 8。
+        guard entries.count <= (create ? 64 : 8) else { throw SystemSnapshotError("snapshot_storage_limit") }
         return try action(root)
         #else
         throw SystemSnapshotError("app_group_unavailable")

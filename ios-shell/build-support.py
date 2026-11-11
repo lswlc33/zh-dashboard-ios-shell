@@ -13,6 +13,7 @@ import stat
 import struct
 import subprocess
 import sys
+import uuid
 import zipfile
 
 BUNDLE_ID = 'io.github.lswlc33.dashboard.ios'
@@ -27,6 +28,10 @@ FRAMEWORK_RELATIVE = 'native-shared/build/bin/iosArm64/releaseFramework/ZeehoSha
 WIDGET_ID = BUNDLE_ID + '.widgets'
 WIDGET_DIRECTORY = 'PlugIns/DashboardWidgets.appex/'
 APP_GROUP = 'group.io.github.lswlc33.dashboard.ios'
+# iOS 图标源：必须满出血（radius=0）、1024×1024。build.sh 与 xtool.yml 都指向它。
+IOS_ICON = 'public/icons/icon-ios-1024.png'
+# 归档进 zip 时必须是 LF 的脚本：CRLF 会让 Mac/Linux 的 bash 把 `\` 续行吃掉。
+SHELL_SCRIPTS = ('ios-shell/build.sh', 'ios-shell/build-xtool.sh', 'native-shared/gradlew')
 FIXED_INPUTS = {
     'ios-shell/Info.plist', 'ios-shell/build.sh', 'ios-shell/build-support.py',
     'ios-shell/test.py', 'ios-shell/bridge-bootstrap.js',
@@ -39,6 +44,10 @@ FIXED_INPUTS = {
     'native-shared/gradlew', 'native-shared/gradle/wrapper/gradle-wrapper.jar',
     'native-shared/gradle/wrapper/gradle-wrapper.properties',
     'public/icons/icon-512.png',
+    # build.sh 在打包 sips 图标前对它做硬闸门；不进白名单的话，
+    # `build-windows.ps1 -Mode Build -MacHost -AllowSourceUpload` 会先跑完 Gradle + swiftc，
+    # 才在 Mac 上因为「缺 iOS 图标源」失败，而且「上传快照 = 完整构建输入」也不成立。
+    'public/icons/icon-ios-1024.png',
 }
 OPTIONAL_INPUTS = {
     'native-shared/gradlew.bat', 'native-shared/gradle.properties',
@@ -73,9 +82,42 @@ def require(condition, message):
         raise ValueError(message)
 
 
+# 这些是真·文本：Windows（CRLF）与 CI/Mac（LF）对同一 commit 必须给出同一个指纹，
+# 否则「上传快照 == 完整构建输入」这条安全前提在跨平台时永远对不上。
+# 除常见源码扩展名外，还必须覆盖 .entitlements（XML 模板）、.toml（libs.versions）、
+# .xml/.html/.css/.txt —— 仓库里都存在，漏掉就会让同一 commit 有两个指纹。
+TEXT_EXTENSIONS = {
+    '.swift', '.py', '.sh', '.js', '.mjs', '.json', '.plist', '.entitlements', '.yml', '.yaml',
+    '.md', '.kt', '.kts', '.gradle', '.properties', '.toml', '.xml', '.html', '.css', '.txt',
+}
+
+
+def is_text_input(name):
+    base = str(name).replace('\\', '/').rsplit('/', 1)[-1]
+    # Gradle wrapper 没有扩展名，但它是必须按 LF 执行的 Shell 脚本。
+    return base == 'gradlew' or pathlib.PurePosixPath(base).suffix.lower() in TEXT_EXTENSIONS
+
+
+def normalized_bytes(path):
+    """读源文件字节；文本类把 CRLF 折成 LF，二进制（png/ipa/jar）原样返回。
+
+    archive/extract/inventory 三处都走这里，归档里写的就是归一化后的字节，
+    所以 Mac 上解包后重算哈希仍然等于清单；二进制不做归一，避免改动签名数据。
+    """
+    data = pathlib.Path(path).read_bytes()
+    if is_text_input(pathlib.Path(path).name):
+        return data.replace(b'\r\n', b'\n')
+    return data
+
+
 def sha256_file(path):
+    """对磁盘内容取哈希；文本类先归一换行，二进制逐字节精确。"""
     digest = hashlib.sha256()
-    with pathlib.Path(path).open('rb') as stream:
+    path = pathlib.Path(path)
+    if is_text_input(path.name):
+        digest.update(normalized_bytes(path))
+        return digest.hexdigest()
+    with path.open('rb') as stream:
         for block in iter(lambda: stream.read(1024 * 1024), b''):
             digest.update(block)
     return digest.hexdigest()
@@ -142,6 +184,12 @@ def tree_digest(records):
     return hashlib.sha256(encoded).hexdigest()
 
 
+def source_record(root, name):
+    """清单条目用「归一化后的字节」计数与取哈希，保证归档内容、清单、解包复算三者一致。"""
+    data = normalized_bytes(regular_source(root, name))
+    return {'path': name, 'size': len(data), 'sha256': hashlib.sha256(data).hexdigest()}
+
+
 def inventory(root, expected=None):
     root = pathlib.Path(root).resolve()
     missing = sorted(name for name in FIXED_INPUTS if not root.joinpath(*name.split('/')).is_file())
@@ -163,6 +211,15 @@ def inventory(root, expected=None):
         names.add(name)
     require(any(n.startswith('native-shared/src/commonMain/kotlin/') for n in names), 'KMP commonMain Kotlin source is missing')
     require(any(n.startswith('native-shared/src/jvmMain/kotlin/') for n in names), 'KMP JVM source is missing')
+    # 反向断言：iOS 图标源必须真的进清单（光有 FIXED_INPUTS 条目还不够，
+    # 白名单被谁改窄时这里要立刻 BLOCKED，而不是等到 Mac 上 sips 之前才发现）。
+    require(IOS_ICON in names, 'Missing iOS app icon source in the upload allowlist: ' + IOS_ICON)
+    icon = regular_source(root, IOS_ICON)
+    # 满出血 1024×1024 是 iOS 的唯一正确形状：带圆角会让系统再切一次角。
+    with icon.open('rb') as stream:
+        header = stream.read(24)
+    require(header.startswith(b'\x89PNG\r\n\x1a\n') and struct.unpack_from('>II', header, 16) == (1024, 1024),
+            IOS_ICON + ' must be a 1024x1024 PNG (full-bleed, radius=0)')
     swift = sorted(n for n in names if n.startswith('ios-shell/') and n.endswith('.swift')
                    and len(n.split('/')) == 2 and n != 'ios-shell/Package.swift')
     shared = sorted(n for n in names if n.startswith('ios-shell/Shared/') and n.endswith('.swift'))
@@ -195,8 +252,7 @@ def inventory(root, expected=None):
     require(re.search(r'^distributionUrl=https\\://services\.gradle\.org/distributions/gradle-\d+(?:\.\d+)+-(?:bin|all)\.zip\s*$', wrapper_text, re.M), 'Only a public official Gradle distribution URL is allowed in the source snapshot')
     if 'native-shared/gradle.properties' in names:
         check_public_properties(regular_source(root, 'native-shared/gradle.properties'))
-    records = [{'path': name, 'size': regular_source(root, name).stat().st_size,
-                'sha256': sha256_file(regular_source(root, name))} for name in sorted(names)]
+    records = [source_record(root, name) for name in sorted(names)]
     with regular_source(root, 'ios-shell/Info.plist').open('rb') as stream:
         info = plistlib.load(stream)
     validate_info(info)
@@ -247,6 +303,36 @@ def validate_output_directory(root, output):
     return output
 
 
+PUBLISHED_ARTIFACTS = (IPA_NAME, 'version.json', 'build-manifest.json', 'source-commit.txt', 'SHA256SUMS')
+
+
+def publish_artifacts(root, staged, output):
+    """把暂存产物整体搬进输出目录，要么全有要么全无。
+
+    逐文件 `xb` 拷贝在磁盘满/权限错误时会留下「有 ipa 但没有 version.json/SHA256SUMS」
+    的半套产物，而下游（README、发布脚本）只看 ipa 存在就当成功。
+    所以先写到输出目录里的临时子目录 `.publish-<uuid>`，全部写成功后再逐个
+    `os.replace` 到最终路径；任何一步失败都删掉临时目录并让输出目录保持原状。
+    """
+    output = validate_output_directory(root, output)
+    staged = pathlib.Path(staged).resolve()
+    for name in PUBLISHED_ARTIFACTS:
+        require((staged / name).is_file(), 'Staged artifact is missing: ' + name)
+    output.mkdir(parents=True, exist_ok=True)
+    temp = output / ('.publish-' + uuid.uuid4().hex)
+    temp.mkdir()
+    try:
+        for name in PUBLISHED_ARTIFACTS:
+            with (staged / name).open('rb') as source, (temp / name).open('xb') as destination:
+                shutil.copyfileobj(source, destination)
+        for name in PUBLISHED_ARTIFACTS:
+            os.replace(temp / name, output / name)
+    finally:
+        # 成功时临时目录已空；失败时把半成品清掉，别留一个看起来像产物目录的残留。
+        shutil.rmtree(temp, ignore_errors=True)
+    return output
+
+
 def validate_info(info, executable='Dashboard', bundle_id=BUNDLE_ID):
     require(info.get('CFBundlePackageType') == 'APPL' and info.get('CFBundleExecutable') == executable, 'Invalid app executable/package type')
     require(info.get('CFBundleIdentifier') == bundle_id, 'Unexpected bundle identifier')
@@ -263,20 +349,41 @@ def archive_sources(root, output, manifest_path):
     require(output.parent != manifest_path.parent, 'Archive data and creator/control files must use separate directories')
     require(output.parent.is_dir() and not any(output.parent.iterdir()), 'Archive directory must be new and empty')
     manifest = inventory(root)
+    normalized = []
     with zipfile.ZipFile(output, 'x', compression=zipfile.ZIP_DEFLATED) as archive:
         for record in manifest['files']:
             path = regular_source(root, record['path'])
-            data = path.read_bytes()
-            require(hashlib.sha256(data).hexdigest() == record['sha256'], 'Source changed while making archive: ' + record['path'])
+            # 文本类先归一 CRLF→LF：Windows 工作树的脚本按原始字节打包，
+            # 到 Mac 上 `bash build.sh` 会把 `\` + CRLF 的续行断掉（报
+            # `--swift-list: command not found`）。归一后清单哈希也按同样字节算，
+            # 解包端复算仍然一致；这里只警告不 BLOCKED，因为这是开发者本地配置
+            # 差异，不是源码错误（.gitattributes 已声明 *.sh eol=lf）。
+            raw = path.read_bytes()
+            data = raw.replace(b'\r\n', b'\n') if is_text_input(record['path']) else raw
+            if hashlib.sha256(data).hexdigest() != record['sha256']:
+                raise ValueError('Source changed while making archive: ' + record['path'])
+            # 归一后仍带孤立的 CR（老式 Mac 行尾 / 混写）无法安全修复：
+            # bash 会把 `\` + CR 当成未知参数，症状与 CRLF 完全一样。
+            # 这种才是真的源码问题，必须 BLOCKED 而不是静默归一。
+            if record['path'] in SHELL_SCRIPTS and b'\r' in data:
+                raise ValueError('BLOCKED: ' + record['path'] + ' 含 CRLF（或孤立 CR），Shell 脚本必须在 LF 下打包')
+            if data != raw:
+                normalized.append(record['path'])
             entry = zipfile.ZipInfo(record['path'])
             entry.create_system = 3
-            mode = 0o755 if record['path'].endswith(('/gradlew', '/build.sh', '/build-xtool.sh')) else 0o644
+            mode = 0o755 if record['path'] in SHELL_SCRIPTS else 0o644
             entry.external_attr = (stat.S_IFREG | mode) << 16
             entry.compress_type = zipfile.ZIP_DEFLATED
             archive.writestr(entry, data)
     require(output.stat().st_size <= MAX_ARCHIVE_BYTES, 'Source archive exceeds the bounded upload size')
     manifest['archiveSha256'] = sha256_file(output)
     manifest['archiveSize'] = output.stat().st_size
+    if normalized:
+        # 记在清单里，方便事后解释「上传字节与工作树字节为何不同」；
+        # 终端只打一行摘要，别把几十个文件名刷满构建日志。
+        manifest['normalizedLineEndings'] = sorted(normalized)
+        preview = ', '.join(sorted(normalized)[:3])
+        print(f'warning: normalized CRLF to LF in {len(normalized)} text input(s) before archiving ({preview}...)', file=sys.stderr)
     write_json(manifest_path, manifest)
     return manifest
 
@@ -342,8 +449,8 @@ def macho(data, expected_type, signed=True, expected_minimum=0x000F0400):
     require(magic == 0xFEEDFACF and cpu == 0x0100000C and subtype & 0xFFFFFF in (0, 1), 'Expected a thin arm64 device Mach-O (not simulator/fat/placeholder)')
     require(filetype == expected_type, 'Unexpected Mach-O file type')
     require(0 < ncmds <= 8192 and command_size <= len(data) - 32, 'Invalid Mach-O load commands')
-    offset, imports, rpaths, platform, minimum, sdk, signature, symtab, entrypoint = 32, [], [], None, None, None, None, None, False
-    entry_offset, text_ranges = None, []
+    offset, imports, rpaths, platform, minimum, sdk, signature, symtab, dysymtab, entrypoint = 32, [], [], None, None, None, None, None, None, False
+    entry_offset, text_ranges, sections = None, [], []
     for _ in range(ncmds):
         require(offset + 8 <= 32 + command_size, 'Truncated load command')
         command, size = struct.unpack_from('<II', data, offset)
@@ -351,10 +458,22 @@ def macho(data, expected_type, signed=True, expected_minimum=0x000F0400):
         if command == 0x19:
             require(size >= 72, 'Truncated LC_SEGMENT_64')
             segment = data[offset + 8:offset + 24].split(b'\x00', 1)[0]
+            vm_address = struct.unpack_from('<Q', data, offset + 24)[0]
             file_offset, file_size = struct.unpack_from('<QQ', data, offset + 40)
             require(file_offset + file_size <= len(data), 'Segment file range exceeds binary')
             if segment == b'__TEXT':
-                text_ranges.append((file_offset, file_offset + file_size))
+                text_ranges.append((file_offset, file_offset + file_size, vm_address))
+            # 记下 S_SYMBOL_STUBS 段落：扩展的入口常常不是已定义符号，
+            # 而是 lazy bind 的 `_NSExtensionMain` stub（真机产物实测就是这样）。
+            section_count = struct.unpack_from('<I', data, offset + 64)[0]
+            require(size >= 72 + section_count * 80, 'Truncated LC_SEGMENT_64 sections')
+            for index in range(section_count):
+                base = offset + 72 + index * 80
+                section_addr, section_size = struct.unpack_from('<QQ', data, base + 32)
+                section_flags = struct.unpack_from('<I', data, base + 64)[0]
+                reserved1, reserved2 = struct.unpack_from('<II', data, base + 68)
+                if section_flags & 0xFF == 0x8:  # S_SYMBOL_STUBS
+                    sections.append((section_addr, section_size, reserved1, reserved2))
         elif command in (0xC, 0x80000018, 0x8000001F, 0x80000023, 0x20, 0x8000001C):
             require(size >= 12, 'Invalid dynamic import/rpath command')
             start = struct.unpack_from('<I', data, offset + 8)[0]
@@ -382,12 +501,23 @@ def macho(data, expected_type, signed=True, expected_minimum=0x000F0400):
         elif command == 0x2:
             require(size >= 24, 'Truncated LC_SYMTAB')
             symtab = struct.unpack_from('<4I', data, offset + 8)
+        elif command == 0xB:
+            # LC_DYSYMTAB = cmd/cmdsize + 18 个 uint32（共 80 字节）。
+            # 只解 18 个：写成 20 会读到命令之外，撞上后面命令的字节。
+            require(size >= 80, 'Truncated LC_DYSYMTAB')
+            dysymtab = struct.unpack_from('<18I', data, offset + 8)
         offset += size
     require(offset == 32 + command_size, 'Inconsistent Mach-O command table')
     require(platform == 2 and minimum is not None and minimum <= expected_minimum, 'Mach-O is not compatible with the required iOS device deployment')
+    lc_main_address = None
+    if entry_offset is not None:
+        for start, end, base in text_ranges:
+            if start <= entry_offset < end:
+                lc_main_address = base + (entry_offset - start)
+                break
     if expected_type == 2:
         require(minimum == expected_minimum and sdk is not None and sdk >= minimum, 'Executable deployment/SDK load-command record is missing or incorrect')
-        require(entrypoint and entry_offset is not None and any(start <= entry_offset < end for start, end in text_ranges),
+        require(entrypoint and entry_offset is not None and any(start <= entry_offset < end for start, end, _ in text_ranges),
                 'Real executable LC_MAIN entrypoint must address the __TEXT file range')
     signature_metadata = {'present': signature is not None, 'cryptographicVerification': False}
     if signed:
@@ -423,30 +553,57 @@ def macho(data, expected_type, signed=True, expected_minimum=0x000F0400):
                 signature_metadata['entitlements'] = entitlements
         require(directories, 'Code signature has no CodeDirectory')
     shared_symbols, widget_symbols, main_symbols = [], [], []
+    extension_entry_address = None
     if symtab:
         symbol_offset, count, string_offset, string_size = symtab
         require(count <= 1_000_000 and symbol_offset + count * 16 <= len(data) and string_offset + string_size <= len(data), 'Invalid Mach-O symbols')
         strings = data[string_offset:string_offset + string_size]
+
+        def symbol_name(index):
+            start = struct.unpack_from('<I', data, symbol_offset + index * 16)[0]
+            require(start < len(strings), 'Invalid symbol name offset')
+            end = strings.find(b'\x00', start)
+            require(end >= start, 'Unterminated Mach-O symbol')
+            return strings[start:end]
+
         for index in range(count):
-            string_index = struct.unpack_from('<I', data, symbol_offset + index * 16)[0]
-            require(string_index < len(strings), 'Invalid symbol name offset')
-            end = strings.find(b'\x00', string_index)
-            require(end >= string_index, 'Unterminated Mach-O symbol')
             # 避免逐符号复制整个 string table；只统计真正定义的 KMP 类，非未解析 imports。
             symbol_type = data[symbol_offset + index * 16 + 4]
-            name = strings[string_index:end]
+            name = symbol_name(index)
             if symbol_type & 0x0E == 0x0E and name.startswith(b'_OBJC_CLASS_$_ZeehoShared'):
                 shared_symbols.append(name.decode('utf-8'))
             if name == b'_NSExtensionMain':
-                widget_symbols.append(name.decode('utf-8'))
+                # 只认真正定义在某个 section 里的符号（`& 0x0E == 0x0E` ⇒ N_SECT）；
+                # ld 自动为 `-e _NSExtensionMain` 生成的 stub 会让同名符号以 undef 出现，
+                # 旧代码不过滤类型，等于「导入即算」，入口根本没被验证。
+                if symbol_type & 0x0E == 0x0E:
+                    extension_entry_address = struct.unpack_from('<Q', data, symbol_offset + index * 16 + 8)[0]
+                    widget_symbols.append(name.decode('utf-8'))
             if symbol_type & 0x0E == 0x0E and name in (b'_main', b'_DashboardIOS_main', b'_SwiftProbe_main'):
                 main_symbols.append(name.decode('utf-8'))
+        # 扩展的 LC_MAIN 通常落在 lazy 绑定的 `_NSExtensionMain` stub 上（真机产物实测），
+        # 那种形态下符号表里只有 undef；这里用 __stubs + 间接符号表把入口解析回符号名。
+        if entry_offset is not None and lc_main_address is not None and dysymtab and dysymtab[13]:
+            indirect_offset, indirect_count = dysymtab[12], dysymtab[13]
+            require(indirect_offset + indirect_count * 4 <= len(data), 'Invalid indirect symbol table')
+            for section_address, section_size, first, stride in sections:
+                if stride and section_address <= lc_main_address < section_address + section_size:
+                    slot = first + (lc_main_address - section_address) // stride
+                    require(slot < indirect_count, 'LC_MAIN stub index outside the indirect symbol table')
+                    value = struct.unpack_from('<I', data, indirect_offset + slot * 4)[0] & 0x7FFFFFFF
+                    require(value < count, 'Invalid stub symbol index')
+                    if symbol_name(value) == b'_NSExtensionMain':
+                        extension_entry_address = lc_main_address
+                        if not widget_symbols:
+                            widget_symbols.append('_NSExtensionMain')
+                    break
     return {'architecture': 'arm64', 'platform': 'iOS', 'minimumIOS': unpack_version(minimum),
             'SDKVersion': unpack_version(sdk) if sdk is not None else None,
             'fileType': {1: 'object', 2: 'executable', 6: 'dylib'}[expected_type],
             'imports': imports, 'rpaths': rpaths, 'codeSignaturePresent': signature is not None,
             'signature': signature_metadata, 'entrypointPresent': entrypoint, 'mainSymbols': main_symbols,
-            'extensionEntrypointSymbols': widget_symbols,
+            'extensionEntrypointSymbols': widget_symbols, 'entryAddress': lc_main_address,
+            'extensionEntryAddress': extension_entry_address,
             'sharedClassSymbolCount': len(shared_symbols), 'sharedClassSymbols': shared_symbols[:8]}
 
 
@@ -539,10 +696,31 @@ def validate_ipa(path, expected_info=None, backend='mac', probe=False):
         resource_name = app_prefix + '_CodeSignature/CodeResources'
         require(resource_name in names, 'App resource code signature missing')
         require(isinstance(plistlib.loads(archive.read(resource_name)), dict), 'Invalid app resource signature')
-        if backend == 'mac':
-            for size in (120, 152, 167, 180):
-                icon = archive.read(app_prefix + f'Icon{size}.png')
-                require(icon.startswith(b'\x89PNG\r\n\x1a\n') and len(icon) >= 24 and struct.unpack_from('>II', icon, 16) == (size, size), 'Missing/invalid fixed icon size')
+        # 两个后端都要查图标：xtool 后端同样产出一个可安装的 App 包，
+        # 绕过检查就会重新引入「四角白边」（xtool.yml 曾经指到带圆角的 icon-512.png）。
+        # probe 是明确声明的工具链探针（不是完整 App），不要求图标。
+        #
+        # 通用部分（两个后端）：包内必须存在图标 PNG，且每张都是正方形、边长 ≥ 60。
+        # mac 部分额外钉住 sips 产出的四个固定尺寸——那是 build.sh 的既有契约；
+        # 不在 xtool 上也写死 Icon{120,152,167,180}，因为图标产物命名由 xtool 决定，
+        # 写死名字只会在真实 xtool 产物上误杀。
+        if not probe:
+            icon_entries = sorted(
+                name for name in names
+                if name.startswith(app_prefix) and '/_CodeSignature/' not in name
+                and re.fullmatch(r'(?:Icon|AppIcon)[^/]*\.png', name.rsplit('/', 1)[-1]))
+            require(icon_entries, 'App bundle has no icon PNG; iOS would show a blank icon')
+            for name in icon_entries:
+                icon = archive.read(name)
+                require(icon.startswith(b'\x89PNG\r\n\x1a\n') and len(icon) >= 24, 'Invalid icon PNG: ' + name)
+                width, height = struct.unpack_from('>II', icon, 16)
+                require(width == height and width >= 60, 'Icon must be a square PNG at least 60px: ' + name)
+            if backend == 'mac':
+                for size in (120, 152, 167, 180):
+                    name = app_prefix + f'Icon{size}.png'
+                    require(name in names, f'Missing fixed icon size: Icon{size}.png')
+                    icon = archive.read(name)
+                    require(struct.unpack_from('>II', icon, 16) == (size, size), f'Icon{size}.png is not {size}x{size}')
         bridge = b'' if probe else archive.read(app_prefix + 'bridge-bootstrap.js')
         require(probe or bridge.strip(), 'bridge-bootstrap.js is missing/empty')
         binary_name = app_prefix + product
@@ -569,7 +747,13 @@ def validate_ipa(path, expected_info=None, backend='mac', probe=False):
             require(widget_prefix + '_CodeSignature/CodeResources' in names, 'Widget resource signature missing')
             reports[widget_binary] = macho(archive.read(widget_binary), 2)
             widget = reports[widget_binary]
-            require(widget['extensionEntrypointSymbols'] and widget['signature'].get('identifier') == widget_info['CFBundleIdentifier'], 'Widget _NSExtensionMain/signature identity is missing')
+            # 只「导入」_NSExtensionMain 不算数（旧实现在任何 Objective-C 依赖都会带上这个 undef），
+            # 必须同时满足：符号真的是入口目标，且 LC_MAIN 正好落在它的定义地址或它的 stub 上。
+            require(widget['extensionEntrypointSymbols']
+                    and widget['extensionEntryAddress'] is not None
+                    and widget['entryAddress'] == widget['extensionEntryAddress']
+                    and widget['signature'].get('identifier') == widget_info['CFBundleIdentifier'],
+                    'Widget _NSExtensionMain must be the real LC_MAIN entrypoint and match the signature identity')
             require(widget['sharedClassSymbolCount'] == 0 and not any('ZeehoShared.framework' in i['path'] for i in widget['imports']), 'KMP must not be linked into Widgets')
             for code in (main, widget):
                 groups = code['signature'].get('entitlements', {}).get('com.apple.security.application-groups')
@@ -773,12 +957,7 @@ def main():
     p.add_argument('--source-manifest')
     args = parser.parse_args()
     if args.command == 'publish':
-        output = validate_output_directory(args.root, args.output)
-        output.mkdir(parents=True, exist_ok=True)
-        staged = pathlib.Path(args.staged).resolve()
-        for name in (IPA_NAME, 'version.json', 'build-manifest.json', 'source-commit.txt', 'SHA256SUMS'):
-            with (staged / name).open('rb') as source, (output / name).open('xb') as destination:
-                shutil.copyfileobj(source, destination)
+        publish_artifacts(args.root, args.staged, args.output)
     elif args.command == 'output-check':
         print(validate_output_directory(args.root, args.output))
     elif args.command == 'inputs':

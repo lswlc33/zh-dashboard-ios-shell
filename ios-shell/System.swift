@@ -10,9 +10,19 @@ import UniformTypeIdentifiers
 
 // WK 桥在调用前验证当前文档、主框架和来源；此服务不接受网页自报的 origin 或 gesture。
 // 所有敏感 RPC 再经过原生按钮确认，避免可信页面中的脚本在启动时悄悄读取或授权。
+//
+// 当前已实现、但网页还没有调用方的方法（保留给后续接线，删掉会让新页面无法启用能力）：
+// - app.appearance：网页还没有切换原生深浅色的入口（只有 test.py 的源码合同检查提到它）。
+// - clipboard.read / clipboard.write：网页统一走 navigator.clipboard / WK 的粘贴链路。
+// - photos.save：网页导出图片目前走 file.share，没有直接存照片的按钮。
+// - notifications.status / request / schedule / cancel：网页只把 notifications.request
+//   写进 ios-bridge.js 的超时白名单，没有真正发起本地提醒。
+// - media.permission：网页没有调用 getUserMedia，因此也不会走到这里的相机/麦克风授权
+//   （media.capture 只是 WebKit 回调的入口，同样没有调用方）。
 final class IOSSystemService: NSObject, IOSBridgeCancellableService, IOSBridgeMediaService,
                               IOSBridgeBackgroundHandoffService, UIDocumentPickerDelegate,
-                              UIAdaptivePresentationControllerDelegate {
+                              UIAdaptivePresentationControllerDelegate,
+                              UNUserNotificationCenterDelegate {
     typealias Reply = (Any?, String?) -> Void
 
     static let maxFileBytes = 20 * 1024 * 1024
@@ -23,6 +33,12 @@ final class IOSSystemService: NSObject, IOSBridgeCancellableService, IOSBridgeMe
     private static let notificationBusinessKey = "dashboardBusinessID"
     private static let notificationNamespaceKey = "dashboardNamespace"
     private static let photoMimes = ["image/png", "image/jpeg", "image/heic"]
+    /// app.diag 的落盘频率闸门：1 秒最多一条、每会话最多 200 条。
+    ///
+    /// 诊断日志是用户可见的单一文件（512KB），一旦被页面刷满就会 truncate 到 0，
+    /// 真正的启动日志会被冲掉；所以超限只计数、不再写盘。
+    private static let diagMinimumInterval: TimeInterval = 1
+    private static let diagSessionLimit = 200
 
     let methods = [
         "file.share", "file.save", "clipboard.write", "clipboard.read",
@@ -36,11 +52,18 @@ final class IOSSystemService: NSObject, IOSBridgeCancellableService, IOSBridgeMe
     private var generation: UInt64 = 0
     private var jobs: [UUID: Job] = [:]
     private var interactiveJob: Job?
+    /// app.diag 的会话内计数（只留内存，不落盘）。
+    private var diagLogged = 0
+    private var diagSuppressed = 0
+    private var diagLastLog = -Double.infinity
 
     private final class Job {
         let id = UUID()
         let method: String
-        let arguments: NSArray
+        /// 入参在确认后会被清掉（见 `releaseFileArguments`），所以是可选的。
+        var arguments: NSArray?
+        /// 清掉入参后用于匹配取消/后台接管的轻量指纹（name|mime|bytes）。
+        var argumentFingerprint: String?
         let generation: UInt64
         var reply: Reply?
         var presentation: UIViewController?
@@ -53,6 +76,8 @@ final class IOSSystemService: NSObject, IOSBridgeCancellableService, IOSBridgeMe
         init(method: String, arguments: [Any], generation: UInt64, reply: @escaping Reply) {
             self.method = method
             self.arguments = NSArray(array: arguments)
+            // 指纹在 begin 时就算好：确认后入参会被丢掉，取消/后台接管只能靠它匹配。
+            self.argumentFingerprint = IOSSystemService.fileFingerprint(arguments)
             self.generation = generation
             self.reply = reply
         }
@@ -115,6 +140,29 @@ final class IOSSystemService: NSObject, IOSBridgeCancellableService, IOSBridgeMe
     init(controller: @escaping () -> UIViewController?) {
         self.controller = controller
         super.init()
+        // iOS 对「App 在前台时到达的本地通知」默认不呈现任何 UI，只有实现
+        // UNUserNotificationCenterDelegate.willPresent 才会出横幅。这里在服务初始化时
+        // 装一次 delegate（主线程，系统要求）。
+        //
+        // delegate 是 weak 属性：只要 IOSSystemService 活着（它由 IOSBridge.services 强持有，
+        // Bridge 又由 PanelController 强持有），delegate 就不会掉；不要改成临时对象。
+        if Thread.isMainThread { installNotificationDelegate() }
+        else { DispatchQueue.main.async { [weak self] in self?.installNotificationDelegate() } }
+    }
+
+    private func installNotificationDelegate() {
+        UNUserNotificationCenter.current().delegate = self
+    }
+
+    /// 前台到达时主动展示。`.banner` / `.list` 保证「网页排了提醒、App 正在前台」也能看到。
+    ///
+    /// `.sound` 无法在 willPresent 里按单条请求取回（通知内容已交付到这里，但读
+    /// `input.sound` 需要跨对象保存状态，收益很小），固定带上；系统仍会尊重用户的静音与
+    /// 通知设置，静音键/专注模式下不会响。
+    func userNotificationCenter(_ center: UNUserNotificationCenter,
+                               willPresent notification: UNNotification,
+                               withCompletionHandler completionHandler: @escaping (UNNotificationPresentationOptions) -> Void) {
+        completionHandler([.banner, .list, .sound])
     }
 
     func handle(method: String, args: [Any], reply: @escaping Reply) {
@@ -134,8 +182,21 @@ final class IOSSystemService: NSObject, IOSBridgeCancellableService, IOSBridgeMe
                           message.utf8.count <= 4096 else {
                         throw Failure(IOSStrings.invalidArguments)
                     }
+                    // 限流：1 秒最多一条 + 每会话 200 条。日志文件 512KB 一到就 truncate 到 0，
+                    // 页面若在循环里报错会把真正的启动日志整段冲掉，反而更难排查。
+                    let now = ProcessInfo.processInfo.systemUptime
+                    guard self.diagLogged < Self.diagSessionLimit,
+                          now - self.diagLastLog >= Self.diagMinimumInterval else {
+                        self.diagSuppressed += 1
+                        reply(["status": "throttled", "logged": self.diagLogged,
+                               "suppressed": self.diagSuppressed], nil)
+                        return
+                    }
+                    self.diagLogged += 1
+                    self.diagLastLog = now
                     IOSDiagnostics.shared.log("web: " + message)
-                    reply(["status": "logged"], nil)
+                    reply(["status": "logged", "logged": self.diagLogged,
+                           "suppressed": self.diagSuppressed], nil)
                 case "app.appearance":
                     // 只接受 {dark: Bool}：网页切深浅色时同步状态栏与系统控件明暗。
                     // 不申请权限、不弹确认框——它只改本 App 的外观，没有副作用。
@@ -146,11 +207,17 @@ final class IOSSystemService: NSObject, IOSBridgeCancellableService, IOSBridgeMe
                     }
                     let isDark = raw.boolValue
                     let style: UIUserInterfaceStyle = isDark ? .dark : .light
-                    UIApplication.shared.connectedScenes
-                        .compactMap { $0 as? UIWindowScene }
-                        .flatMap { $0.windows }
-                        .forEach { $0.overrideUserInterfaceStyle = style }
-                    reply(["status": "applied", "dark": isDark], nil)
+                    // 本 App 没有 UIApplicationSceneManifest，走经典 AppDelegate 手建 UIWindow，
+                    // 所以 connectedScenes 是空集。必须回落到 windows / delegate.window，
+                    // 否则这里是一片空操作却回执 applied（网页会以为已经改成功）。
+                    let changed = self.applyAppearance(style)
+                    if changed > 0 {
+                        reply(["status": "applied", "dark": isDark, "windows": changed], nil)
+                    } else {
+                        // 窗口还没建好或已释放：明确告诉网页没生效，而不是伪报成功。
+                        reply(["status": "unavailable", "dark": isDark, "windows": 0,
+                               "reason": "no_key_window"], nil)
+                    }
                 case "notifications.status":
                     guard options.isEmpty else { throw Failure(IOSStrings.invalidArguments) }
                     let job = try self.begin(method: method, args: args, interactive: false, reply: reply)
@@ -184,6 +251,12 @@ final class IOSSystemService: NSObject, IOSBridgeCancellableService, IOSBridgeMe
                         : method == "file.save" ? IOSStrings.saveFile : IOSStrings.savePhoto
                     self.confirm(job, title: title, message: message, button: button) { [weak self, weak job] in
                         guard let self = self, let job = job else { return }
+                        // 用户一确认就把原始入参（含最大 28MiB 的 Base64 文本）从 Job 上摘掉，
+                        // 只留 name/mime/bytes 指纹。内存预算：文件上限 20MiB 原始字节，
+                        // Base64 膨胀到约 27MiB，Swift String + NSArray 各留一份拷贝会翻倍；
+                        // 解码出的 Data 又要 20MiB，同时持有会把峰值推到 ~70MiB，
+                        // 在 3GB 机型上容易被系统杀掉。摘掉后峰值只剩 Data + 临时文件。
+                        self.releaseFileArguments(job)
                         self.prepareFile(input, job: job, validatePhoto: method == "photos.save")
                     }
                 case "clipboard.write":
@@ -288,7 +361,7 @@ final class IOSSystemService: NSObject, IOSBridgeCancellableService, IOSBridgeMe
         onMain {
             // Bridge 的 deadline 只撤销本服务内、method/args 完全匹配的任务。
             // media.capture 是 WK helper 而非公开 RPC，不能被网页 cancel 冒名撤销。
-            let matching = self.jobs.values.filter { $0.method == method && $0.arguments.isEqual(to: args) }
+            let matching = self.jobs.values.filter { $0.method == method && self.matches($0, args: args) }
             for job in matching { self.cancelJob(job, reason: "timeout") }
         }
     }
@@ -298,8 +371,25 @@ final class IOSSystemService: NSObject, IOSBridgeCancellableService, IOSBridgeMe
         let handedOff = Set(["file.share", "file.save", "app.settings", "photos.save"])
         guard handedOff.contains(method) else { return false }
         return jobs.values.contains {
-            current($0) && $0.method == method && $0.arguments.isEqual(to: args) && $0.submitted
+            current($0) && $0.method == method && matches($0, args: args) && $0.submitted
         }
+    }
+
+    /// 任务入参匹配。文件类任务在确认后会丢掉 bodyB64（见 `releaseFileArguments`），
+    /// 这时只能用确认前记下的轻量指纹比对，不能因为内存优化让取消/后台接管失效。
+    private func matches(_ job: Job, args: [Any]) -> Bool {
+        if let arguments = job.arguments { return arguments.isEqual(to: args) }
+        guard let fingerprint = job.argumentFingerprint else { return false }
+        return Self.fileFingerprint(args) == fingerprint
+    }
+
+    /// 文件类入参的轻量指纹：name + mime + Base64 长度。只用于匹配同一次调用，
+    /// 不参与任何安全判断（真正的校验在 fileInput 里）。
+    fileprivate static func fileFingerprint(_ args: [Any]) -> String? {
+        guard args.count == 1, let options = args[0] as? [String: Any],
+              let name = options["name"] as? String, let mime = options["mime"] as? String,
+              let body = options["bodyB64"] as? String else { return nil }
+        return name + "\u{1}" + mime + "\u{1}" + String(body.utf8.count)
     }
 
     func navigationChanged() {
@@ -433,6 +523,26 @@ final class IOSSystemService: NSObject, IOSBridgeCancellableService, IOSBridgeMe
         return value.doubleValue
     }
 
+    /// 把深浅色写到所有实际存在的窗口，返回改到的窗口数（0 表示没生效）。
+    ///
+    /// 先走 connectedScenes（将来若切到 Scene 生命周期仍然正确）；本项目用的是经典
+    /// AppDelegate + 手建 UIWindow，connectedScenes 恒为空集，所以回落到 delegate.window。
+    /// 不去用 `UIApplication.windows`：它在 iOS 15 起被标记弃用，本工程又没有 Scene 可查。
+    private func applyAppearance(_ style: UIUserInterfaceStyle) -> Int {
+        let app = UIApplication.shared
+        var targets = app.connectedScenes.compactMap { $0 as? UIWindowScene }.flatMap { $0.windows }
+        if targets.isEmpty, let window = (app.delegate as? AppDelegate)?.window { targets = [window] }
+        // 同一窗口可能同时出现在两处，去重后统一改，回执里的数量才是真实窗口数。
+        var seen = Set<ObjectIdentifier>()
+        var changed = 0
+        for window in targets {
+            guard seen.insert(ObjectIdentifier(window)).inserted else { continue }
+            window.overrideUserInterfaceStyle = style
+            changed += 1
+        }
+        return changed
+    }
+
     private func appInfo() -> [String: Any] {
         let info = Bundle.main.infoDictionary ?? [:]
         return [
@@ -499,6 +609,14 @@ final class IOSSystemService: NSObject, IOSBridgeCancellableService, IOSBridgeMe
             name = (stem.isEmpty ? IOSStrings.defaultExportName : stem) + "." + suffix
         } else if (name as NSString).pathExtension.isEmpty { name += ".bin" }
         return name
+    }
+
+    /// 确认后丢掉 Job 上保留的原始入参（文件类方法含最大 28MiB 的 Base64）。
+    ///
+    /// 为什么可以丢：确认按钮之后所有需要的字段已经提取成 `FileInput`（name/mime/bodyB64），
+    /// Job 只用于生命周期匹配。指纹在 `begin` 时就记好了，所以取消/后台接管仍能认出同一次调用。
+    private func releaseFileArguments(_ job: Job) {
+        job.arguments = nil
     }
 
     private func prepareFile(_ input: FileInput, job: Job, validatePhoto: Bool) {
@@ -663,15 +781,43 @@ final class IOSSystemService: NSObject, IOSBridgeCancellableService, IOSBridgeMe
             let options = PHAssetResourceCreationOptions()
             options.originalFilename = file.name
             request.addResource(with: .photo, fileURL: file.url, options: options)
-        } completionHandler: { [weak self, weak job, file] saved, _ in
+        } completionHandler: { [weak self, weak job, file] saved, error in
             // 系统还在读 fileURL 时 RPC 可以失效，但资源要等 performChanges 结束才能删除。
             file.lease.release()
             self?.onMain {
                 guard let self = self, let job = job, self.current(job) else { return }
-                self.finish(job, value: saved ? Self.fileReceipt(file, status: "saved") : nil,
-                            error: saved ? nil : IOSStrings.photoSaveFailed)
+                guard !saved else {
+                    self.finish(job, value: Self.fileReceipt(file, status: "saved")); return
+                }
+                // 权限撤销、磁盘满、格式不支持原来都吃同一句文案；这里按 PHPhotosError 的
+                // domain/code 拆成 permission 与 io 两类，并把错误码写进诊断日志
+                // （只写 domain/code，不写文件路径或文件名）。
+                let failure = Self.photoSaveFailure(error)
+                IOSDiagnostics.shared.log("photos.save 失败 domain=\(failure.domain) code=\(failure.code) kind=\(failure.reason)")
+                self.finish(job, value: ["status": "failed", "reason": failure.reason,
+                                         "photosCode": failure.code, "message": failure.message])
             }
         }
+    }
+
+    /// 把 Photos 的写入失败归类。权限类错误让用户去设置里改；其余都算 io（空间/格式/中断）。
+    ///
+    /// 判据以 `PHPhotosError` 的 domain/code 为主（这两个码 iOS 15 起就有，deployment
+    /// target 15.4 可以直接引用）：`accessRestricted` / `accessUserDenied` 是权限；
+    /// 其余（notEnoughSpace / invalidResource / operationInterrupted …）是 io。
+    /// 再补一层授权状态复查，兜住「写入失败但错误码只报 generic」时权限其实已被撤销的情况。
+    private static func photoSaveFailure(_ error: Error?) -> (domain: String, code: Int, reason: String, message: String) {
+        let ns = error as NSError?
+        let domain = ns?.domain ?? "unknown"
+        let code = ns?.code ?? 0
+        let permissionCodes: Set<Int> = [PHPhotosError.Code.accessRestricted.rawValue,
+                                         PHPhotosError.Code.accessUserDenied.rawValue]
+        let status = PHPhotoLibrary.authorizationStatus(for: .addOnly)
+        let deniedNow = status == .denied || status == .restricted
+        let isPermission = (domain == PHPhotosErrorDomain && permissionCodes.contains(code))
+            || (domain == PHPhotosErrorDomain && deniedNow)
+        return (domain, code, isPermission ? "permission" : "io",
+                isPermission ? IOSStrings.photoPermissionDenied : IOSStrings.photoSaveFailed)
     }
 
     private static func mediaTypes(_ options: [String: Any]) throws -> [AVMediaType] {
@@ -849,19 +995,30 @@ final class IOSSystemService: NSObject, IOSBridgeCancellableService, IOSBridgeMe
                         let request = UNNotificationRequest(identifier: id, content: content,
                                                             trigger: UNTimeIntervalNotificationTrigger(timeInterval: interval, repeats: false))
                         let atMs = Date().addingTimeInterval(interval).timeIntervalSince1970 * 1000
-                        job.submitted = true
+                        // 先记下本任务自己的系统 ID（取消/超时靠它精确清理），但 submitted
+                        // 只在 add 真的成功后才置位。
                         job.notificationID = id
-                        if !replaced.isEmpty { center.removePendingNotificationRequests(withIdentifiers: replaced) }
-                        // 迟到的 add completion 仍保留 Job，失效后仅移除自己的 UUID 版本。
+                        // 顺序很重要：先 add 新的，成功后再删 replaced。
+                        // 新请求标识是每次唯一的 UUID，重复排不会互相覆盖，所以反过来才安全；
+                        // 若先删旧的再 add，add 失败（权限被撤、磁盘满）就白丢用户原有提醒。
                         center.add(request) { [weak self, job] error in
                             DispatchQueue.main.async { [weak self, job] in
-                                guard let self = self, self.current(job) else {
+                                if error != nil {
+                                    // add 失败：只撤本次新加的 UUID，旧提醒原样保留（用户的不动产）。
                                     center.removePendingNotificationRequests(withIdentifiers: [id])
+                                }
+                                guard let self = self, self.current(job) else {
+                                    // 回执已失效（导航/超时）：新 UUID 已在上面删掉，旧提醒未动。
                                     return
                                 }
-                                self.finish(job, value: error == nil ? ["status": "scheduled", "id": input.id, "atMs": atMs,
-                                                                      "repeats": false, "local": true] : nil,
-                                            error: error == nil ? nil : IOSStrings.notificationScheduleFailed)
+                                guard error == nil else {
+                                    self.finish(job, value: nil, error: IOSStrings.notificationScheduleFailed)
+                                    return
+                                }
+                                job.submitted = true
+                                if !replaced.isEmpty { center.removePendingNotificationRequests(withIdentifiers: replaced) }
+                                self.finish(job, value: ["status": "scheduled", "id": input.id, "atMs": atMs,
+                                                         "repeats": false, "local": true])
                             }
                         }
                     }
@@ -891,31 +1048,44 @@ final class IOSSystemService: NSObject, IOSBridgeCancellableService, IOSBridgeMe
                         guard let id = Self.notificationBusinessID($0) else { return false }
                         return selected.contains(id)
                     }.map { $0.identifier })
-                    job.submitted = true
+                    // 没算到任何 identifier 时什么都没删，不能置 submitted——否则桥会把
+                    // 「取消」当成已提交给系统、允许它在后台完成并回执 operationMayComplete。
+                    let removed: [String] = identifiers.isEmpty ? [] : Array(identifiers)
                     if !identifiers.isEmpty {
-                        center.removePendingNotificationRequests(withIdentifiers: Array(identifiers))
-                        center.removeDeliveredNotifications(withIdentifiers: Array(identifiers))
+                        job.submitted = true
+                        center.removePendingNotificationRequests(withIdentifiers: removed)
+                        center.removeDeliveredNotifications(withIdentifiers: removed)
                     }
-                    self.verifyNotificationsRemoved(ids, identifiers: Array(identifiers), job: job, remaining: 3)
+                    self.verifyNotificationsRemoved(ids, identifiers: removed, job: job, attempts: 0)
                 }
             }
         }
     }
 
-    private func verifyNotificationsRemoved(_ ids: [String], identifiers: [String], job: Job, remaining: Int) {
+    /// 0.15 / 0.4 / 1.0 秒的退避；慢设备上 `getDeliveredNotifications` 可能仍返回旧条目。
+    ///
+    /// 判据放宽为「pending 已清空」即成功：delivered 列表是系统侧的展示缓存，删除后
+    /// 可能延迟消失，继续等下去只会制造误报失败。
+    private static let notificationVerifyBackoff: [TimeInterval] = [0.15, 0.4, 1.0]
+
+    private func verifyNotificationsRemoved(_ ids: [String], identifiers: [String], job: Job, attempts: Int) {
         let center = UNUserNotificationCenter.current()
         center.getPendingNotificationRequests { [weak self, weak job] pending in
             center.getDeliveredNotifications { [weak self, weak job] delivered in
                 self?.onMain {
                     guard let self = self, let job = job, self.current(job) else { return }
                     let selected = Set(identifiers)
-                    let found = pending.contains { selected.contains($0.identifier) }
-                        || delivered.contains { selected.contains($0.request.identifier) }
-                    if !found { self.finish(job, value: ["status": "removed", "ids": ids]) }
-                    else if remaining > 0 {
-                        DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) { [weak self, weak job] in
+                    let pendingLeft = pending.contains { selected.contains($0.identifier) }
+                    let deliveredLeft = delivered.contains { selected.contains($0.request.identifier) }
+                    // pending 清空就成功；delivered 残留只是系统展示缓存延迟，不再等它。
+                    if !pendingLeft {
+                        self.finish(job, value: ["status": "removed", "ids": ids,
+                                                 "deliveredPending": deliveredLeft])
+                    } else if attempts < Self.notificationVerifyBackoff.count {
+                        let delay = Self.notificationVerifyBackoff[attempts]
+                        DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self, weak job] in
                             guard let self = self, let job = job, self.current(job) else { return }
-                            self.verifyNotificationsRemoved(ids, identifiers: identifiers, job: job, remaining: remaining - 1)
+                            self.verifyNotificationsRemoved(ids, identifiers: identifiers, job: job, attempts: attempts + 1)
                         }
                     } else { self.finish(job, value: nil, error: IOSStrings.notificationCancelFailed) }
                 }

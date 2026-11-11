@@ -34,6 +34,22 @@ struct IOSRelease: Decodable {
         }
     }
 
+    /// 当前系统是否满足这个版本的 `minimumIOS`。
+    ///
+    /// 下载弹出之前必须先过这道闸：清单里写的最低系统高于本机时，
+    /// 用户下完 IPA 才发现装不上（TrollStore 会直接拒绝），白等一次下载。
+    /// 更新面板与 Dashboard 的「检查更新」都要在弹「发现新版本」之前调它，
+    /// 否则同一个闸门会在两个入口漂移（Dashboard 早已有，更新面板漏了）。
+    func requireSupportedSystem() throws {
+        let parts = try Self.versionParts(minimumIOS)
+        let required = OperatingSystemVersion(majorVersion: parts[0],
+                                             minorVersion: parts[1],
+                                             patchVersion: parts[2])
+        guard ProcessInfo.processInfo.isOperatingSystemAtLeast(required) else {
+            throw UpdateError.systemTooOld
+        }
+    }
+
     func isNewer(version installed: String, build installedBuild: String) throws -> Bool {
         try validate()
         let remote = try Self.versionParts(version), local = try Self.versionParts(installed)

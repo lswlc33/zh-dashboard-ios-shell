@@ -23,6 +23,17 @@ enum UpdateTest {
         try expect(!release.isNewer(version: "1.0.1", build: "3"))
         try expect(!release.isNewer(version: "1.0.1", build: "4"))
         try expect(!release.isNewer(version: "1.0.2", build: "1"))
+        // build 现在默认来自 `git rev-list --count HEAD`，会很快超过 9：
+        // 必须按数值比较，字符串比较会把 "10" 判成比 "9" 老（或反过来）。
+        let numeric: [String: Any] = [
+            "version": "1.0.1", "build": "10", "bundleIdentifier": IOSRelease.bundleID,
+            "minimumIOS": "15.4", "architecture": "arm64", "installer": "TrollStore",
+            "file": "dashboard-trollstore.ipa", "size": bytes.count,
+            "sha256": SHA256.hash(data: bytes).map { String(format: "%02x", $0) }.joined()
+        ]
+        let numericRelease = try decode(numeric)
+        try expect(numericRelease.isNewer(version: "1.0.1", build: "9"))
+        try expect(!numericRelease.isNewer(version: "1.0.1", build: "11"))
         assert(release.downloadURLs.map { $0.host! } == ["ghfast.top", "gh-proxy.com", "raw.githubusercontent.com", "cdn.jsdelivr.net", "lswlc33.github.io"])
         for url in release.downloadURLs {
             assert(url.scheme == "https")

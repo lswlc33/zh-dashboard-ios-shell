@@ -28,28 +28,42 @@ enum PanelNavigation {
     /// `zhb.xn--fiqz59cpva341l.top`，Foundation 在不同入口可能给出 punycode
     /// 或 Unicode 两种形式，字符串不等就会把自家首页判成「非面板」——
     /// 真机上表现为点「进入面板」后 navigation_not_allowed 直接白屏。
-    /// 统一走 `URL` 的绝对字符串（Foundation 会做规范化）再比。
+    ///
+    /// 做法：优先取 `percentEncodedHost`（URL 里原样的 ASCII 形态，punycode 就是
+    /// punycode）；只有拿不到时才退回 `host`。**不要指望再 `URL(string:)` 一次能
+    /// 把 Unicode 转成 punycode**——Foundation 的 URL 解析不做 IDNA/A-label 转换，
+    /// 那一步只能让「percent 编码形态 ↔ 解码形态」收敛。
+    ///
+    /// 解析失败返回不可匹配的哨兵（而不是 ""）：否则 home 与 url 同时失败时会
+    /// 因为 "" == "" 判成同一 origin，等于 fail-open。
     private static func originKey(_ url: URL) -> String {
-        guard let parts = URLComponents(url: url, resolvingAgainstBaseURL: false) else { return "" }
+        guard let parts = URLComponents(url: url, resolvingAgainstBaseURL: false) else {
+            return "invalid://\(url.absoluteString)"
+        }
         let scheme = (parts.scheme ?? "").lowercased()
-        // 优先用 percentEncodedHost（punycode 原样），退化到 host。
         let host = (parts.percentEncodedHost ?? parts.host ?? "").lowercased()
-        // 国际化域名再兜一层：转成 punycode 形式比较。
-        let canonical = URL(string: "https://\(host)")?.host?.lowercased() ?? host
         let port = (parts.port == nil || parts.port == 443) ? "" : ":\(parts.port!)"
-        return "\(scheme)://\(canonical)\(port)"
+        return "\(scheme)://\(host)\(port)"
     }
 
     /// 主文档 origin（基准）。
     private static var homeOriginKey: String { originKey(home) }
 
     static func isPanel(_ url: URL) -> Bool {
-        // 本地快照：zeeho-panel://panel/... 只有主文档可拥有原生桥。
+        // 本地快照：zeeho-panel://panel/index.html 只有主文档可拥有原生桥。
+        // 端口也要像 https 分支一样只允许默认端口：否则网页把指向 :8443 的地址
+        // 交给导航，会拿到同内容但不同 origin 的文档（localStorage 分桶）。
+        // 不是越权，但会让「刷新后面板配置全丢」这类问题无法归因。
         if url.scheme?.lowercased() == localScheme {
             guard url.host?.lowercased() == localHost,
                   url.user == nil, url.password == nil else { return false }
-            let path = url.path.isEmpty ? "/index.html" : url.path
-            return ["/", "/index.html"].contains(path)
+            guard let parts = URLComponents(url: url, resolvingAgainstBaseURL: false),
+                  parts.port == nil else { return false }
+            // 本地快照根固定是 /index.html：快照目录里 index.html 就在根下，
+            // 子资源也全部相对根解析。不能再接受任意子路径——线上的
+            // /zeeho-3d-models/ 基址被搬到自定义 scheme 后会指到不存在的目录。
+            let path = parts.percentEncodedPath
+            return ["/", "/index.html"].contains(path.isEmpty ? "/index.html" : path)
         }
         guard let parts = URLComponents(url: url, resolvingAgainstBaseURL: false) else { return false }
         // Pages 同域还托管产物等页面；只有面板主文档可拥有原生桥。
@@ -82,16 +96,50 @@ enum PanelNavigation {
         ["https", "http", "iosamap", "tel", "mailto"].contains(url.scheme?.lowercased() ?? "")
     }
 
-    /// 把线上主文档映射成同路径的自定义 scheme 地址（保留 `_shellNav`）。
+    /// 判断某个 (scheme, host, port) 三元组是否属于当前面板 origin。
+    ///
+    /// 桥的安全校验用它（`BridgePolicy.trustedOrigin`），和 `isPanel` 共用同一套
+    /// 判定，避免两处各写一份字符串比较：只要有一处不认本地快照
+    /// （`zeeho-panel://panel`），本地文档发出的每条 RPC 都会被拒
+    /// `untrusted_document`，表现为「桥候选为真但不可用、永久停在 UI 测试预览」。
+    ///
+    /// - Parameter port: 调用方给 0 表示「没有端口」。
+    static func isTrustedOrigin(scheme: String, host: String, port: Int) -> Bool {
+        let lowerScheme = scheme.lowercased()
+        let lowerHost = host.lowercased()
+        // 本地快照：自定义 scheme 没有「默认端口」，只接受不带端口。
+        if lowerScheme == localScheme {
+            return lowerHost == localHost && port == 0
+        }
+        guard lowerScheme == "https", port == 0 || port == 443 else { return false }
+        guard let homeParts = URLComponents(url: home, resolvingAgainstBaseURL: false) else { return false }
+        let homeHost = (homeParts.percentEncodedHost ?? homeParts.host ?? "").lowercased()
+        // 两种形态都认：WebKit 可能给 punycode，也可能给百分号编码后的 Unicode。
+        if lowerHost == homeHost { return true }
+        if let decoded = homeHost.removingPercentEncoding?.lowercased(), lowerHost == decoded { return true }
+        if let decoded = lowerHost.removingPercentEncoding?.lowercased(), decoded == homeHost { return true }
+        return false
+    }
+
+    /// 把线上主文档映射成自定义 scheme 的**根**地址（保留 `_shellNav` 与 fragment）。
     /// 是否真的用本地快照由调用方判断——这里只做纯字符串变换，便于单测。
+    ///
+    /// 路径必须固定落到 `/index.html`，不能继承线上的基址子目录：
+    /// GitHub 线路的 base 是 `.../zeeho-3d-models/`，原样搬运会得到
+    /// `zeeho-panel://panel/zeeho-3d-models/`，而 `isPanel` 的本地分支只认
+    /// `/` 与 `/index.html`（快照目录里 index.html 就在根下，子资源也相对根解析）。
+    /// 真机后果：默认线路（GitHub）100% 打不开，且 `fallbackToNetwork` 会再生成
+    /// 同一个坏地址形成同步递归。只有 Cloudflare 线路（base 路径是 `/`）侥幸能过。
     static func localURL(matching remote: URL) -> URL? {
         guard remote.scheme?.lowercased() == "https" else { return nil }
         var parts = URLComponents()
         parts.scheme = localScheme
         parts.host = localHost
-        parts.path = remote.path.isEmpty ? "/index.html" : remote.path
+        parts.path = "/index.html"
         // 查询串必须保留：`_shellNav` 是桥的文档身份，丢了握手就失败。
         parts.query = remote.query
+        // fragment 也一并保留：深链（如 #settings）落到页首会让用户以为链接失效。
+        parts.fragment = remote.fragment
         return parts.url
     }
 }

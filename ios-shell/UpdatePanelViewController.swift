@@ -8,16 +8,20 @@ import UIKit
 //   2. 面板资源（本地快照的构建号、资源数、大小、上次更新时间）
 //   3. 软件更新线路（单选，切换后立刻重新初始化资源）
 //   4. 操作（检查更新 / 重新初始化 / 查看诊断日志）
+//
+// 所有可见文案都走 IOSStrings：这一页以前大段内联中文，
+// 和恢复页同一句话会出现两种措辞，文案审计也没法统一改。
 final class UpdatePanelViewController: UIViewController,
                                        UITableViewDataSource, UITableViewDelegate {
     private enum Section: Int, CaseIterable {
         case versions, resources, line, actions
         var title: String {
             switch self {
-            case .versions: return "版本信息"
-            case .resources: return "面板资源"
-            case .line: return "软件更新线路"
-            case .actions: return "操作"
+            case .versions: return IOSStrings.updateSectionVersions
+            case .resources: return IOSStrings.updateSectionResources
+            // 线路这一段与恢复页那行标签共用同一个常量，避免两处措辞分叉。
+            case .line: return IOSStrings.recoverySoftwareLineLabel
+            case .actions: return IOSStrings.updateSectionActions
             }
         }
     }
@@ -25,6 +29,8 @@ final class UpdatePanelViewController: UIViewController,
     private let table = UITableView(frame: .zero, style: .insetGrouped)
     private var resourceInfo: [String: String] = [:]
     private var checking = false
+    /// 关闭通知只发一次：点「完成」与 viewWillDisappear 都会走到 notifyChange。
+    private var changeNotified = false
 
     /// 关闭时通知调用方刷新（线路/资源可能变了）。
     var onChange: (() -> Void)?
@@ -35,7 +41,7 @@ final class UpdatePanelViewController: UIViewController,
         view.backgroundColor = .systemGroupedBackground
 
         navigationItem.rightBarButtonItem = UIBarButtonItem(
-            title: "完成", style: .done, target: self, action: #selector(dismissSelf))
+            title: IOSStrings.updateDone, style: .done, target: self, action: #selector(dismissSelf))
 
         table.dataSource = self
         table.delegate = self
@@ -47,55 +53,147 @@ final class UpdatePanelViewController: UIViewController,
             table.leadingAnchor.constraint(equalTo: view.leadingAnchor),
             table.trailingAnchor.constraint(equalTo: view.trailingAnchor)
         ])
+        // 初始化在途时禁止下滑关闭：formSheet 下滑会打断正在跑的资源下载，
+        // 用户看不到进度也回不到这个页面。
+        syncModalLock()
         loadResourceInfo()
     }
 
-    @objc private func dismissSelf() {
+    override func viewWillAppear(_ animated: Bool) {
+        super.viewWillAppear(animated)
+        syncModalLock()
+    }
+
+    override func viewWillDisappear(_ animated: Bool) {
+        super.viewWillDisappear(animated)
+        // 只有「真的被关掉」才通知调用方。present 一个全屏 alert / 分享页
+        // 也会触发 viewWillDisappear，那种情况下通知只是在弹窗背后白刷新一次。
+        guard isBeingDismissed || navigationController?.isBeingDismissed == true else { return }
+        notifyChange()
+    }
+
+    /// 初始化在途时锁住下滑关闭，结束后解锁。
+    ///
+    /// 只在 viewWillAppear 与初始化回调里调：`isModalInPresentation` 一旦置 true，
+    /// 用户就从「下滑能走」变成「必须点完成」，中途再点「取消本次任务」也得靠恢复页
+    /// 才能回到空闲——所以必须跟着真实状态来回切，不能只置不管。
+    private func syncModalLock() {
+        // 初始化回调可能在面板已经关掉之后才到（比如线路确认后用户立刻点完成），
+        // 这时写 isModalInPresentation 会碰一个正在消失的控制器，别碰。
+        guard isViewLoaded, view.window != nil else { return }
+        isModalInPresentation = IOSPanelCache.shared.snapshot().busy
+    }
+
+    private func notifyChange() {
+        guard !changeNotified else { return }
+        changeNotified = true
         onChange?()
+    }
+
+    @objc private func dismissSelf() {
+        notifyChange()
         dismiss(animated: true)
     }
 
     // MARK: - 数据
 
+    /// 统计本地快照：只算 `IOSPanelCache.resources` 里列出的文件。
+    ///
+    /// 以前用 FileManager.enumerator 遍历，它会把 `icons/` 目录本身也返回成一项，
+    /// 于是「已下载资源 12 个」紧挨着「资源清单 11 项」，看起来像自相矛盾。
+    /// 按清单逐项 attributesOfItem 更准，也顺手把字节数对齐。
+    ///
+    /// 文件 IO 放后台：目录在 Application Support，走的可能是 encrypted 卷，
+    /// 首帧同步扫十几个文件（含 2MB 的 index.html）会让页面停顿一拍。
     private func loadResourceInfo() {
-        let cache = IOSPanelCache.shared
-        let directory = cache.snapshotDirectory()
-        var bytes: Int64 = 0
-        var count = 0
-        if let directory = directory {
-            let enumerator = FileManager.default.enumerator(at: directory,
-                                                            includingPropertiesForKeys: [.fileSizeKey])
-            while let file = enumerator?.nextObject() as? URL {
-                if let size = try? file.resourceValues(forKeys: [.fileSizeKey]).fileSize {
-                    bytes += Int64(size)
+        DispatchQueue.global(qos: .utility).async { [weak self] in
+            let cache = IOSPanelCache.shared
+            let directory = cache.snapshotDirectory()
+            let manager = FileManager.default
+            var bytes: Int64 = 0
+            var count = 0
+            if let directory = directory {
+                for name in IOSPanelCache.resources {
+                    let file = directory.appendingPathComponent(name, isDirectory: false)
+                    guard let attributes = try? manager.attributesOfItem(atPath: file.path) else { continue }
                     count += 1
+                    bytes += (attributes[.size] as? NSNumber)?.int64Value ?? 0
                 }
             }
+            let build = cache.snapshotBuild()
+            let modified: String
+            if let directory = directory,
+               let date = try? manager.attributesOfItem(atPath: directory.path)[.modificationDate] as? Date {
+                let formatter = DateFormatter()
+                formatter.dateFormat = "yyyy-MM-dd HH:mm"
+                // 不钉 locale 时，非公历区域（佛历/和历）会把这个 pattern 解释成别的历法，
+                // 显示出来的年份差几百年。POSIX 保证固定公历 + 固定数字。
+                formatter.locale = Locale(identifier: "en_US_POSIX")
+                modified = formatter.string(from: date)
+            } else {
+                modified = IOSStrings.updateValueNone
+            }
+            let info = [
+                "build": build.isEmpty ? IOSStrings.recoveryPanelVersionNone : build,
+                "files": String(format: IOSStrings.updateFilesCount, count),
+                "size": ByteCountFormatter.string(fromByteCount: bytes, countStyle: .file),
+                "updated": modified
+            ]
+            DispatchQueue.main.async {
+                guard let self = self else { return }
+                self.resourceInfo = info
+                self.table.reloadData()
+            }
         }
-        let build = cache.snapshotBuild()
-        let modified: String
-        if let directory = directory,
-           let date = try? FileManager.default.attributesOfItem(atPath: directory.path)[.modificationDate] as? Date {
-            let formatter = DateFormatter()
-            formatter.dateFormat = "yyyy-MM-dd HH:mm"
-            modified = formatter.string(from: date)
-        } else {
-            modified = "—"
-        }
-        resourceInfo = [
-            "build": build.isEmpty ? IOSStrings.recoveryPanelVersionNone : build,
-            "files": "\(count) 个",
-            "size": ByteCountFormatter.string(fromByteCount: bytes, countStyle: .file),
-            "updated": modified
-        ]
-        table.reloadData()
     }
 
     private func appVersionLine() -> String {
         let info = Bundle.main.infoDictionary ?? [:]
-        let version = info["CFBundleShortVersionString"] as? String ?? "—"
-        let build = info["CFBundleVersion"] as? String ?? "—"
-        return "\(version)（\(build)）"
+        let version = info["CFBundleShortVersionString"] as? String ?? IOSStrings.updateValueNone
+        let build = info["CFBundleVersion"] as? String ?? IOSStrings.updateValueNone
+        return String(format: IOSStrings.updateAppVersionFormat, version, build)
+    }
+
+    /// 最低系统从 Info.plist 读。
+    /// 以前这里写死 "iOS 15.4"，Package.swift 与 Info.plist 一旦抬高（比如升到 16.0），
+    /// 面板上显示的还是一句过期承诺。
+    private func minimumIOSLine() -> String {
+        let value = Bundle.main.object(forInfoDictionaryKey: "MinimumOSVersion") as? String
+        guard let version = value, !version.isEmpty else { return IOSStrings.updateMinimumIOSFallback }
+        return String(format: IOSStrings.updateMinimumIOSFormat, version)
+    }
+
+    /// 每一段的行数据。行数与内容同源，`numberOfRowsInSection` 直接取 count，
+    /// 不再「行数写 4、数组也写 4」两处独立维护（将来只改一处就 index out of range）。
+    private func rows(for section: Section) -> [(String, String)] {
+        switch section {
+        case .versions:
+            return [
+                (IOSStrings.recoveryAppVersionLabel, appVersionLine()),
+                (IOSStrings.recoveryPanelVersionLabel, resourceInfo["build"] ?? IOSStrings.updateValueNone),
+                (IOSStrings.recoveryWebviewLabel,
+                 String(format: IOSStrings.updateWebviewFormat, UIDevice.current.systemVersion)),
+                (IOSStrings.recoveryMinimumLabel, minimumIOSLine())
+            ]
+        case .resources:
+            return [
+                (IOSStrings.updateResourceDownloaded, resourceInfo["files"] ?? IOSStrings.updateValueNone),
+                (IOSStrings.updateResourceSize, resourceInfo["size"] ?? IOSStrings.updateValueNone),
+                (IOSStrings.updateResourceUpdated, resourceInfo["updated"] ?? IOSStrings.updateValueNone),
+                (IOSStrings.updateResourceManifest,
+                 String(format: IOSStrings.updateManifestCount, IOSPanelCache.resources.count))
+            ]
+        case .line:
+            return [IOSPanelLine.github, IOSPanelLine.cf].map { line in
+                (line.displayName, line == IOSPanelLine.current ? IOSStrings.updateCurrentLine : "")
+            }
+        case .actions:
+            return [
+                (checking ? IOSStrings.updateChecking : IOSStrings.recoveryUpdate, ""),
+                (IOSStrings.updateReinitializeRow, ""),
+                (IOSStrings.updateShowDiagnostics, "")
+            ]
+        }
     }
 
     // MARK: - UITableViewDataSource
@@ -107,13 +205,8 @@ final class UpdatePanelViewController: UIViewController,
     }
 
     func tableView(_ tableView: UITableView, numberOfRowsInSection section: Int) -> Int {
-        switch Section(rawValue: section) {
-        case .versions: return 4
-        case .resources: return 4
-        case .line: return 2
-        case .actions: return 3
-        case .none: return 0
-        }
+        guard let section = Section(rawValue: section) else { return 0 }
+        return rows(for: section).count
     }
 
     func tableView(_ tableView: UITableView, cellForRowAt indexPath: IndexPath) -> UITableViewCell {
@@ -123,47 +216,20 @@ final class UpdatePanelViewController: UIViewController,
         cell.detailTextLabel?.font = .preferredFont(forTextStyle: .subheadline)
         cell.selectionStyle = .none
 
-        switch Section(rawValue: indexPath.section) {
-        case .versions:
-            let rows: [(String, String)] = [
-                (IOSStrings.recoveryAppVersionLabel, appVersionLine()),
-                (IOSStrings.recoveryPanelVersionLabel, resourceInfo["build"] ?? "—"),
-                (IOSStrings.recoveryWebviewLabel, "WKWebView · iOS \(UIDevice.current.systemVersion)"),
-                (IOSStrings.recoveryMinimumLabel, "iOS 15.4")
-            ]
-            cell.textLabel?.text = rows[indexPath.row].0
-            cell.detailTextLabel?.text = rows[indexPath.row].1
+        guard let section = Section(rawValue: indexPath.section) else { return cell }
+        let items = rows(for: section)
+        // 防御：行数与 rows 现在同源，正常不会越界；留着避免以后有人只改一处。
+        guard indexPath.row < items.count else { return cell }
+        cell.textLabel?.text = items[indexPath.row].0
+        cell.detailTextLabel?.text = items[indexPath.row].1
 
-        case .resources:
-            let rows: [(String, String)] = [
-                ("已下载资源", resourceInfo["files"] ?? "—"),
-                ("占用空间", resourceInfo["size"] ?? "—"),
-                ("上次更新", resourceInfo["updated"] ?? "—"),
-                ("资源清单", "\(IOSPanelCache.resources.count) 项")
-            ]
-            cell.textLabel?.text = rows[indexPath.row].0
-            cell.detailTextLabel?.text = rows[indexPath.row].1
-
+        switch section {
         case .line:
-            let lines = [IOSPanelLine.github, IOSPanelLine.cf]
-            let line = lines[indexPath.row]
-            cell.textLabel?.text = line.displayName
-            cell.detailTextLabel?.text = line == IOSPanelLine.current ? "当前" : ""
+            let line = [IOSPanelLine.github, IOSPanelLine.cf][indexPath.row]
             cell.accessoryType = line == IOSPanelLine.current ? .checkmark : .none
-
         case .actions:
             cell.textLabel?.textColor = .tintColor
-            cell.detailTextLabel?.text = ""
-            switch indexPath.row {
-            case 0:
-                cell.textLabel?.text = checking ? "正在检查…" : "检查软件更新"
-            case 1:
-                cell.textLabel?.text = "重新初始化面板资源"
-            default:
-                cell.textLabel?.text = "查看诊断日志"
-            }
-
-        case .none:
+        default:
             break
         }
         return cell
@@ -176,6 +242,7 @@ final class UpdatePanelViewController: UIViewController,
         switch Section(rawValue: indexPath.section) {
         case .line:
             let lines = [IOSPanelLine.github, IOSPanelLine.cf]
+            guard indexPath.row < lines.count else { return }
             selectLine(lines[indexPath.row])
         case .actions:
             switch indexPath.row {
@@ -192,16 +259,27 @@ final class UpdatePanelViewController: UIViewController,
 
     private func selectLine(_ line: IOSPanelLine) {
         guard line != IOSPanelLine.current else { return }
-        IOSPanelLine.current = line
-        table.reloadData()
         let alert = UIAlertController(
-            title: IOSStrings.recoveryVersionTitle,
+            title: IOSStrings.updateLineChangedTitle,
             message: String(format: IOSStrings.recoveryLineChanged, line.displayName),
             preferredStyle: .alert)
+        // 取消必须真的什么都不写：以前赋值在弹窗前，弹窗还只有「确定」，
+        // 用户一取消/杀 App 就留下「新线路 + 旧快照」，下次启动资源对不上。
+        alert.addAction(UIAlertAction(title: IOSStrings.cancel, style: .cancel) { [weak self] _ in
+            // 取消时什么都没写（赋值在 confirm 回调里），但选中态的勾选是由
+            // IOSPanelLine.current 决定的，这里刷新一次把 UI 恢复到真实值。
+            // 不能省略：不然用户会以为自己已经换线，下次进来才发现还是原线路。
+            self?.table.reloadData()
+        })
         alert.addAction(UIAlertAction(title: IOSStrings.confirm, style: .default) { [weak self] _ in
+            guard let self = self else { return }
+            IOSPanelLine.current = line
+            self.table.reloadData()
+            self.syncModalLock()
             // 换线路后旧快照可能来自另一个源，必须重下才能保证资源一致。
             IOSPanelCache.shared.initialize(force: true) { _ in
-                self?.loadResourceInfo()
+                self.syncModalLock()
+                self.loadResourceInfo()
             }
         })
         present(alert, animated: true)
@@ -221,20 +299,28 @@ final class UpdatePanelViewController: UIViewController,
                 let version = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? ""
                 let build = Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String ?? ""
                 if try release.isNewer(version: version, build: build) {
+                    // 最低系统闸门：与 Dashboard.checkUpdate 共用同一份实现，
+                    // 否则两个入口的判据会漂移（这里以前完全没判，直接弹「发现新版本」）。
+                    try release.requireSupportedSystem()
                     let alert = UIAlertController(
-                        title: "发现新版本",
-                        message: "当前：\(version)（\(build)）\n新版：\(release.version)（\(release.build)）\n\n下载后请在分享菜单中选择 TrollStore 覆盖安装。",
+                        title: IOSStrings.updateNewVersionTitle,
+                        message: String(format: IOSStrings.updateNewVersionMessage,
+                                        version, build, release.version, release.build),
                         preferredStyle: .alert)
-                    alert.addAction(UIAlertAction(title: "稍后", style: .cancel))
-                    alert.addAction(UIAlertAction(title: "下载", style: .default) { [weak self] _ in
+                    alert.addAction(UIAlertAction(title: IOSStrings.updateLater, style: .cancel))
+                    alert.addAction(UIAlertAction(title: IOSStrings.updateDownload, style: .default) { [weak self] _ in
                         self?.downloadUpdate(release)
                     })
                     present(alert, animated: true)
                 } else {
-                    presentMessage("已是最新", "当前 iOS 软件版本：\(version)（\(build)）")
+                    // 这里用恢复页那条「当前版本 + 更新渠道」的说明，而不是另写一句
+                    // 「已是最新」：它同时告诉用户 iOS 版更新从发布仓库来，
+                    // 也就顺带解释了为什么这里的手动检查和启动时提示要分别点。
+                    presentMessage(IOSStrings.updateUpToDateTitle,
+                                   String(format: IOSStrings.recoveryUpdateHint, version, build))
                 }
             } catch {
-                presentMessage("检查失败", error.localizedDescription)
+                presentMessage(IOSStrings.updateCheckFailedTitle, error.localizedDescription)
             }
         }
     }
@@ -250,30 +336,41 @@ final class UpdatePanelViewController: UIViewController,
                 }
                 present(activity, animated: true)
             } catch {
-                presentMessage("下载失败", error.localizedDescription)
+                presentMessage(IOSStrings.updateDownloadFailedTitle, error.localizedDescription)
             }
         }
     }
 
     private func reinitialize() {
         let alert = UIAlertController(
-            title: "重新初始化",
-            message: "将重新下载全部面板资源。账号和设置不会被清除。",
+            title: IOSStrings.updateReinitializeTitle,
+            message: IOSStrings.updateReinitializeMessage,
             preferredStyle: .alert)
         alert.addAction(UIAlertAction(title: IOSStrings.cancel, style: .cancel))
         alert.addAction(UIAlertAction(title: IOSStrings.confirm, style: .default) { [weak self] _ in
+            guard let self = self else { return }
+            self.syncModalLock()
             IOSPanelCache.shared.initialize(force: true) { _ in
-                self?.loadResourceInfo()
+                self.syncModalLock()
+                self.loadResourceInfo()
             }
         })
         present(alert, animated: true)
     }
 
     private func showDiagnostics() {
-        present(DiagnosticsViewController(), animated: true)
+        // 裸 present 时看不到标题，也没有关闭按钮（唯一出口是那个名叫「重试」的按钮）。
+        // 包一层导航容器，诊断页自己挂「完成」与标题。
+        let controller = DiagnosticsViewController()
+        let nav = UINavigationController(rootViewController: controller)
+        nav.modalPresentationStyle = .formSheet
+        present(nav, animated: true)
     }
 
     private func presentMessage(_ title: String, _ message: String) {
+        // 已经有一个弹窗在显示时不要再 present，UIKit 会在控制台刷
+        // 「Attempt to present ... which is already presenting」并且这次提示直接丢掉。
+        guard presentedViewController == nil else { return }
         let alert = UIAlertController(title: title, message: message, preferredStyle: .alert)
         alert.addAction(UIAlertAction(title: IOSStrings.confirm, style: .default))
         present(alert, animated: true)

@@ -52,6 +52,13 @@ final class RootRouter: UIViewController {
             if state.ready && !BootHealth.needsWelcome() {
                 BootHealth.markWelcomeShown()
                 self.showPanel()
+                // 快照过期（超过 24 小时或换过线路）就后台补一份新的，
+                // 下次冷启动生效。这里不能阻塞进面板：用户要的是立刻看到页面。
+                // 以前完全没有这个判定，导致面板产物更新后老用户几个月都看不到新页面。
+                if IOSPanelCache.shared.needsRefresh() {
+                    IOSDiagnostics.shared.log("面板快照已过期，后台刷新")
+                    IOSPanelCache.shared.initialize(force: false) { _ in }
+                }
             } else {
                 BootHealth.markWelcomeShown()
                 self.showRecovery(reason: "")
@@ -178,6 +185,14 @@ final class PanelController: UIViewController, WKNavigationDelegate, WKUIDelegat
     private var lastSafeArea = UIEdgeInsets.zero
     /// 当前这轮是否在用本地快照；失败时用它决定要不要自动回退线上。
     private var usingLocalSnapshot = false
+    /// 本轮导航是否已经因本地快照失败回退过一次。
+    ///
+    /// 必须有这个一次性闸门：`prepareNavigation` 的白名单失败是**同步**回调的，
+    /// 调用链是 preparePanel → 同步 .failure → showError → fallbackToNetwork →
+    /// preparePanel(home) → 又用同一个坏本地地址 → 再同步失败 …… 全在主线程栈上，
+    /// 最终栈溢出闪退。`usingLocalSnapshot = false` 挡不住，因为 preparePanel
+    /// 进门就又把它置回 true。回退后必须真的落到 https。
+    private var localFallbackUsed = false
     private var bootWatchTimer: Timer?
     private var bootWatchTick = 0
     /// 白屏诊断页只弹一次，别在每次看门狗探测时都弹。
@@ -313,6 +328,14 @@ final class PanelController: UIViewController, WKNavigationDelegate, WKUIDelegat
                 let file = try await IOSUpdater.download(release)
                 guard presentedViewController == nil else { return }
                 let share = UIActivityViewController(activityItems: [file], applicationActivities: nil)
+                // iPad 上以 popover 呈现时必须给锚点，否则系统直接抛异常终止。
+                // 其他几处分享（Diagnostics / UpdatePanel / System / Ride）都做了同样处理。
+                if let popover = share.popoverPresentationController {
+                    popover.sourceView = self.view
+                    popover.sourceRect = CGRect(x: self.view.bounds.midX, y: self.view.bounds.midY,
+                                                width: 1, height: 1)
+                    popover.permittedArrowDirections = []
+                }
                 present(share, animated: true)
             } catch { updateMessage(error.localizedDescription) }
         }
@@ -349,9 +372,13 @@ final class PanelController: UIViewController, WKNavigationDelegate, WKUIDelegat
         }
         // 有本地快照就把主文档改写到 zeeho-panel://，弱网/离线也能进；
         // 没快照保持线上 https，行为与以前一致。
-        let target = Self.localSnapshotURL(for: url) ?? url
+        // 已经因本地快照失败回退过一次的，本轮不再用本地——否则会原地打转。
+        let target = (localFallbackUsed ? nil : Self.localSnapshotURL(for: url)) ?? url
         // 记录本轮是否走本地：本地加载失败要能自动回退线上，否则用户会看到白屏。
         usingLocalSnapshot = target.scheme?.lowercased() == PanelNavigation.localScheme
+        // 进度日志按导航重置，否则第一次加载到 100% 之后，后续导航的 0→100
+        // 全部落在阈值以下，唯一的「卡在哪」取证通道就失效了。
+        lastLoggedProgress = -10
         IOSDiagnostics.shared.log("preparePanel: url=\(url.absoluteString) target=\(target.absoluteString) local=\(usingLocalSnapshot)")
         bridge.prepareNavigation(to: target) { [weak self] result in
             guard let self = self else { return }
@@ -366,10 +393,15 @@ final class PanelController: UIViewController, WKNavigationDelegate, WKUIDelegat
         }
     }
 
-    /// 本地快照加载失败时回退到线上地址，并让快照失效（下次进欢迎页重下）。
+    /// 本地快照加载失败时回退到线上地址。
     /// 返回 true 表示已经回退，调用方不要再弹错误。
+    ///
+    /// 一次性：本轮只回退一次，回退后 `localFallbackUsed` 置位，后续
+    /// `preparePanel` 一律走 https。持久性失败（快照文件被清、Data Protection
+    /// 未解锁）本来也不会因为重试本地而好转，再回退只会无限自旋。
     private func fallbackToNetwork() -> Bool {
-        guard usingLocalSnapshot else { return false }
+        guard usingLocalSnapshot, !localFallbackUsed else { return false }
+        localFallbackUsed = true
         usingLocalSnapshot = false
         BootHealth.failed(reason: "resources")
         preparePanel(PanelNavigation.home)
@@ -508,16 +540,24 @@ final class PanelController: UIViewController, WKNavigationDelegate, WKUIDelegat
             // 本地快照加载完但 body 是空的：多半是自定义 scheme 下某些能力不可用
             // （WebKit 对非 http(s) scheme 的存储/安全上下文限制）。
             // 直接切回线上 https，用户至少能进面板，而不是盯着白屏。
+            //
+            // 判据必须带上 readyState：单文件产物 3.5MB，<body> 在文件很靠后的位置，
+            // 看门狗 2 秒第一次探测时 body 可能还没解析出来，childCount 自然为 0。
+            // 只看 childCount 会把「还在下载」误判成白屏，白白把用户切到更慢的线上。
+            let readyState = object["readyState"] as? String ?? ""
             let childCount = object["childCount"] as? Int ?? 0
-            if childCount == 0, self.usingLocalSnapshot {
-                IOSDiagnostics.shared.log("[\(tag)] body 为空且在用本地快照，回退线上")
+            // 文档还在 loading 时不算白屏（还可能画出来）；只有确认解析完
+            // （readyState=complete）或看门狗已经探了很多轮（10 秒多）才判死。
+            let blank = childCount == 0 && (readyState == "complete" || self.bootWatchTick >= 5)
+            if blank, self.usingLocalSnapshot {
+                IOSDiagnostics.shared.log("[\(tag)] body 为空且在用本地快照（readyState=\(readyState)），回退线上")
                 self.fallbackToNetwork()
                 return
             }
             // 线上也空：这是真白屏，把日志弹给用户，让他能发给我。只弹一次。
-            if childCount == 0, !self.diagnosticsShown {
+            if blank, !self.diagnosticsShown {
                 self.diagnosticsShown = true
-                IOSDiagnostics.shared.log("[\(tag)] body 为空且已走线上——真白屏，弹出诊断")
+                IOSDiagnostics.shared.log("[\(tag)] body 为空且已走线上（readyState=\(readyState)）——真白屏，弹出诊断")
                 self.presentDiagnostics()
                 return
             }
@@ -536,6 +576,9 @@ final class PanelController: UIViewController, WKNavigationDelegate, WKUIDelegat
     private func presentDiagnostics() {
         guard presentedViewController == nil else { return }
         let controller = DiagnosticsViewController()
+        // 「重试」必须真的重载面板：以前诊断页里那个按钮只 dismiss，
+        // 用户点完还是白屏，等于没有出口。
+        controller.onRetry = { [weak self] in self?.loadPanel() }
         controller.modalPresentationStyle = .pageSheet
         present(controller, animated: true)
     }

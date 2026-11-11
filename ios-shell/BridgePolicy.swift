@@ -67,9 +67,12 @@ enum IOSBridgePolicy {
     }
 
     static func trustedOrigin(_ origin: WKSecurityOrigin) -> Bool {
-        origin.protocol.lowercased() == "https"
-            && origin.host.lowercased() == PanelNavigation.home.host?.lowercased()
-            && (origin.port == 0 || origin.port == 443)
+        // 复用 PanelNavigation 的判定：本地快照页（zeeho-panel://panel）也要认。
+        // 这里曾经写死 https + home.host，导致「本地快照优先」这条主路径上
+        // 每一条 RPC（含 hello）都被回 untrusted_document —— 桥候选为真、
+        // available 恒假，网页永久停在「UI 测试预览」，而且因为 candidate 非假，
+        // Dashboard 的「桥不可用就回退线上」也不会触发。
+        PanelNavigation.isTrustedOrigin(scheme: origin.protocol, host: origin.host, port: origin.port)
     }
 
     static func trustedFrame(_ frame: WKFrameInfo, navigationID: String) -> Bool {

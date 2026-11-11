@@ -4,7 +4,9 @@ product: DashboardIOS
 bundleID: io.github.lswlc33.dashboard.ios
 infoPath: Info.plist
 entitlementsPath: XtoolSupport/App.entitlements
-iconPath: ../public/icons/icon-512.png
+# 图标必须用满出血的 iOS 专用源：xtool 后端同样会产出 App 包，
+# 用带圆角的 icon-512.png 会让 iOS 再切一次角，四角透出白边。
+iconPath: ../public/icons/icon-ios-1024.png
 resources:
   - bridge-bootstrap.js
 extensions:

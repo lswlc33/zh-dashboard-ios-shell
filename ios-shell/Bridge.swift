@@ -96,7 +96,10 @@ final class IOSBridge {
     /// 最近一次生成的 bootstrap 源码。自定义 scheme 下 atDocumentStart 注入
     /// 可能不生效（WKWebView 对非 http(s) 来源的限制），didCommit 时用它兜底补注入。
     private var bootstrapSource: String?
-    private var bootstrapReinjected = false
+    /// 补注入的尝试次数，按导航 ticket（navId）记账：换文档就换 key，
+    /// 旧 ticket 的计数自然作废，不需要在准备阶段清理一个全局标志。
+    private var bootstrapAttempts: [String: Int] = [:]
+    private static let maxBootstrapAttempts = 3
     private var prepared = false
     private var navigationPermit: String?
     private var closed = false
@@ -181,8 +184,8 @@ final class IOSBridge {
         preparation += 1
         prepared = false
         navigationPermit = nil
-        // 新一轮导航要允许重新补注入。
-        bootstrapReinjected = false
+        // 新一轮导航：清掉上一轮的重试计数与源码，避免旧导航的计数继续生效。
+        bootstrapAttempts.removeAll()
         let ticket = preparation
         store.snapshot { [weak self] snapshot in
             guard let self = self, !self.closed, self.preparation == ticket else {
@@ -211,14 +214,22 @@ final class IOSBridge {
                     // 写死 https 会让本地模式下 bootstrap 的 origin 校验失败，
                     // __zeehoIOS 不注入 → 网页判定「无桥」→ 白屏。
                     let targetParts = URLComponents(url: target, resolvingAgainstBaseURL: false)
+                    let targetScheme = (targetParts?.scheme ?? target.scheme ?? "").lowercased()
+                    let targetHost = (targetParts?.host ?? target.host ?? "").lowercased()
                     let targetOrigin = targetParts.flatMap { parts -> String? in
                         guard let scheme = parts.scheme, let host = parts.host else { return nil }
                         return parts.port.map { "\(scheme)://\(host):\($0)" } ?? "\(scheme)://\(host)"
                     } ?? ""
                     let targetPath = target.path.isEmpty ? "/index.html" : target.path
                     let targetRoot = targetPath.hasSuffix("/") ? targetPath : targetPath + "/"
+                    // origin 在自定义 scheme 下可能是字符串 "null"（opaque origin），
+                    // 所以除了 origin 还单独给 scheme/host/rootPath，让 bootstrap 用
+                    // 「protocol + host ± rootPath」这套不依赖 location.origin 的判据。
                     let config: [String: Any] = [
                         "origin": targetOrigin,
+                        "scheme": targetScheme,
+                        "host": targetHost,
+                        "rootPath": String(targetRoot.dropLast()),
                         "paths": [String(targetRoot.dropLast()), targetRoot, targetRoot + "index.html"],
                         "nonce": nonce, "navId": id, "generation": documentGeneration, "epoch": epoch,
                         "capabilities": capabilities, "storeSnapshot": snapshot.values,
@@ -268,17 +279,49 @@ final class IOSBridge {
     /// 网页退回「UI 测试预览」（数据取不到、安全区也不走原生分支）。
     ///
     /// didCommit 时文档已建立、页面脚本还在解析中，此刻 evaluateJavaScript
-    /// 注入能保证在页面自己的脚本之前生效。已经注过就不再重复。
+    /// 注入能保证在页面自己的脚本之前生效。
+    ///
+    /// 要点（之前三处都踩过）：
+    /// 1. 先探一次 `typeof window.__zeehoIOS`：user script 已经跑过就别再跑，
+    ///    否则 `configurable: false` 的 defineProperty 抛 TypeError，而 bootstrap
+    ///    自己的 error 监听会画一个全屏黑浮层——用户看到的就是「纯黑点不动」。
+    /// 2. 失败要能重试：`evaluateJavaScript` 不报错不等于生效（可能打在旧文档上），
+    ///    所以每次注入后都复查一次，未生效就退避重试，最多 3 次。
+    /// 3. 重试按导航 ticket 计数，换文档就清零。
     func reinjectBootstrapIfNeeded() {
         precondition(Thread.isMainThread)
-        guard !closed, prepared, !bootstrapReinjected, let source = bootstrapSource,
-              let web = webView else { return }
-        bootstrapReinjected = true
-        web.evaluateJavaScript(source) { _, error in
-            if let error = error {
-                IOSDiagnostics.shared.log("bootstrap 补注入失败: \(error.localizedDescription)")
-            } else {
-                IOSDiagnostics.shared.log("bootstrap 补注入完成")
+        guard !closed, prepared, let source = bootstrapSource, let web = webView,
+              let url = web.url, PanelNavigation.navigationID(in: url) == navigationID else { return }
+        let ticket = navigationID
+        let attempt = bootstrapAttempts[ticket] ?? 0
+        guard attempt < Self.maxBootstrapAttempts else {
+            IOSDiagnostics.shared.log("bootstrap 补注入放弃：已试 \(attempt) 次")
+            return
+        }
+        web.evaluateJavaScript("typeof window.__zeehoIOS !== 'undefined'") { [weak self] value, _ in
+            guard let self = self, !self.closed, self.navigationID == ticket else { return }
+            if (value as? Bool) == true {
+                // user script 这次跑得早，不需要补。
+                return
+            }
+            self.bootstrapAttempts[ticket] = attempt + 1
+            web.evaluateJavaScript(source) { [weak self] _, error in
+                guard let self = self, !self.closed, self.navigationID == ticket else { return }
+                if let error = error {
+                    IOSDiagnostics.shared.log("bootstrap 补注入第 \(attempt + 1) 次失败: \(error.localizedDescription)")
+                }
+                // 复查：没报错也可能因为文档未就绪而没生效。
+                web.evaluateJavaScript("typeof window.__zeehoIOS !== 'undefined'") { [weak self] value, _ in
+                    guard let self = self, !self.closed, self.navigationID == ticket else { return }
+                    if (value as? Bool) == true {
+                        IOSDiagnostics.shared.log("bootstrap 补注入成功（第 \(attempt + 1) 次）")
+                        return
+                    }
+                    let delay = [0.15, 0.4, 1.0][min(attempt, 2)]
+                    DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in
+                        self?.reinjectBootstrapIfNeeded()
+                    }
+                }
             }
         }
     }
