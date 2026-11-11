@@ -200,10 +200,20 @@ final class IOSBridge {
                     guard template.components(separatedBy: "__ZEEHO_IOS_CONFIG__").count == 2 else {
                         throw IOSBridgePolicy.Failure("bootstrap_invalid")
                     }
-                    let root = PanelNavigation.home.path
+                    // origin/paths 必须跟实际要加载的文档走：本地快照是
+                    // zeeho-panel://panel/，线上是 https://<host>/。
+                    // 写死 https 会让本地模式下 bootstrap 的 origin 校验失败，
+                    // __zeehoIOS 不注入 → 网页判定「无桥」→ 白屏。
+                    let targetParts = URLComponents(url: target, resolvingAgainstBaseURL: false)
+                    let targetOrigin = targetParts.flatMap { parts -> String? in
+                        guard let scheme = parts.scheme, let host = parts.host else { return nil }
+                        return parts.port.map { "\(scheme)://\(host):\($0)" } ?? "\(scheme)://\(host)"
+                    } ?? ""
+                    let targetPath = target.path.isEmpty ? "/index.html" : target.path
+                    let targetRoot = targetPath.hasSuffix("/") ? targetPath : targetPath + "/"
                     let config: [String: Any] = [
-                        "origin": "https://" + (PanelNavigation.home.host ?? ""),
-                        "paths": [String(root.dropLast()), root, root + "index.html"],
+                        "origin": targetOrigin,
+                        "paths": [String(targetRoot.dropLast()), targetRoot, targetRoot + "index.html"],
                         "nonce": nonce, "navId": id, "generation": documentGeneration, "epoch": epoch,
                         "capabilities": capabilities, "storeSnapshot": snapshot.values,
                         "storeRevision": snapshot.revision, "storeReadError": snapshot.readError as Any? ?? NSNull()

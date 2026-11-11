@@ -12,15 +12,19 @@ final class IOSPanelCache {
 
     // 顺序即资源序号；与 build-static.mjs 生成的产物集合保持一致。
     // 首个是 index.html，它决定整份快照是否可用。
+    // 后四项是 index.html 会引用的图标与 PWA 清单，缺了虽然不白屏但会 404。
     static let resources: [String] = [
         "index.html",
         "mock.json",
         "version.json",
         "manifest.webmanifest",
         "sw.js",
+        "theme.LICENSE.txt",
         "icons/icon-192.png",
         "icons/icon-512.png",
-        "icons/apple-touch-icon.png"
+        "icons/apple-touch-icon.png",
+        "icons/favicon-32.png",
+        "icons/icon-maskable-512.png"
     ]
 
     enum Phase: String {

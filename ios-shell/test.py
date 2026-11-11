@@ -70,8 +70,9 @@ assert 'IOSStrings.recoveryTitle' in recovery and 'IOSStrings.recoverySubtitle' 
 assert 'initializeButton.isHidden = cancellable' in recovery
 assert 'cancelButton.isHidden = !cancellable' in recovery
 assert 'enterButton.isEnabled = ready && !busy' in recovery
-# 欢迎页不创建 WebView，也不调用 JS。
-assert 'WKWebView' not in recovery and 'evaluateJavaScript' not in recovery
+# 欢迎页不创建 WebView，也不调用 JS（文案里提到 WKWebView 是正常的，检查真实类型/调用）。
+assert 'WKWebView(' not in recovery and 'evaluateJavaScript' not in recovery
+assert 'import WebKit' not in recovery
 
 # 资源快照：清单与自定义 scheme 必须一致，否则本地页面缺资源。
 cache = (root / 'PanelCache.swift').read_text(encoding='utf-8')

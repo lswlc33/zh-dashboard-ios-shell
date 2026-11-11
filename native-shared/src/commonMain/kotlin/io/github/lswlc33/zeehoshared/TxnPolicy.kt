@@ -28,7 +28,18 @@ internal object TxnPolicy {
     const val MAX_TOTAL = 128
     const val RESULT_TTL_MS = 120_000L
     const val MAX_JSON_CHARS = (MAX_BODY_BYTES + 2) / 3 * 4 + 64 * 1024
-    private val allowedHeaders = setOf("cfmoto-x-param", "cfmoto-x-sign", "cfmoto-x-sign-type", "cfmoto-sign", "cfmoto-sign-type", "authorization", "content-type", "accept")
+    // 只放行官方 App 真实会发的头。`interfaceversion` 与 `accept-language` 是网关
+    // 按「App 请求」识别的依据，之前漏掉会被当成普通网页请求；其余仍静默丢弃，
+    // 避免把网页的探测头原样转发。
+    //
+    // 刻意**不放行** `x-app-info` / `appid` / `nonce` / `signature` / `timestamp`：
+    // 实测只要带上 x-app-info，服务端 WAF 就回 430 30121 permit error，
+    // 无论签名怎么算（见 public/js/sign.js 的 APP_INFO 注释）。
+    private val allowedHeaders = setOf(
+        "cfmoto-x-param", "cfmoto-x-sign", "cfmoto-x-sign-type", "cfmoto-sign", "cfmoto-sign-type",
+        "authorization", "content-type", "accept",
+        "accept-language", "interfaceversion", "user-agent"
+    )
     private val allowedHosts = setOf("tapi.zeehoev.com", "h5.zeehoev.com")
 
     fun parse(json: JsonObject): TxnRequest {

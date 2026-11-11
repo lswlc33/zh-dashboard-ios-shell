@@ -154,6 +154,8 @@ final class PanelController: UIViewController, WKNavigationDelegate, WKUIDelegat
     private var checkingUpdate = false
     private var checkedOnLaunch = false
     private var lastSafeArea = UIEdgeInsets.zero
+    /// 当前这轮是否在用本地快照；失败时用它决定要不要自动回退线上。
+    private var usingLocalSnapshot = false
 
     /// 启动失败回调：交给 RootRouter 切到恢复页。
     var onBootFailure: ((String) -> Void)?
@@ -299,6 +301,8 @@ final class PanelController: UIViewController, WKNavigationDelegate, WKUIDelegat
         // 有本地快照就把主文档改写到 zeeho-panel://，弱网/离线也能进；
         // 没快照保持线上 https，行为与以前一致。
         let target = Self.localSnapshotURL(for: url) ?? url
+        // 记录本轮是否走本地：本地加载失败要能自动回退线上，否则用户会看到白屏。
+        usingLocalSnapshot = target.scheme?.lowercased() == PanelNavigation.localScheme
         bridge.prepareNavigation(to: target) { [weak self] result in
             guard let self = self else { return }
             switch result {
@@ -307,6 +311,16 @@ final class PanelController: UIViewController, WKNavigationDelegate, WKUIDelegat
             case let .failure(error): self.showError(error)
             }
         }
+    }
+
+    /// 本地快照加载失败时回退到线上地址，并让快照失效（下次进欢迎页重下）。
+    /// 返回 true 表示已经回退，调用方不要再弹错误。
+    private func fallbackToNetwork() -> Bool {
+        guard usingLocalSnapshot else { return false }
+        usingLocalSnapshot = false
+        BootHealth.failed(reason: "resources")
+        preparePanel(PanelNavigation.home)
+        return true
     }
 
     func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
@@ -328,6 +342,8 @@ final class PanelController: UIViewController, WKNavigationDelegate, WKUIDelegat
 
     private func showError(_ error: Error) {
         guard (error as NSError).code != NSURLErrorCancelled else { return }
+        // 本地快照读不出来（文件被清、权限问题）先自动回退线上，别让用户看白屏。
+        if fallbackToNetwork() { return }
         bridge?.navigationFailed()
         BootHealth.failed(reason: "load_failed")
         onBootFailure?("load_failed")
