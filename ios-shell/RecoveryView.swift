@@ -47,7 +47,18 @@ final class RecoveryViewController: UIViewController {
         super.viewDidLoad()
         view.backgroundColor = .systemBackground
         buildUI()
+        // 初始化期间每 100ms 推一次进度；不用轮询，避免空转。
+        IOSPanelCache.shared.onState = { [weak self] state in
+            self?.render(state)
+        }
         refreshCache()
+    }
+
+    deinit {
+        // 页面销毁后不要再往它身上回调。
+        if IOSPanelCache.shared.onState != nil {
+            IOSPanelCache.shared.onState = nil
+        }
     }
 
     // MARK: - 布局
@@ -314,22 +325,32 @@ final class RecoveryViewController: UIViewController {
         let doneText = Self.formatBytes(state.done)
         if state.phase == .downloading, state.total > 0 {
             let bytes = String(format: IOSStrings.recoveryBytes, doneText, Self.formatBytes(state.total))
-            if state.resourceIndex > 0, state.resourceCount >= state.resourceIndex {
-                bytesLabel.text = String(format: IOSStrings.recoveryResourceProgress,
-                                         state.resourceIndex, state.resourceCount, bytes)
-            } else {
-                bytesLabel.text = bytes
-            }
+            bytesLabel.text = String(format: IOSStrings.recoveryResourceProgress,
+                                     max(1, state.resourceIndex), max(1, state.resourceCount), bytes)
         } else if state.phase == .downloading {
-            bytesLabel.text = String(format: IOSStrings.recoveryBytesUnknown, doneText)
+            // 并发下载时 Content-Length 还没回来，先显示已下字节与文件进度。
+            let base = String(format: IOSStrings.recoveryBytesUnknown, doneText)
+            bytesLabel.text = String(format: IOSStrings.recoveryResourceProgress,
+                                     max(1, state.resourceIndex), max(1, state.resourceCount), base)
         } else {
             bytesLabel.text = ready ? IOSStrings.recoveryReadyHint : ""
         }
         bytesLabel.isHidden = (bytesLabel.text ?? "").isEmpty
 
         progressBar.isHidden = !busy
-        progressBar.progress = (busy && state.total > 0)
-            ? Float(Double(state.done) / Double(state.total)) : 0
+        if busy {
+            // 总量未知时用「已完成文件数 / 总数」当比例，别让进度条一直停在 0。
+            let ratio: Double
+            if state.total > 0 {
+                ratio = Double(state.done) / Double(state.total)
+            } else {
+                ratio = Double(state.resourceCount - max(0, state.resourceCount - state.resourceIndex))
+                    / Double(max(1, state.resourceCount))
+            }
+            progressBar.progress = Float(max(0, min(1, ratio)))
+        } else {
+            progressBar.progress = 0
+        }
 
         let message = state.error.isEmpty ? reasonMessage() : initErrorMessage(state.error)
         errorLabel.text = message
@@ -392,64 +413,13 @@ final class RecoveryViewController: UIViewController {
         onEnter?()
     }
 
-    /// 「版本与更新」：完整对照安卓的版本弹窗 + 线路选择。
+    /// 「版本与更新」：打开独立更新面板（版本信息 / 资源状态 / 线路 / 操作）。
     @objc private func showVersion() {
-        let info = Bundle.main.infoDictionary ?? [:]
-        let version = info["CFBundleShortVersionString"] as? String ?? "—"
-        let build = info["CFBundleVersion"] as? String ?? "—"
-        let panelBuild = IOSPanelCache.shared.snapshotBuild()
-        let message = [
-            "\(IOSStrings.recoveryAppVersionLabel)：\(version)（\(build)）",
-            "\(IOSStrings.recoveryPanelVersionLabel)：\(panelBuild.isEmpty ? IOSStrings.recoveryPanelVersionNone : panelBuild)",
-            "\(IOSStrings.recoveryWebviewLabel)：WKWebView（iOS \(UIDevice.current.systemVersion)）",
-            "\(IOSStrings.recoveryMinimumLabel)：iOS 15.4",
-            "",
-            IOSStrings.recoverySoftwareLineLabel
-        ].joined(separator: "\n")
-
-        let sheet = UIAlertController(title: IOSStrings.recoveryVersionTitle, message: message,
-                                      preferredStyle: .actionSheet)
-        // 线路选择：两个选项各带勾选状态，点一下立刻生效。
-        for line in [IOSPanelLine.github, IOSPanelLine.cf] {
-            let mark = line == IOSPanelLine.current ? "✓ " : ""
-            sheet.addAction(UIAlertAction(title: mark + line.displayName, style: .default) { [weak self] _ in
-                self?.selectLine(line)
-            })
-        }
-        sheet.addAction(UIAlertAction(title: IOSStrings.recoveryUpdate, style: .default) { [weak self] _ in
-            self?.checkUpdate()
-        })
-        sheet.addAction(UIAlertAction(title: IOSStrings.cancel, style: .cancel))
-        // iPad 上 actionSheet 需要锚点，否则崩溃。
-        if let popover = sheet.popoverPresentationController {
-            popover.sourceView = versionButton
-            popover.sourceRect = versionButton.bounds
-        }
-        present(sheet, animated: true)
-    }
-
-    private func selectLine(_ line: IOSPanelLine) {
-        guard line != IOSPanelLine.current else { return }
-        IOSPanelLine.current = line
-        // 换线路后旧快照可能来自另一个源，必须重下才能保证资源一致。
-        IOSPanelCache.shared.initialize(force: true) { [weak self] state in
-            self?.render(state)
-        }
-        let alert = UIAlertController(title: IOSStrings.recoveryVersionTitle,
-                                      message: String(format: IOSStrings.recoveryLineChanged, line.displayName),
-                                      preferredStyle: .alert)
-        alert.addAction(UIAlertAction(title: IOSStrings.confirm, style: .default))
-        present(alert, animated: true)
-    }
-
-    private func checkUpdate() {
-        let version = Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "—"
-        let build = Bundle.main.infoDictionary?["CFBundleVersion"] as? String ?? "—"
-        let alert = UIAlertController(title: IOSStrings.recoveryUpdate,
-                                      message: String(format: IOSStrings.recoveryUpdateHint, version, build),
-                                      preferredStyle: .alert)
-        alert.addAction(UIAlertAction(title: IOSStrings.confirm, style: .default))
-        present(alert, animated: true)
+        let panel = UpdatePanelViewController()
+        panel.onChange = { [weak self] in self?.refreshCache() }
+        let nav = UINavigationController(rootViewController: panel)
+        nav.modalPresentationStyle = .formSheet
+        present(nav, animated: true)
     }
 
     @objc private func showBackup() {

@@ -54,17 +54,29 @@ final class IOSPanelCache {
 
     private let queue = DispatchQueue(label: "io.github.lswlc33.dashboard.ios.panel-cache", qos: .utility)
     /// 复用同一个 ephemeral session：每次下载新建一个会漏连接池，也不利于统一取消。
+    /// 下载会话。
+    ///
+    /// 用 `.default` 而不是 `.ephemeral`：ephemeral 不给磁盘缓存也不复用连接池里的
+    /// TLS session，每个请求都要重新握手（GitHub Pages 是 HTTPS，握手本身就 2~3 个 RTT）。
+    /// 11 个资源串行下载时这点开销被放大得最明显。
+    /// urlCache 仍置空，避免拿到过期的面板资源。
     private static let session: URLSession = {
-        let configuration = URLSessionConfiguration.ephemeral
+        let configuration = URLSessionConfiguration.default
         configuration.requestCachePolicy = .reloadIgnoringLocalCacheData
         configuration.urlCache = nil
         configuration.httpCookieStorage = nil
+        configuration.httpShouldUsePipelining = true
+        configuration.httpMaximumConnectionsPerHost = 6
+        configuration.timeoutIntervalForRequest = 30
         return URLSession(configuration: configuration)
     }()
     private var state = State()
-    private var task: URLSessionDataTask?
+    private var tasks: [URLSessionDataTask] = []
+    private let lock = NSLock()
     private var generation = 0
     private var cancelled = false
+    /// 初始化期间每次状态变化都回调，让欢迎页看到实时进度。
+    var onState: ((State) -> Void)?
 
     private init() {}
 
@@ -204,8 +216,10 @@ final class IOSPanelCache {
             guard let self = self else { return }
             self.cancelled = true
             self.generation += 1
-            self.task?.cancel()
-            self.task = nil
+            self.lock.lock()
+            for job in self.tasks { job.cancel() }
+            self.tasks.removeAll()
+            self.lock.unlock()
             if self.snapshotDirectory() != nil {
                 self.state = State(phase: .ready, done: 0, total: 0, resourceIndex: 0,
                                    resourceCount: Self.resources.count, error: "",
@@ -227,80 +241,194 @@ final class IOSPanelCache {
 
     // MARK: - 下载
 
-    /// 下载进度在闭包间共享，用引用类型而不是闭包捕获 var：
-    /// Swift 6 对「在 @Sendable 闭包里改捕获的可变局部变量」有限制，
-    /// 而且串行队列上的可变状态本来就该是显式对象。
-    private final class DownloadProgress {
-        var index = 0
+    /// 并发下载全部资源。
+    ///
+    /// 之前的实现是「一个文件下完再下一个」，11 个文件串行 = 首屏要等 11 个 RTT，
+    /// 而且进度条只在每个文件完成时跳一次，中途看起来像卡死。改成：
+    ///   - 同时最多 `maxConcurrent` 个请求（太多会被 CDN 限速，4 是常见甜点）
+    ///   - 每个字节都回调进度（节流到 100ms，避免刷爆主线程）
+    ///   - total 用响应头 Content-Length 累加，进度条按真实比例走
+    private static let maxConcurrent = 4
+    private static let progressInterval: TimeInterval = 0.1
+
+    /// 并发下载的共享状态。用引用类型而不是闭包捕获 var：
+    /// Swift 6 不允许在异步闭包里改捕获的可变局部变量。
+    private final class Batch {
+        let ticket: Int
+        var remaining: Int
         var totalBytes: Int64 = 0
         var doneBytes: Int64 = 0
         var failed: Error?
+        var lastEmit: TimeInterval = 0
+        var inFlight = 0
+        var nextIndex = 0
+        var finished = false
+        /// 已经计入 totalBytes 的资源下标，避免重复累加 Content-Length。
+        var knownSizes = Set<Int>()
+        let completion: (Result<Void, Error>) -> Void
+
+        init(ticket: Int, count: Int, completion: @escaping (Result<Void, Error>) -> Void) {
+            self.ticket = ticket
+            self.remaining = count
+            self.completion = completion
+        }
     }
 
     private func downloadAll(into staging: URL, ticket: Int,
                              completion: @escaping (Result<Void, Error>) -> Void) {
         let base = IOSPanelLine.baseURL()
-        let progress = DownloadProgress()
-        stepDownload(base: base, staging: staging, ticket: ticket, progress: progress, completion: completion)
-    }
+        let batch = Batch(ticket: ticket, count: Self.resources.count, completion: completion)
+        state.phase = .downloading
+        state.resourceCount = Self.resources.count
+        // 冷启动时先把阶段推给界面，别让用户盯着「待完成」等第一个字节。
+        emitState(ticket)
 
-    private func stepDownload(base: URL, staging: URL, ticket: Int,
-                              progress: DownloadProgress,
-                              completion: @escaping (Result<Void, Error>) -> Void) {
-        guard !cancelled, generation == ticket else {
-            completion(.failure(Failure.reason("panel_cache_cancelled")))
-            return
-        }
-        if let failed = progress.failed {
-            completion(.failure(failed))
-            return
-        }
-        guard progress.index < Self.resources.count else {
+        if Self.resources.isEmpty {
+            batch.finished = true
             completion(.success(()))
             return
         }
-        let name = Self.resources[progress.index]
-        guard let url = URL(string: name, relativeTo: base) else {
-            completion(.failure(Failure.reason("panel_resource_url_invalid")))
-            return
-        }
-        state.phase = .downloading
-        state.resourceIndex = progress.index + 1
-        state.resourceCount = Self.resources.count
-
-        self.download(url) { [weak self] result in
+        // 先并发探一遍 Content-Length：进度条从第一秒起就是真实比例，
+        // 而不是等最后一个文件下完才跳到 100%。
+        // notify 已经回到本类的串行队列上，不需要再 async 一次。
+        probeSizes(base: base, ticket: ticket) { [weak self] sizes in
             guard let self = self else { return }
-            // 回调已在 URLSession 队列上，切回自己的串行队列再改状态。
-            self.queue.async {
-                guard self.generation == ticket else {
-                    completion(.failure(Failure.reason("panel_cache_cancelled")))
-                    return
-                }
-                switch result {
-                case let .failure(error):
-                    completion(.failure(error))
-                case let .success(data):
-                    let destination = staging.appendingPathComponent(name, isDirectory: false)
-                    do {
-                        try FileManager.default.createDirectory(at: destination.deletingLastPathComponent(),
-                                                                withIntermediateDirectories: true)
-                        try data.write(to: destination, options: [.atomic])
-                        progress.totalBytes += Int64(data.count)
-                        progress.doneBytes += Int64(data.count)
-                        self.state.total = progress.totalBytes
-                        self.state.done = progress.doneBytes
-                        progress.index += 1
-                        self.stepDownload(base: base, staging: staging, ticket: ticket,
-                                          progress: progress, completion: completion)
-                    } catch {
-                        completion(.failure(Failure.reason("panel_write_failed")))
-                    }
-                }
+            guard self.generation == ticket, !batch.finished else { return }
+            batch.totalBytes = sizes.reduce(0) { $0 + $1 }
+            batch.knownSizes = Set(Self.resources.indices)
+            self.state.total = batch.totalBytes
+            self.emitState(ticket)
+            // 起 maxConcurrent 个并发位，每个位下完一个就立刻领下一个。
+            for _ in 0..<min(Self.maxConcurrent, Self.resources.count) {
+                self.pullNext(base: base, staging: staging, batch: batch)
             }
         }
     }
 
-    private func download(_ url: URL, completion: @escaping (Result<Data, Error>) -> Void) {
+    /// 用并行 HEAD 拿每个资源的大小。任何一项失败都当 0 处理，
+    /// 不影响下载本身——进度条退化到「按文件数」即可。
+    private func probeSizes(base: URL, ticket: Int,
+                            completion: @escaping ([Int64]) -> Void) {
+        let group = DispatchGroup()
+        let lock = NSLock()
+        var sizes = [Int64](repeating: 0, count: Self.resources.count)
+        for (index, name) in Self.resources.enumerated() {
+            guard let url = URL(string: name, relativeTo: base) else { continue }
+            var request = URLRequest(url: url, cachePolicy: .reloadIgnoringLocalCacheData, timeoutInterval: 12)
+            request.httpMethod = "HEAD"
+            group.enter()
+            let job = Self.session.dataTask(with: request) { _, response, _ in
+                defer { group.leave() }
+                guard let http = response as? HTTPURLResponse,
+                      let length = http.value(forHTTPHeaderField: "Content-Length"),
+                      let value = Int64(length), value > 0 else { return }
+                lock.lock(); sizes[index] = value; lock.unlock()
+            }
+            job.resume()
+        }
+        group.notify(queue: queue) { completion(sizes) }
+    }
+
+    /// 领下一个还没分配的资源并开始下载；没有剩余且全部完成时收尾。
+    private func pullNext(base: URL, staging: URL, batch: Batch) {
+        guard !cancelled, generation == batch.ticket else {
+            failBatch(batch, Failure.reason("panel_cache_cancelled"))
+            return
+        }
+        guard batch.failed == nil, !batch.finished else { return }
+        guard batch.nextIndex < Self.resources.count else {
+            // 没有更多资源；等在途的都回来再收尾。
+            if batch.inFlight == 0 {
+                finishBatch(batch)
+            }
+            return
+        }
+        let index = batch.nextIndex
+        batch.nextIndex += 1
+        let name = Self.resources[index]
+        guard let url = URL(string: name, relativeTo: base) else {
+            failBatch(batch, Failure.reason("panel_resource_url_invalid"))
+            return
+        }
+        batch.inFlight += 1
+        state.resourceIndex = min(index + 1, Self.resources.count)
+
+        download(url,
+                 onProgress: { [weak self] received, expected in
+                     guard let self = self else { return }
+                     self.queue.async {
+                         guard self.generation == batch.ticket else { return }
+                         // 预探没拿到大小的资源（HEAD 失败/无 Content-Length），
+                         // 下载时补上，保证 total 最终等于真实字节数。
+                         if expected > 0, !batch.knownSizes.contains(index) {
+                             batch.knownSizes.insert(index)
+                             batch.totalBytes += expected
+                         }
+                         batch.doneBytes += received
+                         self.state.total = batch.totalBytes
+                         self.state.done = batch.doneBytes
+                         self.throttledEmit(batch)
+                     }
+                 },
+                 completion: { [weak self] result in
+                     guard let self = self else { return }
+                     self.queue.async {
+                         batch.inFlight -= 1
+                         batch.remaining -= 1
+                         guard self.generation == batch.ticket else { return }
+                         switch result {
+                         case let .failure(error):
+                             self.failBatch(batch, error)
+                         case let .success(data):
+                             let destination = staging.appendingPathComponent(name, isDirectory: false)
+                             do {
+                                 try FileManager.default.createDirectory(
+                                     at: destination.deletingLastPathComponent(),
+                                     withIntermediateDirectories: true)
+                                 try data.write(to: destination, options: [.atomic])
+                                 self.pullNext(base: base, staging: staging, batch: batch)
+                             } catch {
+                                 self.failBatch(batch, Failure.reason("panel_write_failed"))
+                             }
+                         }
+                     }
+                 })
+    }
+
+    private func throttledEmit(_ batch: Batch) {
+        let now = Date().timeIntervalSince1970
+        guard now - batch.lastEmit >= Self.progressInterval else { return }
+        batch.lastEmit = now
+        emitState(batch.ticket)
+    }
+
+    private func emitState(_ ticket: Int) {
+        guard generation == ticket else { return }
+        let current = state
+        DispatchQueue.main.async { self.onState?(current) }
+    }
+
+    private func finishBatch(_ batch: Batch) {
+        guard !batch.finished else { return }
+        batch.finished = true
+        batch.completion(.success(()))
+    }
+
+    private func failBatch(_ batch: Batch, _ error: Error) {
+        guard !batch.finished else { return }
+        batch.finished = true
+        batch.completion(.failure(error))
+    }
+
+    /// 单文件下载。进度粒度是「整个文件」——`URLSession.dataTask` 的
+    /// completion 只在全部收完时回调，拿不到中途字节数。
+    /// 要做真正的字节级进度得改用 `URLSessionDataDelegate` 的 didReceive(data:)，
+    /// 那需要把整个 session 换成 delegate 模式；11 个文件（1 大 10 小）时
+    /// 「每文件一次回调」已经够用，不值得为此重构。
+    /// `onProgress` 的第二个参数是 Content-Length（未知时为 0）。
+    private func download(_ url: URL,
+                          onProgress: @escaping (Int64, Int64) -> Void,
+                          completion: @escaping (Result<Data, Error>) -> Void) {
         var request = URLRequest(url: url, cachePolicy: .reloadIgnoringLocalCacheData, timeoutInterval: 30)
         request.setValue("no-cache", forHTTPHeaderField: "Cache-Control")
         let job = Self.session.dataTask(with: request) { data, response, error in
@@ -314,9 +442,13 @@ final class IOSPanelCache {
                 completion(.failure(Failure.reason("panel_download_failed")))
                 return
             }
+            let declared = Int64(http.value(forHTTPHeaderField: "Content-Length") ?? "") ?? 0
+            onProgress(Int64(data.count), declared > 0 ? declared : 0)
             completion(.success(data))
         }
-        task = job
+        lock.lock()
+        tasks.append(job)
+        lock.unlock()
         job.resume()
     }
 }

@@ -68,6 +68,16 @@ assert 'IOSStrings.recoveryTitle' in recovery and 'IOSStrings.recoverySubtitle' 
 assert 'initializeButton.isHidden = cancellable' in recovery
 assert 'cancelButton.isHidden = !cancellable' in recovery
 assert 'enterButton.isEnabled = ready && !busy' in recovery
+# 初始化进度走推送而不是轮询。
+assert 'IOSPanelCache.shared.onState' in recovery
+# 「版本与更新」打开独立面板，不再是 Alert。
+assert 'UpdatePanelViewController()' in recovery
+assert 'UIAlertController' not in recovery.split('showVersion', 1)[1].split('private func showBackup', 1)[0]
+# 更新面板要能看到版本、资源、线路、操作四段。
+update_panel = (root / 'UpdatePanelViewController.swift').read_text(encoding='utf-8')
+for text in ('版本信息', '面板资源', '软件更新线路', '检查软件更新', '重新初始化面板资源', '查看诊断日志'):
+    assert text in update_panel, text
+assert 'IOSPanelCache.resources.count' in update_panel
 # 欢迎页不创建 WebView，也不调用 JS（文案里提到 WKWebView 是正常的，检查真实类型/调用）。
 assert 'WKWebView(' not in recovery and 'evaluateJavaScript' not in recovery
 assert 'import WebKit' not in recovery
@@ -92,6 +102,11 @@ assert 'UIScrollView()' not in recovery_code
 cache = (root / 'PanelCache.swift').read_text(encoding='utf-8')
 scheme = (root / 'PanelSchemeHandler.swift').read_text(encoding='utf-8')
 assert 'static let resources' in cache and '"index.html"' in cache
+# 下载必须并发 + 预探总量，串行会让首屏等 11 个 RTT 且进度条不动。
+assert 'maxConcurrent' in cache and 'probeSizes' in cache
+assert 'httpMaximumConnectionsPerHost' in cache
+# 进度要实时推给界面，不能只在最后回调一次。
+assert 'var onState' in cache and 'throttledEmit' in cache
 assert 'zeeho-panel' in scheme
 assert 'didFailWithError' in scheme and 'resolvingSymlinksInPath' in scheme
 navigation = (root / 'Navigation.swift').read_text(encoding='utf-8')
