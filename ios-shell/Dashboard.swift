@@ -383,6 +383,11 @@ final class PanelController: UIViewController, WKNavigationDelegate, WKUIDelegat
 
     func webView(_ webView: WKWebView, didCommit navigation: WKNavigation!) {
         IOSDiagnostics.shared.log("didCommit: \(webView.url?.absoluteString ?? "nil")")
+        // 兜底补注入：自定义 scheme 下 atDocumentStart 的 user script 可能不执行
+        // （WKWebView 对非 http(s) 来源的限制），那 ios-bridge.js 执行时
+        // window.__zeehoIOS 还是 undefined，candidate 恒为 false，
+        // 网页就退回「UI 测试预览」。这里在文档已提交、脚本尚未跑完时补一次。
+        bridge?.reinjectBootstrapIfNeeded()
     }
 
     func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {

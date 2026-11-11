@@ -93,6 +93,10 @@ final class IOSBridge {
     private var snapshot = IOSStore.Snapshot(values: [:], revision: 0, readError: "store_not_loaded")
     private var navigationID = ""
     private var nonce = ""
+    /// 最近一次生成的 bootstrap 源码。自定义 scheme 下 atDocumentStart 注入
+    /// 可能不生效（WKWebView 对非 http(s) 来源的限制），didCommit 时用它兜底补注入。
+    private var bootstrapSource: String?
+    private var bootstrapReinjected = false
     private var prepared = false
     private var navigationPermit: String?
     private var closed = false
@@ -177,6 +181,8 @@ final class IOSBridge {
         preparation += 1
         prepared = false
         navigationPermit = nil
+        // 新一轮导航要允许重新补注入。
+        bootstrapReinjected = false
         let ticket = preparation
         store.snapshot { [weak self] snapshot in
             guard let self = self, !self.closed, self.preparation == ticket else {
@@ -231,6 +237,7 @@ final class IOSBridge {
                     case let .success((target, nonce, source)):
                         self.navigationID = PanelNavigation.navigationID(in: target)
                         self.nonce = nonce
+                        self.bootstrapSource = source
                         let controller = web.configuration.userContentController
                         controller.removeAllUserScripts()
                         controller.addUserScript(WKUserScript(source: source, injectionTime: .atDocumentStart,
@@ -251,6 +258,29 @@ final class IOSBridge {
         preparation += 1
         cancelAll(code: "navigation_failed")
         services.forEach { $0.navigationChanged() }
+    }
+
+    /// 补注入 bootstrap。
+    ///
+    /// `addUserScript(.atDocumentStart)` 在自定义 scheme 页面上不一定执行——
+    /// 真机实测：`hasBootstrap` 在 2 秒后的探测里是 true，但 `ios-bridge.js`
+    /// 执行那一刻 `window.__zeehoIOS` 还是 undefined，于是 candidate=false，
+    /// 网页退回「UI 测试预览」（数据取不到、安全区也不走原生分支）。
+    ///
+    /// didCommit 时文档已建立、页面脚本还在解析中，此刻 evaluateJavaScript
+    /// 注入能保证在页面自己的脚本之前生效。已经注过就不再重复。
+    func reinjectBootstrapIfNeeded() {
+        precondition(Thread.isMainThread)
+        guard !closed, prepared, !bootstrapReinjected, let source = bootstrapSource,
+              let web = webView else { return }
+        bootstrapReinjected = true
+        web.evaluateJavaScript(source) { _, error in
+            if let error = error {
+                IOSDiagnostics.shared.log("bootstrap 补注入失败: \(error.localizedDescription)")
+            } else {
+                IOSDiagnostics.shared.log("bootstrap 补注入完成")
+            }
+        }
     }
 
     func close() {
