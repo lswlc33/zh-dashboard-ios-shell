@@ -1,0 +1,109 @@
+import Foundation
+
+// 新增系统能力的可见文案集中在这里，避免各个权限回调使用不同解释。
+// Info.plist 的用途说明必须是静态字符串；对应常量保留同文案，供接线时核对。
+enum IOSStrings {
+    static let appTitle = "几何面板"
+    static let cancel = "取消"
+    static let confirm = "确定"
+    static let continueButton = "继续"
+    static let cancelButton = cancel
+    static let allow = "继续授权"
+    static let copy = "复制文字"
+    static let paste = "读取并粘贴"
+    static let share = "打开分享菜单"
+    static let saveFile = "选择保存位置"
+    static let savePhoto = "保存到照片"
+    static let openSettings = "打开系统设置"
+    static let schedule = "设置本地提醒"
+    static let removeNotifications = "取消这些提醒"
+    static let defaultExportName = "面板导出"
+
+    static let bluetoothUsage = "用于你主动连接车辆、使用感应钥匙或读取车辆蓝牙状态。"
+    static let locationUsage = "仅在你开启骑行记录时获取位置，用于绘制路线和记录距离。"
+    static let locationAlwaysUsage = "仅在你明确开启骑行记录后，允许切到后台继续记录路线；结束记录后停止获取位置。"
+    static let photoAddUsage = "仅在你点击保存图片后，将面板生成的图片添加到照片；不会读取已有照片。"
+    static let cameraUsage = "仅在你点击相机扫码或拍摄上传时使用摄像头，不会在启动时开启。"
+    static let microphoneUsage = "仅在你点击现场录音后使用麦克风，录制你的专属车辆音效。"
+
+    static let shareTitle = "分享面板文件"
+    static let saveTitle = "保存面板文件"
+    static let photoTitle = "保存面板图片"
+    static let clipboardWriteTitle = "复制到剪贴板"
+    static let clipboardWriteMessage = "只复制你提供的文字，不读取现有剪贴板；内容不会通过通用剪贴板同步到其他设备。"
+    static let clipboardReadTitle = "读取剪贴板"
+    static let clipboardReadMessage = "点击后才读取当前剪贴板中的文字，并交给当前面板页面。文字可能包含登录信息，请只在你准备粘贴时继续；系统可能再次询问是否允许粘贴。"
+    static let settingsTitle = "前往 iOS 设置"
+    static let settingsMessage = "打开本 App 的系统设置页，你可以自行修改通知、相机、麦克风、照片、位置或蓝牙权限；不会自动替你开启权限。"
+    static let notificationsTitle = "允许本地通知"
+    static let notificationsMessage = "仅为你设置的本地提醒申请通知权限。iOS 本地通知不代表后台定时查询车辆，也不是实时活动或跨 App 实况卡片；免打扰等系统设置可能影响展示。"
+    static let scheduleTitle = "设置一次本地提醒"
+    static let cancelNotificationsTitle = "取消本地提醒"
+    static let cameraTitle = "允许使用摄像头"
+    static let cameraMessage = "只有在你准备相机扫码或拍摄时才继续。授权只允许当前面板使用摄像头，不会读取照片或让其他 App 显示面板画面。"
+    static let microphoneTitle = "允许使用麦克风"
+    static let microphoneMessage = "只有在你准备现场录音时才继续。授权只允许当前面板录音，不会在后台自动录音或让其他 App 展示面板音频。"
+    static let cameraAndMicrophoneTitle = "允许相机和麦克风"
+    static let cameraAndMicrophoneMessage = "仅为当前面板中你主动启动的拍摄申请相机和麦克风权限。两项都获得系统授权才允许采集；离开页面或切到后台会撤销待处理的采集请求。"
+    static let bluetoothReadTitle = "读取车辆蓝牙状态"
+    static let bluetoothReadMessage = "只启停 command124 的只读车辆状态采样，不执行解锁、配对或登记。蓝牙写入应答只代表收到数据，不等于车辆认证成功或车控成功。"
+    static let gpsReadTitle = "获取手机 GPS 速度"
+    static let gpsReadMessage = "只有你继续后才获取手机 GPS 速度；即使已允许位置权限也不会自动启动。没有开启骑行记录时不会记录或分享位置，取消后不开始获取。"
+    static let rideShareTitle = "分享骑行路线"
+    static let rideShareMessage = "骑行路线包含位置信息。只有你继续后才交给系统分享菜单；取消分享不会显示成功，请确认你愿意分享给所选应用。"
+    static let rideRecordTitle = "开始骑行记录"
+    static let rideRecordMessage = "骑行记录会保存真实手机位置和当前可见的蓝牙车辆状态，仅保存在本机。不会自动连接或认证车辆；后台继续记录仍取决于你允许的位置权限和 iOS 调度，取消后不启动。"
+    static let rideDeleteTitle = "删除所选骑行记录"
+    static let rideDeleteMessage = "只删除你选中的本机骑行记录，不删除其他车辆的记录。删除后无法恢复，请确认这些记录不再需要。"
+    static let systemSnapshotTitle = "在系统表面显示车辆快照"
+    static let systemSnapshotMessage = "只把当前车辆的简单名称、车架号尾号、已知电量和充电状态，以及你主动录制的骑行速度与时长，保存到本机共享区供小组件和实时活动显示。不会保存登录凭据、车主身份或精确位置；锁屏可能显示这些状态，过期数据会标出最后更新时间。不会偷偷查询车辆，切换账号或车辆会清理旧快照。"
+    static let systemSnapshotDisableTitle = "关闭 iOS 系统显示"
+    static let systemSnapshotDisableMessage = "结束当前车辆的实时活动，并清除小组件共享快照。后续前台同步和骑行记录不会继续发布系统快照，直到你再次主动启用；不会停止骑行记录、删除历史或执行车控。"
+    static let liveActivityStartTitle = "开启 iOS 实时活动"
+    static let liveActivityStartMessage = "在锁屏显示当前车辆的已知状态或你主动开始的骑行记录，只使用已同步的数据。支持的设备是否显示灵动岛由 iOS 决定；这不是普通通知，不申请推送权限，也不保证后台持续更新。只有你点击继续后才开启，同时允许为此车辆保存不含凭据和精确位置的共享快照。"
+    static let liveActivityEndTitle = "结束 iOS 实时活动"
+    static let liveActivityEndMessage = "结束当前车辆的所选实时活动，不执行车控、不停止充电，也不删除骑行历史或修改系统通知权限。"
+
+    static let invalidArguments = "原生操作参数不正确，请重新打开页面后再试。"
+    static let unsupportedMethod = "当前 iOS 壳没有实现这项原生能力。"
+    static let unavailable = "原生服务暂时不可用，请重新打开 App。"
+    static let foregroundRequired = "请回到面板前台，再点击执行这项操作。"
+    static let busy = "请先完成或关闭当前系统操作，再试一次。"
+    static let fileTooLarge = "文件不能超过 20 MiB，请缩小后再导出。"
+    static let invalidFile = "文件内容或格式无效，只接受完整的 Base64 文件字节。"
+    static let fileWriteFailed = "无法准备导出文件，请检查设备剩余空间后重试。"
+    static let shareFailed = "系统分享未完成，请重新点击分享。"
+    static let saveFailed = "文件保存未完成，请重新选择保存位置。"
+    static let clipboardTooLarge = "剪贴板文字不能超过 1 MiB，请缩短后重试。"
+    static let settingsFailed = "无法打开本 App 的系统设置，请手动前往 iOS 设置。"
+    static let notificationRequestFailed = "通知授权未完成，请检查系统设置后重试。"
+    static let notificationScheduleFailed = "本地提醒未能设置，请检查通知权限后重试。"
+    static let notificationCancelFailed = "提醒取消结果尚未确认，请稍后再试。"
+    static let notificationLimit = "本 App 待触发的本地提醒已满，请先取消不需要的提醒。"
+    static let invalidSchedule = "请选择未来 1 秒到 366 天内的一次提醒时间，不支持重复后台任务。"
+    static let photoFormat = "只支持完整的单张 PNG、JPEG 或 HEIC 图片，请重新导出。"
+    static let photoDimensions = "图片过大：每边不能超过 8192 像素，总像素不能超过 2400 万。"
+    static let photoPermissionDenied = "尚未允许添加照片，请在系统设置中允许后重新保存。"
+    static let photoSaveFailed = "照片保存未完成，请检查图片格式和设备剩余空间后重试。"
+    static let operationFailed = "系统操作未完成，请重新点击后再试。"
+
+    static func shareMessage(name: String) -> String {
+        "将“\(name)”交给系统分享菜单；只有系统报告完成后，面板才会显示分享成功。"
+    }
+
+    static func saveMessage(name: String) -> String {
+        "把“\(name)”导出到你选择的文件位置。不会读取其他文件，取消选择不会报告保存成功。"
+    }
+
+    static func photoMessage(name: String) -> String {
+        "将“\(name)”添加到系统照片，只申请添加权限，不会读取、枚举或上传已有照片。"
+    }
+
+    static func scheduleMessage(title: String, body: String) -> String {
+        "提醒标题：\(title)\n\n\(body)\n\n这是一次本地提醒，只展示你提供的内容，不会在后台查询车辆。系统授权、免打扰及系统调度仍会影响通知展示。"
+    }
+
+    static func cancelNotificationsMessage(count: Int) -> String {
+        "取消你指定的 \(count) 项本地提醒，并移除相应已展示通知。不会清理其他类型通知或改变系统通知权限。"
+    }
+}

@@ -1,0 +1,117 @@
+name: Build unsigned iOS IPA
+
+# 公开仓库只负责构建：源码由私有仓库按白名单同步进来，产物回传到 Release。
+# 不做 Apple 登录、不使用证书/profile；产出 ad-hoc 签名的 IPA（TrollStore 侧载用）。
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'ios-shell/**'
+      - 'native-shared/**'
+      - 'public/icons/**'
+      - '.github/workflows/build-ios.yml'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: '版本号（用于 Release tag，留空则用日期时间）'
+        required: false
+        default: ''
+
+permissions:
+  contents: write
+
+concurrency:
+  group: build-ios-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    # 公开仓库的标准 macOS runner 免费，无需自托管。
+    runs-on: macos-15
+    timeout-minutes: 60
+
+    steps:
+      - name: 检出源码
+        uses: actions/checkout@v4
+
+      - name: 选择 Xcode
+        run: |
+          # 打印可用版本，选中最新稳定版；build.sh 需要完整 Xcode 而非仅 CLT。
+          ls -d /Applications/Xcode*.app 2>/dev/null || true
+          sudo xcode-select -switch /Applications/Xcode.app
+          xcodebuild -version
+          xcrun --sdk iphoneos --show-sdk-path
+
+      - name: 安装 JDK 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      - name: 缓存 Gradle
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+          key: gradle-${{ runner.os }}-${{ hashFiles('native-shared/**/*.gradle.kts', 'native-shared/gradle/wrapper/gradle-wrapper.properties') }}
+          restore-keys: gradle-${{ runner.os }}-
+
+      - name: 源码契约检查
+        run: python3 -I ios-shell/test.py
+
+      - name: 构建 iOS 壳（含 KMP framework，ad-hoc 签名）
+        run: |
+          chmod +x native-shared/gradlew ios-shell/build.sh
+          bash ios-shell/build.sh --output-dir "$RUNNER_TEMP/out" 2>&1 | tee build.log
+
+      - name: 记录源码指纹
+        if: always()
+        run: |
+          python3 -I ios-shell/build-support.py inputs --root . --manifest "$RUNNER_TEMP/build-inputs.json" || true
+          if [[ -f "$RUNNER_TEMP/build-inputs.json" ]]; then
+            python3 -I -c "import json,sys;d=json.load(open(sys.argv[1]));print('sourceTreeSha256='+str(d.get('sourceTreeSha256','')))" "$RUNNER_TEMP/build-inputs.json"
+          fi
+
+      - name: 校验产物
+        run: |
+          IPA="$RUNNER_TEMP/out/dashboard-trollstore.ipa"
+          [[ -f "$IPA" ]] || { echo "BLOCKED: IPA not produced"; ls -R "$RUNNER_TEMP/out" || true; exit 1; }
+          ls -l "$IPA"
+          shasum -a 256 "$IPA" | tee "$RUNNER_TEMP/SHA256SUMS"
+          # 结构校验：arm64 Mach-O + 签名结构存在（ad-hoc 也算已签名）
+          python3 -I ios-shell/test.py "$IPA"
+
+      - name: 上传构建日志
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-log
+          path: build.log
+          retention-days: 7
+
+      - name: 发布到 Release
+        if: success()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          VERSION="${{ github.event.inputs.version }}"
+          if [[ -z "$VERSION" ]]; then VERSION="$(date -u +%Y%m%d-%H%M%S)"; fi
+          TAG="ios-v${VERSION}"
+          FINGERPRINT="$(python3 -I -c "import json;print(json.load(open('$RUNNER_TEMP/build-inputs.json')).get('sourceTreeSha256','unknown'))" 2>/dev/null || echo unknown)"
+          # 用 printf 拼多行 notes：避免 heredoc 缩进与 YAML 缩进互相干扰。
+          NOTES_FILE="$RUNNER_TEMP/notes.md"
+          {
+            printf '未签名（ad-hoc）IPA，用于 TrollStore 侧载，不适用于 App Store 或普通自签安装。\n\n'
+            printf '`sourceTreeSha256`: `%s`\n' "$FINGERPRINT"
+            printf '公开仓库 commit: `%s`\n' "${{ github.sha }}"
+            printf '构建时间（UTC）: `%s`\n\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+            printf '本产物由公开仓库的 GitHub Actions 构建；源码由私有仓库按白名单同步，不含客户端密钥。\n'
+          } > "$NOTES_FILE"
+          gh release create "$TAG" \
+            --prerelease \
+            --title "iOS 未签名 IPA ${VERSION}" \
+            --notes-file "$NOTES_FILE" \
+            "$RUNNER_TEMP/out/dashboard-trollstore.ipa" \
+            "$RUNNER_TEMP/SHA256SUMS"
+          echo "Released $TAG"

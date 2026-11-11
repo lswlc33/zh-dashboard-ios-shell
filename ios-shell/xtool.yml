@@ -1,0 +1,15 @@
+# xtool 1.24.0 PackSchema v1; build-xtool.sh stages and expands Info.plist before building.
+version: 1
+product: DashboardIOS
+bundleID: io.github.lswlc33.dashboard.ios
+infoPath: Info.plist
+entitlementsPath: XtoolSupport/App.entitlements
+iconPath: ../public/icons/icon-512.png
+resources:
+  - bridge-bootstrap.js
+extensions:
+  - product: DashboardWidgets
+    bundleID: io.github.lswlc33.dashboard.ios.widgets
+    infoPath: Widgets/Info.plist
+    entitlementsPath: XtoolSupport/Widgets.entitlements
+skipLSP: true

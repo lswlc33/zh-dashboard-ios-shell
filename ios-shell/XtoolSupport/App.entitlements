@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+    <!-- 公开模板不是授权凭据。签名身份和 provisioning 必须真实批准这个 App Group。 -->
+    <key>com.apple.security.application-groups</key><array>
+        <string>group.io.github.lswlc33.dashboard.ios</string>
+    </array>
+</dict></plist>

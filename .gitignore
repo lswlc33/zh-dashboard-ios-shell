@@ -1,0 +1,12 @@
+# 构建产物与本地缓存（公开仓库只存源码）
+build/
+.gradle/
+.kotlin/
+.build-local/
+dist/
+__pycache__/
+*.pyc
+*.ipa
+*.xcframework
+local.properties
+private-api.properties
