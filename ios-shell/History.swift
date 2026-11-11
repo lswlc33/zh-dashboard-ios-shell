@@ -978,8 +978,9 @@ final class IOSHistoryService: IOSBridgeService {
     // 目录 fsync 未确认时，回读目标文件核对是否已经是本次要写的内容。
     // 内容一致 = rename 已生效，可以当成功；不一致/读不出 = 真的没写成。
     private func commitConfirmed(_ file: URL, _ bytes: Data) throws -> Bool {
-        // readFile 返回 Data?（文件不存在时 nil），所以只做一层可选绑定。
-        guard let currentBytes = try? readFile(file), let currentBytes = currentBytes else {
+        // readFile 返回 Data?，而 `try?` 会把「抛错」与「返回 nil」都折成 nil；
+        // 两者都表示「无法确认已落盘」，所以一层可选绑定就够。
+        guard let currentBytes = try? readFile(file) else {
             throw Failure("history_durability_unconfirmed")
         }
         guard currentBytes == bytes else { throw Failure("history_durability_unconfirmed") }
