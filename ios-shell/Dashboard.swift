@@ -514,6 +514,15 @@ final class PanelController: UIViewController, WKNavigationDelegate, WKUIDelegat
                 self.diagnosticsShown = true
                 IOSDiagnostics.shared.log("[\(tag)] body 为空且已走线上——真白屏，弹出诊断")
                 self.presentDiagnostics()
+                return
+            }
+            // 桥没就绪但页面有内容：说明本地 scheme 下 messageHandlers 不可用
+            // （WKWebView 对自定义 scheme 的限制），网页会退回「UI 测试预览」。
+            // 这种情况必须切回线上 https——只有 https 页面才能拿到原生桥。
+            let candidate = object["iosbrCandidate"] as? Bool ?? false
+            if !candidate, self.usingLocalSnapshot, childCount > 0 {
+                IOSDiagnostics.shared.log("[\(tag)] 本地快照下桥不可用，回退线上 https")
+                self.fallbackToNetwork()
             }
         }
     }

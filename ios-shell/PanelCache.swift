@@ -264,6 +264,9 @@ final class IOSPanelCache {
     ///   - total 用响应头 Content-Length 累加，进度条按真实比例走
     private static let maxConcurrent = 4
     private static let progressInterval: TimeInterval = 0.1
+    /// 单个资源失败后最多重试次数。移动网络抖动很常见，
+    /// 一次失败就整批 abort 会让用户卡在「N-1/N」不动。
+    private static let maxRetriesPerResource = 2
 
     /// 并发下载的共享状态。用引用类型而不是闭包捕获 var：
     /// Swift 6 不允许在异步闭包里改捕获的可变局部变量。
@@ -282,6 +285,8 @@ final class IOSPanelCache {
         /// 已完成（落盘成功）的文件数。进度条以它为主，字节数为辅——
         /// 字节数依赖 Content-Length，CDN 压缩/缺头时不可靠。
         var completedFiles = 0
+        /// 每个资源已尝试次数，用于单文件重试。
+        var attempts: [Int: Int] = [:]
         let completion: (Result<Void, Error>) -> Void
 
         init(ticket: Int, count: Int, completion: @escaping (Result<Void, Error>) -> Void) {
@@ -402,13 +407,29 @@ final class IOSPanelCache {
                  completion: { [weak self] result in
                      guard let self = self else { return }
                      self.queue.async {
-                         batch.inFlight -= 1
-                         batch.remaining -= 1
                          guard self.generation == batch.ticket else { return }
                          switch result {
                          case let .failure(error):
+                             // 单文件失败先重试（网络抖动很常见）；重试次数用完才整体失败。
+                             // 之前一次失败就整批 abort，用户看到的就是「卡在 90% 然后没了」。
+                             let attempts = (batch.attempts[index] ?? 0) + 1
+                             batch.attempts[index] = attempts
+                             if attempts <= Self.maxRetriesPerResource,
+                                (error as? Failure)?.code != "panel_cache_cancelled" {
+                                 IOSDiagnostics.shared.log(
+                                     "panelCache: \(name) 第 \(attempts) 次失败（\((error as? Failure)?.code ?? "?")），重试")
+                                 // 把序号让回去，让这个并发位重新领同一个文件。
+                                 batch.nextIndex = index
+                                 batch.inFlight -= 1
+                                 self.pullNext(base: base, staging: staging, batch: batch)
+                                 return
+                             }
+                             batch.inFlight -= 1
+                             batch.remaining -= 1
                              self.failBatch(batch, error)
                          case let .success(data):
+                             batch.inFlight -= 1
+                             batch.remaining -= 1
                              let destination = staging.appendingPathComponent(name, isDirectory: false)
                              do {
                                  try FileManager.default.createDirectory(

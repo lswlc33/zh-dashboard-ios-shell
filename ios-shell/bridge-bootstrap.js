@@ -101,7 +101,6 @@
       var stage = d.querySelector('.stage');
       var cs = stage ? w.getComputedStyle(stage) : null;
       bar.textContent = 'iOS 探针 readyState=' + d.readyState
-        + ' progress=' + Math.round((w.__zeehoIOS && w.__zeehoIOS.generation) || 0)
         + '\nbodyChildren=' + d.body.children.length
         + ' bodyLen=' + (d.body.innerHTML || '').length
         + '\nstage.display=' + (cs ? cs.display : 'n/a')
@@ -111,6 +110,35 @@
       d.body.appendChild(bar);
     } catch (e) { /* 取证失败就算了 */ }
   }, 6000);
+
+  // 桥诊断：把 candidate 判定的每一项单独报出来。
+  // 「当前是 UI 测试预览」= candidate 为 false，但光看结果猜不出是哪一项挂了。
+  w.setTimeout(function () {
+    try {
+      var d = w.document;
+      if (!d || !d.body) return;
+      var br = w.IOSBR;
+      if (!br || br.candidate()) return;   // 桥正常就什么都不做
+      var native = w.__zeehoIOS;
+      var h = w.webkit && w.webkit.messageHandlers && w.webkit.messageHandlers.zeehoIOS;
+      var detail = [
+        '原生桥判定失败（candidate=false）',
+        '__zeehoIOS=' + (native ? 'present' : 'MISSING'),
+        'flavor=' + (native ? native.flavor : 'n/a'),
+        'version=' + (native ? native.version : 'n/a'),
+        'nonce.len=' + (native && native.nonce ? String(native.nonce).length : 'n/a'),
+        'capabilities=' + (native && native.capabilities ? native.capabilities.length : 'n/a'),
+        'hasHello=' + (native && native.capabilities ? native.capabilities.indexOf('hello') >= 0 : 'n/a'),
+        'handler=' + (h && typeof h.postMessage === 'function' ? 'ok' : 'MISSING'),
+        'storeSnapshot=' + (native && native.storeSnapshot ? typeof native.storeSnapshot : 'n/a'),
+        'storeReadError=' + (native ? String(native.storeReadError) : 'n/a'),
+        'IOSBR=' + (br ? 'present' : 'MISSING'),
+        'available=' + (br && br.available ? br.available() : 'n/a'),
+        'origin=' + w.location.origin
+      ].join('\n');
+      showFatal('原生桥未就绪', detail);
+    } catch (e) { /* 诊断失败不抛 */ }
+  }, 3000);
 
   if (w !== w.top || w.location.origin !== config.origin
     || config.paths.indexOf(w.location.pathname) < 0) {
