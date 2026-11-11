@@ -216,8 +216,9 @@ final class IOSHistoryService: IOSBridgeService {
 
     private func complete(_ request: Request, _ value: Any?, _ error: String? = nil) {
         DispatchQueue.main.async { [self] in
-            guard isCurrent(request) else { finish(request, error: "history_scope_changed"); return }
-            finish(request, value: value, error: error)
+            // Swift 6：闭包内成员访问必须显式 self.。
+            guard self.isCurrent(request) else { self.finish(request, error: "history_scope_changed"); return }
+            self.finish(request, value: value, error: error)
         }
     }
 

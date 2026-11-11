@@ -41,24 +41,24 @@ final class IOSStore {
 
     func snapshot(completion: @escaping (Snapshot) -> Void) {
         queue.async { [self] in
-            loadIfNeeded()
-            let snapshot = Snapshot(values: values, revision: revision, readError: readError)
+            self.loadIfNeeded()
+            let snapshot = Snapshot(values: self.values, revision: self.revision, readError: self.readError)
             DispatchQueue.main.async { completion(snapshot) }
         }
     }
 
     func commit(_ object: [String: Any], completion: @escaping ([String: Any], Snapshot) -> Void) {
         queue.async { [self] in
-            loadIfNeeded()
+            self.loadIfNeeded()
             var result: [String: Any]
             do {
-                if let readError = readError { throw Failure.reason(readError) }
+                if let readError = self.readError { throw Failure.reason(readError) }
                 guard Set(object.keys).isSubset(of: ["puts", "removes"]),
                       let puts = object["puts"] as? [String: String],
                       let removes = object["removes"] as? [String],
                       puts.count + removes.count <= Self.maxKeys,
                       Set(removes).count == removes.count else { throw Failure.reason("invalid_commit") }
-                var next = values
+                var next = self.values
                 for (name, value) in puts {
                     guard Self.validKey(name), value.utf8.count <= Self.maxValueBytes,
                           !removes.contains(name) else { throw Failure.reason("invalid_store_value") }
@@ -68,11 +68,11 @@ final class IOSStore {
                     guard Self.validKey(name) else { throw Failure.reason("invalid_store_key") }
                     next.removeValue(forKey: name)
                 }
-                guard next.count <= Self.maxKeys, revision < 9_007_199_254_740_990,
-                      let key = key, let directory = directory, let archiveURL = archiveURL else {
+                guard next.count <= Self.maxKeys, self.revision < 9_007_199_254_740_990,
+                      let key = self.key, let directory = self.directory, let archiveURL = self.archiveURL else {
                     throw Failure.reason("store_unavailable")
                 }
-                let nextRevision = revision + 1
+                let nextRevision = self.revision + 1
                 let encoder = JSONEncoder()
                 encoder.outputFormatting = [.sortedKeys, .withoutEscapingSlashes]
                 let plain = try encoder.encode(Archive(version: 1, revision: nextRevision, values: next))
@@ -81,18 +81,18 @@ final class IOSStore {
                 guard let encrypted = sealed.combined, encrypted.count <= Self.maxArchiveBytes else {
                     throw Failure.reason("encryption_failed")
                 }
-                try atomicWrite(encrypted, to: archiveURL, directory: directory)
+                try self.atomicWrite(encrypted, to: archiveURL, directory: directory)
                 // 只有文件和目录 fsync 成功才公布新内存快照和 revision。
-                values = next
-                revision = nextRevision
-                result = ["ok": true, "revision": revision]
+                self.values = next
+                self.revision = nextRevision
+                result = ["ok": true, "revision": self.revision]
             } catch {
                 let code = (error as? Failure)?.code ?? "store_write_failed"
                 // rename 后若目录同步失败，磁盘状态不确定；冻结写入，下一次加载显式恢复。
-                if code == "durability_uncertain" { readError = code }
+                if code == "durability_uncertain" { self.readError = code }
                 result = ["ok": false, "reason": code]
             }
-            let snapshot = Snapshot(values: values, revision: revision, readError: readError)
+            let snapshot = Snapshot(values: self.values, revision: self.revision, readError: self.readError)
             DispatchQueue.main.async { completion(result, snapshot) }
         }
     }
