@@ -219,7 +219,7 @@ private enum IOSRideDisk {
                 guard entries.count <= maxFiles + 1 else { throw Failure("storage_limit_reached") }
                 var sum = 0
                 for item in entries { sum += try item.resourceValues(forKeys: [.fileSizeKey]).fileSize ?? 0 }
-                storeUsage(key, sum, stamp)
+                storeUsage(key, bytes: sum, now: stamp)
                 scopeBytes = sum
             }
             total += max(0, scopeBytes - (key == targetDirectory ? targetSize : 0))
@@ -1083,7 +1083,7 @@ final class IOSRideService: NSObject, IOSBridgeService, IOSBridgeCancellableServ
         let owner = run.scope.ownerHash
         worker.async { [weak self, weak run] in
             guard let run = run else { return }
-            let result: Result<Self.Saved, Error>
+            let result: Result<Saved, Error>
             do { result = .success(try Self.persist(value, owner: owner, id: run.id)) }
             catch { result = .failure(error) }
             DispatchQueue.main.async {
@@ -1201,7 +1201,7 @@ final class IOSRideService: NSObject, IOSBridgeService, IOSBridgeCancellableServ
         let owner = run.scope.ownerHash
         worker.async { [weak self, weak run] in
             guard let run = run else { return }
-            var result: Result<Self.Saved, Error>
+            var result: Result<Saved, Error>
             do { result = .success(try Self.persist(value, owner: owner, id: run.id)) }
             catch { result = .failure(error) }
             // iOS 侧原来没有 save_failed 的出口：网页从不发 ride.action{retry}，
