@@ -125,12 +125,8 @@ jobs:
           # version/build 都从 IPA 里的 Info.plist 读，保证「清单说的」与「包里是」一致：
           # version 是 CFBundleShortVersionString（x.y.z，isNewer 用语义化比较），
           # build 是 CFBundleVersion（本步已显式传 --build-number，浅克隆也不会是 1）。
-          PLIST_INFO="$(python3 -I -c "
-import plistlib, zipfile
-with zipfile.ZipFile('$RUNNER_TEMP/out/dashboard-trollstore.ipa') as z:
-    info = plistlib.loads(z.read('Payload/Dashboard.app/Info.plist'))
-print(info['CFBundleShortVersionString'], info['CFBundleVersion'])
-")"
+          # 多行 Python 会顶格破坏 YAML 缩进，所以压成一行分号写法。
+          PLIST_INFO="$(python3 -I -c "import plistlib,zipfile;z=zipfile.ZipFile('$RUNNER_TEMP/out/dashboard-trollstore.ipa');i=plistlib.loads(z.read('Payload/Dashboard.app/Info.plist'));print(i['CFBundleShortVersionString'],i['CFBundleVersion'])")"
           VERSION_FIELD="${PLIST_INFO% *}"
           BUILD="${PLIST_INFO#* }"
           # 用 printf 拼多行 notes：避免 heredoc 缩进与 YAML 缩进互相干扰。
