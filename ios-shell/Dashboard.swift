@@ -78,6 +78,10 @@ final class RootRouter: UIViewController {
         controller.onBootFailure = { [weak self] reason in
             self?.switchToRecovery(reason: reason)
         }
+        controller.onWelcome = { [weak self, weak controller] in
+            guard let self = self, let controller = controller, self.panel === controller else { return }
+            self.openWelcome()
+        }
     }
 
     private func showRecovery(reason: String) {
@@ -114,14 +118,26 @@ final class RootRouter: UIViewController {
         recovery = nil
     }
 
-    private func switchToRecovery(reason: String) {
-        guard let controller = panel else { showRecovery(reason: reason); return }
+    private func removePanel() {
+        guard let controller = panel else { return }
+        controller.stopForRecovery()
         controller.willMove(toParent: nil)
         controller.view.removeFromSuperview()
         controller.removeFromParent()
         panel = nil
+    }
+
+    private func openWelcome() {
+        guard recovery == nil else { return }
+        removePanel()
+        BootHealth.clear()
+        showRecovery(reason: "")
+    }
+
+    private func switchToRecovery(reason: String) {
+        removePanel()
         BootHealth.failed(reason: reason)
-        showRecovery(reason: reason)
+        if recovery == nil { showRecovery(reason: reason) }
     }
 
     override var prefersStatusBarHidden: Bool { false }
@@ -180,8 +196,10 @@ final class PanelController: UIViewController, WKNavigationDelegate, WKUIDelegat
         return view
     }()
     private var bridge: IOSBridge?
-    private var checkingUpdate = false
+    private var updateTask: Task<Void, Never>?
+    private var panelCheckTask: Task<Void, Never>?
     private var checkedOnLaunch = false
+    private var returningToWelcome = false
     private var lastSafeArea = UIEdgeInsets.zero
     /// 当前这轮是否在用本地快照；失败时用它决定要不要自动回退线上。
     private var usingLocalSnapshot = false
@@ -200,10 +218,12 @@ final class PanelController: UIViewController, WKNavigationDelegate, WKUIDelegat
     /// 白屏诊断页只弹一次，别在每次看门狗探测时都弹。
     private var diagnosticsShown = false
     private var progressToken: NSKeyValueObservation?
+    private var updateNotificationTokens: [NSObjectProtocol] = []
     private var lastLoggedProgress = -10
 
     /// 启动失败回调：交给 RootRouter 切到恢复页。
     var onBootFailure: ((String) -> Void)?
+    var onWelcome: (() -> Void)?
 
     // 完全沉浸：状态栏与 home indicator 都可见，但页面铺到它们下面。
     override var prefersStatusBarHidden: Bool { false }
@@ -215,6 +235,12 @@ final class PanelController: UIViewController, WKNavigationDelegate, WKUIDelegat
         web.navigationDelegate = self
         web.uiDelegate = self
         installBridge()
+        for name in [UIApplication.didEnterBackgroundNotification, IOSPanelLine.didChangeNotification] {
+            let token = NotificationCenter.default.addObserver(forName: name, object: nil, queue: .main) { [weak self] _ in
+                self?.cancelUpdateChecks()
+            }
+            updateNotificationTokens.append(token)
+        }
         web.allowsBackForwardNavigationGestures = true
         // 页面自己按原生给出的 safeArea 留白，不需要 WebView 再叠一层 inset。
         web.scrollView.contentInsetAdjustmentBehavior = .never
@@ -242,10 +268,14 @@ final class PanelController: UIViewController, WKNavigationDelegate, WKUIDelegat
 
     override func viewDidAppear(_ animated: Bool) {
         super.viewDidAppear(animated)
-        if !checkedOnLaunch {
-            checkedOnLaunch = true
-            checkUpdate(manual: false)
-        }
+        startLaunchUpdateChecks()
+    }
+
+    private func startLaunchUpdateChecks() {
+        guard documentFinished, view.window != nil, !checkedOnLaunch, !returningToWelcome else { return }
+        checkedOnLaunch = true
+        checkUpdate(manual: false)
+        checkPanelAutomatically()
     }
 
     // 安全区变化（旋转、状态栏高度变化）时通知网页重新取值。
@@ -264,7 +294,10 @@ final class PanelController: UIViewController, WKNavigationDelegate, WKUIDelegat
         let system = IOSSystemService(controller: { [weak self] in self })
         let surfaces = IOSSystemSurfacesService()
         let line = IOSPanelLineService()
-        let core = IOSBridge(webView: web, services: [IOSLocationService.shared, bluetooth, ride, history, system, surfaces, line])
+        let updates = IOSUpdateService(controller: { [weak self] in self },
+            welcome: { [weak self] in self?.requestWelcome() ?? false },
+            restart: { [weak self] in self?.restartAfterPanelUpdate() })
+        let core = IOSBridge(webView: web, services: [IOSLocationService.shared, bluetooth, ride, history, system, surfaces, line, updates])
         let scope: () -> IOSRideScope? = { [weak core] in core?.nativeSessionScope() }
         let presenter: () -> UIViewController? = { [weak self] in self }
         ride.configureScopeProvider(scope)
@@ -286,61 +319,60 @@ final class PanelController: UIViewController, WKNavigationDelegate, WKUIDelegat
 
     @objc private func checkSoftwareUpdate() { checkUpdate(manual: true) }
 
-    private func updateMessage(_ message: String) {
-        guard presentedViewController == nil else { return }
-        let alert = UIAlertController(title: "iOS 软件更新", message: message, preferredStyle: .alert)
-        alert.addAction(UIAlertAction(title: "好", style: .default))
-        present(alert, animated: true)
-    }
-
     private func checkUpdate(manual: Bool) {
-        guard !checkingUpdate else { return }
-        checkingUpdate = true
-        Task { @MainActor in
-            defer { checkingUpdate = false }
-            do {
-                let release = try await IOSUpdater.latest()
-                let version = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? ""
-                let build = Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String ?? ""
-                guard try release.isNewer(version: version, build: build) else {
-                    if manual { updateMessage("当前 iOS 软件版本：\(version)（\(build)），已是最新。") }
-                    return
-                }
-                let required = try IOSRelease.versionParts(release.minimumIOS)
-                guard ProcessInfo.processInfo.isOperatingSystemAtLeast(OperatingSystemVersion(majorVersion: required[0], minorVersion: required[1], patchVersion: required[2])) else {
-                    throw UpdateError.systemTooOld
-                }
-                guard presentedViewController == nil else { return }
-                let alert = UIAlertController(title: "发现 iOS 新版本", message: "当前：\(version)（\(build)）\n新版：\(release.version)（\(release.build)）\n\n下载并校验后，在分享菜单中选择 TrollStore 确认覆盖安装，无需卸载。", preferredStyle: .alert)
-                alert.addAction(UIAlertAction(title: "稍后", style: .cancel))
-                alert.addAction(UIAlertAction(title: "下载 IPA", style: .default) { [weak self] _ in self?.downloadUpdate(release) })
-                present(alert, animated: true)
-            } catch {
-                if manual { updateMessage(error.localizedDescription) }
-            }
+        guard updateTask == nil, !returningToWelcome else { return }
+        updateTask = IOSUpdatePresentation.checkApp(from: self, manual: manual) { [weak self] in
+            self?.updateTask = nil
         }
     }
 
-    private func downloadUpdate(_ release: IOSRelease) {
-        guard !checkingUpdate else { return }
-        checkingUpdate = true
-        Task { @MainActor in
-            defer { checkingUpdate = false }
-            do {
-                let file = try await IOSUpdater.download(release)
-                guard presentedViewController == nil else { return }
-                let share = UIActivityViewController(activityItems: [file], applicationActivities: nil)
-                // iPad 上以 popover 呈现时必须给锚点，否则系统直接抛异常终止。
-                // 其他几处分享（Diagnostics / UpdatePanel / System / Ride）都做了同样处理。
-                if let popover = share.popoverPresentationController {
-                    popover.sourceView = self.view
-                    popover.sourceRect = CGRect(x: self.view.bounds.midX, y: self.view.bounds.midY,
-                                                width: 1, height: 1)
-                    popover.permittedArrowDirections = []
-                }
-                present(share, animated: true)
-            } catch { updateMessage(error.localizedDescription) }
+    private func checkPanelAutomatically() {
+        let line = IOSPanelLine.current, current = IOSPanelCache.shared.snapshotBuild()
+        panelCheckTask?.cancel()
+        panelCheckTask = Task { @MainActor [weak self] in
+            _ = try? await IOSUpdateCenter.shared.checkPanel(current: current, line: line, force: false)
+            self?.panelCheckTask = nil
         }
+    }
+
+    private func requestWelcome() -> Bool {
+        guard !returningToWelcome, onWelcome != nil, isViewLoaded, view.window != nil,
+              UIApplication.shared.applicationState == .active, presentedViewController == nil,
+              !IOSPanelCache.shared.snapshot().busy else { return false }
+        returningToWelcome = true
+        // 当前 RPC 先交回网页，下一主队列才拆桥；回欢迎页不会清除账号或当成启动失败。
+        DispatchQueue.main.async { [weak self] in
+            guard let self = self, self.returningToWelcome else { return }
+            guard UIApplication.shared.applicationState == .active else { self.returningToWelcome = false; return }
+            self.onWelcome?()
+        }
+        return true
+    }
+
+    private func cancelUpdateChecks() {
+        updateTask?.cancel(); updateTask = nil
+        panelCheckTask?.cancel(); panelCheckTask = nil
+    }
+
+    func stopForRecovery() {
+        returningToWelcome = true
+        cancelUpdateChecks()
+        updateNotificationTokens.forEach { NotificationCenter.default.removeObserver($0) }
+        updateNotificationTokens.removeAll()
+        stopBootWatch()
+        progressToken?.invalidate(); progressToken = nil
+        web.stopLoading()
+        web.navigationDelegate = nil
+        web.uiDelegate = nil
+        bridge?.close(); bridge = nil
+    }
+
+    private func restartAfterPanelUpdate() {
+        guard !returningToWelcome, isViewLoaded, view.window != nil,
+              UIApplication.shared.applicationState == .active else { return }
+        localFallbackUsed = false
+        diagnosticsShown = false
+        loadPanel()
     }
 
     private func loadPanel() {
@@ -367,6 +399,7 @@ final class PanelController: UIViewController, WKNavigationDelegate, WKUIDelegat
     }
 
     private func preparePanel(_ url: URL) {
+        cancelUpdateChecks()
         web.stopLoading()
         guard let bridge = bridge else {
             IOSDiagnostics.shared.log("preparePanel: bridge 未就绪")
@@ -411,6 +444,7 @@ final class PanelController: UIViewController, WKNavigationDelegate, WKUIDelegat
     }
 
     func webView(_ webView: WKWebView, didStartProvisionalNavigation navigation: WKNavigation!) {
+        cancelUpdateChecks()
         IOSDiagnostics.shared.log("didStartProvisionalNavigation: \(webView.url?.absoluteString ?? "nil")")
         beginBootWatch()
     }
@@ -429,6 +463,7 @@ final class PanelController: UIViewController, WKNavigationDelegate, WKUIDelegat
         // 文档下载完不等于业务就绪，先探测；仍卡骨架时保留有界诊断计时器。
         documentFinished = true
         diagnoseIfBlank()
+        startLaunchUpdateChecks()
     }
 
     func webView(_ webView: WKWebView, didFailProvisionalNavigation navigation: WKNavigation!, withError error: Error) {

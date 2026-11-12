@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """构建输入白名单、真实 Apple 产物清单与跨平台完整性检查；不下载工具。"""
 import argparse
+import datetime
 import hashlib
 import json
 import os
@@ -15,11 +16,24 @@ import subprocess
 import sys
 import uuid
 import zipfile
+from urllib.parse import parse_qsl, urlsplit
 
 BUNDLE_ID = 'io.github.lswlc33.dashboard.ios'
 APP_PREFIX = 'Payload/Dashboard.app/'
 MINIMUM_IOS = '15.4'
-IPA_NAME = 'dashboard-trollstore.ipa'
+IPA_NAME = 'zeehowebnext.ipa'
+VERSION_NAME = 'version2.json'
+IPA_URL = 'https://zhb.xn--fiqz59cpva341l.top/app/zeehowebnext.ipa'
+RELEASE_NOTES = '解决了一些已知问题。\n\n目前软件处于快速更新迭代中，请及时更新并反馈问题'
+SOURCE_ICON_NAME = 'icon-ios-1024.png'
+SOURCE_ICON_URL = 'https://zhb.xn--fiqz59cpva341l.top/app/icon-ios-1024.png'
+SOURCE_DESCRIPTION = ('官方更新源仓库：https://github.com/lswlc33/zeeho-3d-models\n'
+                  '官方 iOS 源码仓库：https://github.com/lswlc33/zh-dashboard-ios-shell\n\n'
+                  '几何面板是独立的极核电动车数据面板，提供车况、电量、骑行记录和已适配车辆设置。'
+                  'iOS 客户端使用 WKWebView 与原生桥，支持账号管理、面板资源更新和 iOS App 更新；'
+                  '小组件与实时活动按系统能力和授权开放。\n\n'
+                  '本 IPA 为 ad-hoc 构建，当前通过 TrollStore 侧载。采用 AltStore 源格式不代表已经验证 AltStore 重签安装；'
+                  '下载后请按设备支持的方式确认覆盖安装。')
 MAX_IPA_BYTES = 31_457_280  # 必须仍能通过 Update.swift 的下载大小闸门。
 MAX_ARCHIVE_BYTES = 64 * 1024 * 1024
 MAX_UNCOMPRESSED_BYTES = 256 * 1024 * 1024
@@ -85,7 +99,7 @@ def require(condition, message):
 # .xml/.html/.css/.txt —— 仓库里都存在，漏掉就会让同一 commit 有两个指纹。
 TEXT_EXTENSIONS = {
     '.swift', '.py', '.sh', '.js', '.mjs', '.json', '.plist', '.entitlements', '.yml', '.yaml',
-    '.md', '.kt', '.kts', '.gradle', '.properties', '.toml', '.xml', '.html', '.css', '.txt',
+    '.md', '.kt', '.kts', '.gradle', '.properties', '.toml', '.xml', '.html', '.css', '.txt', '.bat',
 }
 
 
@@ -294,12 +308,12 @@ def validate_output_directory(root, output):
         require(output.is_dir() and not any(output.iterdir()),
                 'OUTPUT_DIRECTORY_FORBIDDEN: external output must be a new/empty directory')
     if output.exists():
-        require(not any(p.name.endswith(('.app', '.appex', '.ipa')) or p.name in {'version.json', 'build-manifest.json'}
+        require(not any(p.name.endswith(('.app', '.appex', '.ipa')) or p.name in {'version.json', VERSION_NAME, 'build-manifest.json'}
                         for p in output.iterdir()), 'OUTPUT_ARTIFACT_EXISTS: choose a fresh output directory; do not overwrite examined artifacts')
     return output
 
 
-PUBLISHED_ARTIFACTS = (IPA_NAME, 'version.json', 'build-manifest.json', 'source-commit.txt', 'SHA256SUMS')
+PUBLISHED_ARTIFACTS = (IPA_NAME, VERSION_NAME, 'build-manifest.json', 'source-commit.txt', 'SHA256SUMS')
 
 
 def publish_artifacts(root, staged, output):
@@ -336,7 +350,8 @@ def validate_info(info, executable='Dashboard', bundle_id=BUNDLE_ID):
     require(info.get('MinimumOSVersion') == MINIMUM_IOS, 'Deployment must be iOS 15.4')
     require('NSAppTransportSecurity' not in info, 'Do not package an ATS bypass')
     require(re.fullmatch(r'\d{1,4}\.\d{1,4}(?:\.\d{1,4})?', info.get('CFBundleShortVersionString', '')), 'Invalid release version')
-    require(re.fullmatch(r'[1-9][0-9]*', info.get('CFBundleVersion', '')), 'Invalid build number')
+    require(re.fullmatch(r'[1-9][0-9]*', info.get('CFBundleVersion', ''))
+            and int(info['CFBundleVersion']) <= 2**53 - 1, 'Invalid/unsafe build number')
 
 
 def archive_sources(root, output, manifest_path):
@@ -683,7 +698,9 @@ def validate_ipa(path, expected_info=None):
         require(actual_id == base_id, 'Unexpected bundle ID/prefix')
         validate_info(info, executable=product, bundle_id=actual_id)
         if expected_info:
-            require(actual_id == expected_info['CFBundleIdentifier'] and info['CFBundleShortVersionString'] == expected_info['CFBundleShortVersionString'], 'Packaged version/bundle differs from source')
+            require(actual_id == expected_info['CFBundleIdentifier']
+                    and info['CFBundleShortVersionString'] == expected_info['CFBundleShortVersionString']
+                    and info['CFBundleVersion'] == expected_info['CFBundleVersion'], 'Packaged version/build/bundle differs from source')
         resource_name = app_prefix + '_CodeSignature/CodeResources'
         require(resource_name in names, 'App resource code signature missing')
         require(isinstance(plistlib.loads(archive.read(resource_name)), dict), 'Invalid app resource signature')
@@ -722,7 +739,8 @@ def validate_ipa(path, expected_info=None):
                 and widget_info.get('NSExtension', {}).get('NSExtensionPointIdentifier') == 'com.apple.widgetkit-extension'
                 and 'EXAppExtensionAttributes' not in widget_info, 'Invalid WidgetKit appex identity/extension point')
         require(widget_info.get('CFBundleVersion') == info['CFBundleVersion']
-                and widget_info.get('CFBundleShortVersionString') == info['CFBundleShortVersionString'], 'Host/appex version mismatch')
+                and widget_info.get('CFBundleShortVersionString') == info['CFBundleShortVersionString']
+                and widget_info.get('MinimumOSVersion') == MINIMUM_IOS, 'Host/appex version/build/minimum OS mismatch')
         require(widget_prefix + '_CodeSignature/CodeResources' in names, 'Widget resource signature missing')
         reports[widget_binary] = macho(archive.read(widget_binary), 2)
         widget = reports[widget_binary]
@@ -735,6 +753,8 @@ def validate_ipa(path, expected_info=None):
                 'Widget _NSExtensionMain must be the real LC_MAIN entrypoint and match the signature identity')
         require(widget['sharedClassSymbolCount'] == 0 and not any('ZeehoShared.framework' in i['path'] for i in widget['imports']), 'KMP must not be linked into Widgets')
         for code in (main, widget):
+            require(code['signature'].get('adHoc') is True and not code['signature'].get('teamID'),
+                    'Expected team-free ad-hoc host/Widget signature, not Apple distribution signing')
             groups = code['signature'].get('entitlements', {}).get('com.apple.security.application-groups')
             require(groups == [APP_GROUP], 'App/Widget signature is missing the matching App Group template; this is not proof of provisioning approval')
         for name in sorted(names):
@@ -762,35 +782,110 @@ def validate_ipa(path, expected_info=None):
                 'executableSha256': hashlib.sha256(archive.read(binary_name)).hexdigest()}
 
 
+def release_metadata(path, info):
+    """公开清单只由已验证包推导；Android 风格字段与原 iOS 九键必须同值。"""
+    path = pathlib.Path(path)
+    return {'version': info['CFBundleShortVersionString'], 'build': info['CFBundleVersion'],
+            'bundleIdentifier': BUNDLE_ID, 'minimumIOS': MINIMUM_IOS, 'architecture': 'arm64',
+            'installer': 'TrollStore', 'file': IPA_NAME, 'size': path.stat().st_size, 'sha256': sha256_file(path),
+            'versionName': info['CFBundleShortVersionString'], 'versionCode': int(info['CFBundleVersion']),
+            'url': IPA_URL, 'notes': RELEASE_NOTES}
+
+
+def validate_release_date(value):
+    require(isinstance(value, str) and re.fullmatch(r'\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z', value),
+            'Release date must be the recorded CI UTC ISO8601 timestamp')
+    datetime.datetime.strptime(value, '%Y-%m-%dT%H:%M:%SZ')
+    return value
+
+
+def source_json(path, report, release_date):
+    """生成 AltStore source；仅一个 App 和最新版本，介绍使用官方字段。"""
+    info = report['info']
+    metadata = release_metadata(path, info)
+    entitlement_keys = set()
+    for code in report['machO'].values():
+        entitlement_keys.update(code['signature'].get('entitlements', {}))
+    entitlement_keys -= {'application-identifier', 'com.apple.developer.team-identifier'}
+    privacy = {key: value for key, value in info.items() if key.endswith('UsageDescription')}
+    require(all(isinstance(value, str) and value.strip() for value in privacy.values()), 'Invalid privacy usage description')
+    name = info.get('CFBundleDisplayName')
+    require(isinstance(name, str) and name.strip(), 'App display name must come from host Info.plist')
+    return {'name': '几何面板 iOS 官方源', 'subtitle': '几何面板 iOS 客户端与最新版本更新',
+            'description': SOURCE_DESCRIPTION, 'iconURL': SOURCE_ICON_URL,
+            'website': 'https://github.com/lswlc33/zeeho-3d-models',
+            'apps': [{'name': name, 'bundleIdentifier': info['CFBundleIdentifier'], 'developerName': 'lswlc33',
+                      'subtitle': '极核电动车车况与骑行数据面板', 'localizedDescription': SOURCE_DESCRIPTION,
+                      'iconURL': SOURCE_ICON_URL, 'category': 'utilities',
+                      'versions': [{'version': metadata['version'], 'buildVersion': metadata['build'],
+                                    'date': validate_release_date(release_date), 'localizedDescription': RELEASE_NOTES,
+                                    'downloadURL': IPA_URL + '?sha256=' + metadata['sha256'], 'size': metadata['size'],
+                                    'minOSVersion': info['MinimumOSVersion']}],
+                      'appPermissions': {'entitlements': sorted(entitlement_keys), 'privacy': privacy}}], 'news': []}
+
+
+def from_source(value):
+    """从单版本 source 提取内部校验报告，不把旧平面字段写回公开 source。"""
+    require(isinstance(value, dict) and isinstance(value.get('apps'), list) and len(value['apps']) == 1,
+            'AltStore source must contain exactly one App')
+    app = value['apps'][0]
+    require(isinstance(app, dict) and isinstance(app.get('versions'), list) and len(app['versions']) == 1,
+            'AltStore source must contain only the latest version')
+    latest = app['versions'][0]
+    require(isinstance(latest, dict), 'Invalid AltStore version object')
+    version, build = latest.get('version'), latest.get('buildVersion')
+    require(isinstance(version, str) and re.fullmatch(r'\d{1,4}\.\d{1,4}(?:\.\d{1,4})?', version), 'Invalid AltStore release version')
+    require(isinstance(build, str) and re.fullmatch(r'[1-9][0-9]*', build) and int(build) <= 2**53 - 1,
+            'Invalid AltStore buildVersion')
+    validate_release_date(latest.get('date'))
+    download = latest.get('downloadURL')
+    require(isinstance(download, str) and len(download) <= len(IPA_URL) + 72, 'Invalid AltStore download URL')
+    parsed, base = urlsplit(download), urlsplit(IPA_URL)
+    require(parsed.scheme == base.scheme and parsed.netloc == base.netloc and parsed.path == base.path
+            and not parsed.fragment, 'Unexpected AltStore download origin/path')
+    query = parse_qsl(parsed.query, keep_blank_values=True, strict_parsing=True, max_num_fields=1)
+    require(len(query) == 1 and query[0][0] == 'sha256' and re.fullmatch(r'[0-9a-f]{64}', query[0][1]),
+            'AltStore download URL requires exactly one SHA-256 query')
+    digest = query[0][1]
+    require(download == IPA_URL + '?sha256=' + digest, 'Non-canonical AltStore download URL')
+    require(type(latest.get('size')) is int and 0 < latest['size'] <= MAX_IPA_BYTES, 'Invalid AltStore IPA size')
+    require(app.get('bundleIdentifier') == BUNDLE_ID and latest.get('minOSVersion') == MINIMUM_IOS
+            and latest.get('localizedDescription') == RELEASE_NOTES,
+            'Unexpected AltStore identity/deployment/notes contract')
+    return {'version': version, 'build': build, 'bundleIdentifier': app['bundleIdentifier'],
+            'minimumIOS': latest['minOSVersion'], 'architecture': 'arm64', 'installer': 'TrollStore',
+            'file': IPA_NAME, 'size': latest['size'], 'sha256': digest,
+            'versionName': version, 'versionCode': int(build), 'url': IPA_URL, 'notes': latest['localizedDescription']}
+
+
 def verify_artifacts(path, expected_info=None, source_manifest=None):
     path = pathlib.Path(path).resolve()
     report = validate_ipa(path, expected_info)
-    metadata, manifest = load_json(path.parent / 'version.json'), load_json(path.parent / 'build-manifest.json')
-    require((path.parent / 'version.json').stat().st_size <= 32_768, 'Release metadata exceeds Update.swift size limit')
+    source, manifest = load_json(path.parent / VERSION_NAME), load_json(path.parent / 'build-manifest.json')
+    require((path.parent / VERSION_NAME).stat().st_size <= 32_768, 'Release metadata exceeds Update.swift size limit')
+    require(source == source_json(path, report, manifest.get('releaseDate')), 'AltStore source metadata differs from the actual package/CI date')
+    metadata = from_source(source)
     info, digest = report['info'], sha256_file(path)
-    for key, expected in {'file': IPA_NAME, 'size': path.stat().st_size, 'sha256': digest,
-                          'version': info['CFBundleShortVersionString'], 'build': info['CFBundleVersion'],
-                          'bundleIdentifier': BUNDLE_ID, 'minimumIOS': MINIMUM_IOS,
-                          'architecture': 'arm64', 'installer': 'TrollStore'}.items():
-        require(metadata.get(key) == expected, 'Release metadata mismatch: ' + key)
+    for key, expected in release_metadata(path, info).items():
+        require(type(metadata.get(key)) is type(expected) and metadata[key] == expected, 'Release metadata mismatch: ' + key)
     require(path.name == IPA_NAME, 'Unexpected IPA filename')
     for sidecar in ('source-commit.txt', 'SHA256SUMS'):
         require(0 < (path.parent / sidecar).stat().st_size <= 4096, 'Missing/oversized text sidecar: ' + sidecar)
     source_commit = (path.parent / 'source-commit.txt').read_text(encoding='utf-8').strip()
     require(manifest.get('executableSha256') == report['executableSha256'], 'Build manifest executable hash mismatch')
     require(manifest.get('tools', {}).get('xcode') and manifest.get('tools', {}).get('swift') and manifest.get('tools', {}).get('iphoneosSDK'), 'Actual Apple toolchain version record is missing')
-    require(re.fullmatch(r'[0-9a-f]{40,64}', source_commit) and metadata.get('sourceCommit') == source_commit, 'Source commit sidecar mismatch')
+    require(re.fullmatch(r'[0-9a-f]{40,64}', source_commit), 'Invalid source commit sidecar')
     sums = (path.parent / 'SHA256SUMS').read_text(encoding='utf-8')
     require(sums == digest + '  ' + IPA_NAME + '\n', 'SHA256SUMS mismatch')
     require(manifest.get('schemaVersion') == 1 and manifest.get('ipaSha256') == digest and manifest.get('ipaSize') == path.stat().st_size, 'Build manifest IPA hash/size mismatch')
     require(manifest.get('sourceCommit') == source_commit and manifest.get('sharedLinkage') == report['linkage'], 'Build manifest source/linkage mismatch')
-    require(isinstance(manifest.get('sourceDirty'), bool) and metadata.get('sourceDirty') == manifest['sourceDirty'], 'Source dirty state mismatch')
+    require(isinstance(manifest.get('sourceDirty'), bool), 'Source dirty state is missing')
     require(re.fullmatch(r'[0-9a-f]{64}', manifest.get('sharedFrameworkSha256', '')), 'Shared framework checksum missing')
     require(manifest.get('machO') == report['machO'] and manifest.get('bridgeSha256') == report['bridgeSha256'], 'Build manifest Mach-O/resource mismatch')
     require(manifest.get('buildHostPlatform') == 'Darwin' and manifest.get('codeSigningVerifiedOnMac') is True, 'Missing actual macOS code-sign verification record')
     records = manifest.get('inputs', [])
     require(records and all(public_input(r['path']) for r in records) and tree_digest(records) == manifest.get('sourceTreeSha256'), 'Invalid build input manifest')
-    require(metadata.get('sourceTreeSha256') == manifest['sourceTreeSha256'], 'Release/source tree hash mismatch')
+    require(metadata == release_metadata(path, info), 'Release source/package report mismatch')
     bridge_record = next((r for r in records if r['path'] == 'ios-shell/bridge-bootstrap.js'), None)
     require(bridge_record and bridge_record['sha256'] == report['bridgeSha256'], 'Packaged bridge differs from build sources')
     if source_manifest is not None:
@@ -811,7 +906,8 @@ def write_release(ipa, inputs_path, framework, app):
     subprocess.run(['codesign', '--verify', '--strict', str(app / 'PlugIns/DashboardWidgets.appex')], check=True)
     report = validate_ipa(ipa)
     require(report['linkage'] == framework_kind(framework), 'Linked/shared framework kind differs')
-    require(report['info']['CFBundleShortVersionString'] == inputs['version'], 'Version changed during build')
+    require(report['info']['CFBundleShortVersionString'] == inputs['version']
+            and report['info']['CFBundleVersion'] == inputs['sourceBuild'], 'Source version/build changed or was overridden during build')
     bridge_record = next(r for r in inputs['files'] if r['path'] == 'ios-shell/bridge-bootstrap.js')
     require(bridge_record['sha256'] == report['bridgeSha256'], 'Bridge changed during packaging')
     linked = '\n'.join(item['path'] for item in report['machO'][APP_PREFIX + 'Dashboard']['imports'])
@@ -829,6 +925,7 @@ def write_release(ipa, inputs_path, framework, app):
         'python': sys.version.split()[0],
     }
     manifest = {'schemaVersion': 1, 'buildHostPlatform': 'Darwin', 'codeSigningVerifiedOnMac': True,
+                'releaseDate': datetime.datetime.now(datetime.timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ'),
                 'signing': 'ad-hoc; App Group template only; Apple provisioning and TrollStore compatibility unverified',
                 'appGroupProvisioningVerified': False, 'trollStoreCompatibility': 'unverified',
                 'widgetSwiftSources': inputs['widgetSwiftSources'], 'sharedSwiftSources': inputs['sharedSwiftSources'],
@@ -841,16 +938,8 @@ def write_release(ipa, inputs_path, framework, app):
                 'ipaSha256': digest, 'ipaSize': ipa.stat().st_size, 'bridgeSha256': report['bridgeSha256'],
                 'executableSha256': report['executableSha256'],
                 'machO': report['machO'], 'tools': tools}
-    metadata = {'version': info['CFBundleShortVersionString'], 'build': info['CFBundleVersion'],
-                'bundleIdentifier': BUNDLE_ID, 'minimumIOS': MINIMUM_IOS, 'architecture': 'arm64',
-                'installer': 'TrollStore', 'file': IPA_NAME, 'size': ipa.stat().st_size, 'sha256': digest,
-                'sourceRepository': 'https://github.com/lswlc33/dashboard',
-                'sourceCommit': inputs['sourceCommit'], 'sourceDirty': inputs['sourceDirty'],
-                'sourceTreeSha256': inputs['sourceTreeSha256'], 'sharedFramework': 'ZeehoShared',
-                'panelURL': 'https://lswlc33.github.io/zeeho-3d-models/',
-                'appGroupProvisioningVerified': False, 'trollStoreCompatibility': 'unverified',
-                'notes': 'UIKit/WKWebView 与真实 WidgetKit extension；ad-hoc 签名模板不证明 App Group 授权或 TrollStore/普通安装兼容性。'}
-    write_json(ipa.parent / 'version.json', metadata)
+    metadata = release_metadata(ipa, info)
+    write_json(ipa.parent / VERSION_NAME, source_json(ipa, report, manifest['releaseDate']))
     write_json(ipa.parent / 'build-manifest.json', manifest)
     (ipa.parent / 'source-commit.txt').write_text(inputs['sourceCommit'] + '\n', encoding='utf-8')
     (ipa.parent / 'SHA256SUMS').write_text(digest + '  ' + IPA_NAME + '\n', encoding='utf-8')
@@ -906,6 +995,9 @@ def main():
     p.add_argument('--destination', required=True)
     p = commands.add_parser('framework-kind')
     p.add_argument('--path', required=True)
+    p = commands.add_parser('build-number')
+    p.add_argument('--source', required=True)
+    p.add_argument('--build-number')
     p = commands.add_parser('prepare-plist')
     p.add_argument('--source', required=True)
     p.add_argument('--destination', required=True)
@@ -946,11 +1038,15 @@ def main():
         print(f"Validated/extracted {len(value['files'])} allowlisted files into an empty source directory")
     elif args.command == 'framework-kind':
         print(framework_kind(args.path))
-    elif args.command == 'prepare-plist':
+    elif args.command in ('build-number', 'prepare-plist'):
         with pathlib.Path(args.source).open('rb') as stream:
             info = plistlib.load(stream)
-        if args.build_number is not None:
-            info['CFBundleVersion'] = args.build_number
+        validate_info(info)
+        require(args.build_number is None or args.build_number == info['CFBundleVersion'],
+                'Build override differs from host Info.plist; update the source only during an authorized release')
+        if args.command == 'build-number':
+            print(info['CFBundleVersion'])
+            return
         info['CFBundleIcons'] = {'CFBundlePrimaryIcon': {'CFBundleIconFiles': ['Icon120', 'Icon180']}}
         info['CFBundleIcons~ipad'] = {'CFBundlePrimaryIcon': {'CFBundleIconFiles': ['Icon152', 'Icon167']}}
         validate_info(info)

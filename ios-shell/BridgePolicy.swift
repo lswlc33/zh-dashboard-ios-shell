@@ -17,7 +17,7 @@ enum IOSBridgePolicy {
         "file.share", "file.save", "photos.save", "clipboard.read", "clipboard.write", "media.permission",
         "notifications.request", "notifications.schedule", "notifications.cancel", "app.settings",
         "gps.begin", "ble.scan", "ble.connect", "ble.write", "ride.begin", "history.clear",
-        "system.snapshot", "liveActivity.start", "liveActivity.end"
+        "system.snapshot", "liveActivity.start", "liveActivity.end", "panel.update"
     ]
     static let maxBodyBytes = 8 * 1024 * 1024
     static let maxResponseBytes = 4 * 1024 * 1024

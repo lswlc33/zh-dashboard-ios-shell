@@ -2,18 +2,9 @@ import Foundation
 import CryptoKit
 
 struct IOSRelease: Decodable {
-    // 清单与 IPA 的真实落点是公开壳仓库（zh-dashboard-ios-shell）的 Release 资产：
-    // CI 每次构建都把 `dashboard-trollstore.ipa` + `SHA256SUMS` 发到那里，
-    // 而 zeeho-3d-models 的 app/ios/ 目录自始至终不存在（实测三个源全 404）。
-    // 清单文件 version.json 由发布流程推到产物仓库 zeeho-3d-models/app/ios/
-    // （见 build-support.write-release 的字段，publish 由人工/脚本执行）；
-    // 在那份清单出现之前，这里优先走 Release 侧的 API 读取。
-    static let root = URL(string: "https://raw.githubusercontent.com/lswlc33/zeeho-3d-models/main/app/ios/")!
-    // 公开壳仓库的最新 pre-release 资产直链（GitHub 会 302 到 objects.githubusercontent.com，
-    // checkResponse 会拒绝跨主机重定向，所以只用于清单兜底之外的 IPA 下载不做——
-    // IPA 下载仍走 root 的五个镜像，靠 sha256 校验兜住）。
-    static let releaseApi = URL(string: "https://api.github.com/repos/lswlc33/zh-dashboard-ios-shell/releases/latest")!
     static let bundleID = "io.github.lswlc33.dashboard.ios"
+    static let maximumSize = 30 * 1024 * 1024
+    static let maximumBuild = 9_007_199_254_740_991
     let version: String
     let build: String
     let bundleIdentifier: String
@@ -23,6 +14,106 @@ struct IOSRelease: Decodable {
     let file: String
     let size: Int
     let sha256: String
+    let notes: String
+
+    init(version: String, build: String, bundleIdentifier: String, minimumIOS: String,
+         architecture: String, installer: String, file: String, size: Int, sha256: String,
+         notes: String = IOSStrings.updateDefaultNotes) {
+        self.version = version
+        self.build = build
+        self.bundleIdentifier = bundleIdentifier
+        self.minimumIOS = minimumIOS
+        self.architecture = architecture
+        self.installer = installer
+        self.file = file
+        self.size = size
+        self.sha256 = sha256
+        self.notes = notes
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case version, build, bundleIdentifier, minimumIOS, architecture, installer, file, size, sha256, notes
+        case versionName, versionCode
+    }
+
+    init(from decoder: Decoder) throws {
+        let values = try decoder.container(keyedBy: CodingKeys.self)
+        version = try values.decode(String.self, forKey: .version)
+        build = try values.decode(String.self, forKey: .build)
+        bundleIdentifier = try values.decode(String.self, forKey: .bundleIdentifier)
+        minimumIOS = try values.decode(String.self, forKey: .minimumIOS)
+        architecture = try values.decode(String.self, forKey: .architecture)
+        installer = try values.decode(String.self, forKey: .installer)
+        file = try values.decode(String.self, forKey: .file)
+        size = try values.decode(Int.self, forKey: .size)
+        sha256 = try values.decode(String.self, forKey: .sha256)
+        notes = try values.decodeIfPresent(String.self, forKey: .notes) ?? IOSStrings.updateDefaultNotes
+        if values.contains(.versionName) {
+            guard try values.decode(String.self, forKey: .versionName) == version else {
+                throw UpdateError.invalidRelease
+            }
+        }
+        if values.contains(.versionCode) {
+            let code: String
+            if let text = try? values.decode(String.self, forKey: .versionCode) {
+                code = text
+            } else {
+                code = String(try values.decode(Int.self, forKey: .versionCode))
+            }
+            guard code == build else { throw UpdateError.invalidRelease }
+            _ = try Self.safeBuild(code)
+        }
+    }
+
+    private struct Source: Decodable { let apps: [SourceApp] }
+    private struct SourceApp: Decodable {
+        let name: String
+        let bundleIdentifier: String
+        let developerName: String
+        let localizedDescription: String
+        let iconURL: String
+        let versions: [SourceVersion]
+    }
+    private struct SourceVersion: Decodable {
+        let version: String
+        let buildVersion: String
+        let date: String
+        let localizedDescription: String?
+        let downloadURL: String
+        let size: Int
+        let minOSVersion: String
+    }
+
+    // 单 App、单最新版的 AltStore Classic 源；地址仍限于认可产物，不接受任意下载 URL。
+    static func fromSource(_ bytes: Data) throws -> IOSRelease {
+        guard bytes.count <= IOSUpdater.maximumMetadataSize else { throw UpdateError.tooLarge }
+        let source = try JSONDecoder().decode(Source.self, from: bytes)
+        guard source.apps.count == 1, let app = source.apps.first, app.versions.count == 1,
+              let release = app.versions.first, app.bundleIdentifier == bundleID,
+              !app.name.isEmpty, !app.developerName.isEmpty, !app.localizedDescription.isEmpty,
+              app.iconURL == "https://zhb.xn--fiqz59cpva341l.top/app/icon-ios-1024.png",
+              let url = URLComponents(string: release.downloadURL),
+              let items = url.queryItems, items.count == 1, items[0].name == "sha256",
+              let hash = items[0].value, validHash(hash),
+              release.downloadURL == "https://zhb.xn--fiqz59cpva341l.top/app/zeehowebnext.ipa?sha256=" + hash,
+              ISO8601DateFormatter().date(from: release.date) != nil else { throw UpdateError.invalidRelease }
+        let value = IOSRelease(version: release.version, build: release.buildVersion,
+            bundleIdentifier: app.bundleIdentifier, minimumIOS: release.minOSVersion,
+            architecture: "arm64", installer: "TrollStore", file: "zeehowebnext.ipa",
+            size: release.size, sha256: hash,
+            notes: release.localizedDescription ?? IOSStrings.updateDefaultNotes)
+        try value.validate()
+        return value
+    }
+
+    static func safeBuild(_ text: String) throws -> Int {
+        guard let first = text.utf8.first, (49...57).contains(first), text.utf8.count <= 16,
+              text.utf8.allSatisfy({ (48...57).contains($0) }),
+              let number = Int(text), (1...maximumBuild).contains(number) else {
+            throw UpdateError.invalidRelease
+        }
+        return number
+    }
 
     static func versionParts(_ text: String) throws -> [Int] {
         let parts = text.split(separator: ".", omittingEmptySubsequences: false)
@@ -36,55 +127,112 @@ struct IOSRelease: Decodable {
     func validate() throws {
         _ = try Self.versionParts(version)
         _ = try Self.versionParts(minimumIOS)
+        _ = try Self.safeBuild(build)
         guard bundleIdentifier == Self.bundleID, architecture == "arm64", installer == "TrollStore",
-              file == "dashboard-trollstore.ipa", (1...31_457_280).contains(size),
-              Int(build).map({ $0 > 0 }) == true,
-              sha256.count == 64, sha256.allSatisfy({ "0123456789abcdef".contains($0) }) else {
-            throw UpdateError.invalidRelease
-        }
+              file == "zeehowebnext.ipa", (1...Self.maximumSize).contains(size),
+              Self.validHash(sha256) else { throw UpdateError.invalidRelease }
     }
 
-    /// 当前系统是否满足这个版本的 `minimumIOS`。
-    ///
-    /// 下载弹出之前必须先过这道闸：清单里写的最低系统高于本机时，
-    /// 用户下完 IPA 才发现装不上（TrollStore 会直接拒绝），白等一次下载。
-    /// 更新面板与 Dashboard 的「检查更新」都要在弹「发现新版本」之前调它，
-    /// 否则同一个闸门会在两个入口漂移（Dashboard 早已有，更新面板漏了）。
+    static func validHash(_ text: String) -> Bool {
+        text.utf8.count == 64 && text.utf8.allSatisfy({ (48...57).contains($0) || (97...102).contains($0) })
+    }
+
     func requireSupportedSystem() throws {
         let parts = try Self.versionParts(minimumIOS)
-        let required = OperatingSystemVersion(majorVersion: parts[0],
-                                             minorVersion: parts[1],
-                                             patchVersion: parts[2])
-        guard ProcessInfo.processInfo.isOperatingSystemAtLeast(required) else {
-            throw UpdateError.systemTooOld
-        }
+        let required = OperatingSystemVersion(majorVersion: parts[0], minorVersion: parts[1], patchVersion: parts[2])
+        guard ProcessInfo.processInfo.isOperatingSystemAtLeast(required) else { throw UpdateError.systemTooOld }
     }
 
     func isNewer(version installed: String, build installedBuild: String) throws -> Bool {
         try validate()
         let remote = try Self.versionParts(version), local = try Self.versionParts(installed)
-        guard let localBuild = Int(installedBuild), localBuild > 0 else { throw UpdateError.invalidRelease }
-        return remote == local ? Int(build)! > localBuild : local.lexicographicallyPrecedes(remote)
+        let remoteBuild = try Self.safeBuild(build), localBuild = try Self.safeBuild(installedBuild)
+        return remote == local ? remoteBuild > localBuild : local.lexicographicallyPrecedes(remote)
     }
 
     func verify(_ bytes: Data) throws {
         try validate()
+        guard bytes.count == size else { throw UpdateError.checksum }
         let digest = SHA256.hash(data: bytes).map { String(format: "%02x", $0) }.joined()
-        guard bytes.count == size, digest == sha256 else { throw UpdateError.checksum }
+        guard digest == sha256 else { throw UpdateError.checksum }
+    }
+}
+
+struct IOSUpdateSource: Equatable {
+    let id: String
+    let name: String
+    let baseURL: URL
+    let description: String?
+
+    init(id: String, name: String, baseURL: URL, description: String? = nil) {
+        self.id = id
+        self.name = name
+        self.baseURL = baseURL
+        self.description = description
     }
 
-    var downloadURLs: [URL] {
-        // 与 Android RemoteSources 共用相同镜像顺序；每个源都必须通过官方清单的哈希校验。
-        [
-            "https://ghfast.top/" + Self.root.absoluteString,
-            "https://gh-proxy.com/" + Self.root.absoluteString,
-            Self.root.absoluteString,
-            "https://cdn.jsdelivr.net/gh/lswlc33/zeeho-3d-models@main/app/ios/",
-            "https://lswlc33.github.io/zeeho-3d-models/app/ios/"
-        ].map { root in
-            var url = URLComponents(url: URL(string: root)!.appendingPathComponent(file), resolvingAgainstBaseURL: false)!
-            url.queryItems = [URLQueryItem(name: "sha256", value: sha256)]
-            return url.url!
+    func url(for relative: String, token: String? = nil) throws -> URL {
+        guard IOSUpdateSources.recognizes(self), IOSUpdateSources.paths.contains(relative),
+              token.map({ IOSRelease.validHash($0) }) ?? true,
+              var components = URLComponents(string: baseURL.absoluteString + relative) else {
+            throw UpdateError.invalidRelease
+        }
+        if let token = token { components.queryItems = [URLQueryItem(name: "sha256", value: token)] }
+        guard let url = components.url else { throw UpdateError.invalidRelease }
+        return url
+    }
+}
+
+enum IOSUpdateSources {
+    static let manifestPath = "app/version2.json"
+    static let ipaPath = "app/zeehowebnext.ipa"
+    static let panelPath = "version.json"
+    static let paths = [manifestPath, ipaPath, panelPath]
+    private static let official: [IOSUpdateSource] = [
+        IOSUpdateSource(id: "origin", name: "GitHub", baseURL: URL(string: "https://lswlc33.github.io/zeeho-3d-models/")!),
+        IOSUpdateSource(id: "ghfast", name: "ghfast", baseURL: URL(string: "https://ghfast.top/https://raw.githubusercontent.com/lswlc33/zeeho-3d-models/main/")!),
+        IOSUpdateSource(id: "ghproxy", name: "ghproxy", baseURL: URL(string: "https://gh-proxy.com/https://raw.githubusercontent.com/lswlc33/zeeho-3d-models/main/")!),
+        IOSUpdateSource(id: "raw", name: "raw", baseURL: URL(string: "https://raw.githubusercontent.com/lswlc33/zeeho-3d-models/main/")!),
+        IOSUpdateSource(id: "jsdelivr", name: "jsDelivr", baseURL: URL(string: "https://cdn.jsdelivr.net/gh/lswlc33/zeeho-3d-models@main/")!),
+        IOSUpdateSource(id: "cf", name: "Cloudflare", baseURL: URL(string: "https://zhb.xn--fiqz59cpva341l.top/")!)
+    ]
+
+    static func sources(for line: IOSPanelLine = .current) -> [IOSUpdateSource] {
+        line == .cf ? [official[5]] : official
+    }
+
+    static func recognizes(_ source: IOSUpdateSource) -> Bool {
+        official.contains { $0.id == source.id && $0.baseURL == source.baseURL }
+    }
+
+    static func metadataSources(for line: IOSPanelLine) -> [IOSUpdateSource] {
+        line == .cf ? [official[5]] : [official[0], official[3], official[5]]
+    }
+
+    // 重定向只允许所选源的运输端点，不把重定向当成切换下载源的机会。
+    static func allows(_ url: URL, source: IOSUpdateSource, relative: String) -> Bool {
+        guard recognizes(source), paths.contains(relative),
+              let parts = URLComponents(url: url, resolvingAgainstBaseURL: false),
+              parts.scheme == "https", parts.user == nil, parts.password == nil,
+              parts.port == nil || parts.port == 443, parts.fragment == nil else { return false }
+        let query = parts.queryItems ?? []
+        guard query.count <= 1, query.allSatisfy({ item in
+            if item.name == "sha256" { return item.value.map { IOSRelease.validHash($0) } ?? false }
+            if item.name == "_" {
+                return item.value.map { !$0.isEmpty && $0.utf8.count <= 16 && $0.utf8.allSatisfy { (48...57).contains($0) } } ?? false
+            }
+            return false
+        }) else { return false }
+        var endpoints = [source.baseURL]
+        if source.id == "ghfast" || source.id == "ghproxy" { endpoints.append(official[3].baseURL) }
+        if source.id == "jsdelivr" {
+            for host in ["fastly.jsdelivr.net", "gcore.jsdelivr.net", "testingcf.jsdelivr.net", "quantil.jsdelivr.net"] {
+                endpoints.append(URL(string: "https://\(host)/gh/lswlc33/zeeho-3d-models@main/")!)
+            }
+        }
+        return endpoints.contains { root in
+            guard let expected = URLComponents(string: root.absoluteString + relative) else { return false }
+            return parts.host == expected.host && parts.percentEncodedPath == expected.percentEncodedPath
         }
     }
 }
@@ -93,113 +241,316 @@ enum UpdateError: LocalizedError {
     case invalidRelease, checksum, http, systemTooOld, tooLarge
     var errorDescription: String? {
         switch self {
-        case .invalidRelease: return "iOS 更新清单无效，已停止更新。"
-        case .checksum: return "IPA 大小或 SHA-256 校验失败，请稍后重试。"
-        case .http: return "暂时无法读取 iOS 发布信息（三个来源都不可达）。请稍后重试，或到 GitHub Releases 页面手动下载。"
-        case .systemTooOld: return "新版要求更高的 iOS 系统，当前设备无法安装。"
-        case .tooLarge: return "更新文件超出大小限制，已停止更新。"
+        case .invalidRelease: return IOSStrings.updateErrorInvalidRelease
+        case .checksum: return IOSStrings.updateErrorChecksum
+        case .http: return IOSStrings.updateErrorHTTP
+        case .systemTooOld: return IOSStrings.updateErrorSystemTooOld
+        case .tooLarge: return IOSStrings.updateErrorTooLarge
         }
     }
 }
 
 enum IOSUpdater {
-    private static let session = URLSession(configuration: .ephemeral)
-    // 小清单仅从官方 HTTPS 来源读取，第三方 CDN 只运输经过哈希校验的 IPA。
-    // 前两个源是产物仓库的 app/ios/version.json（发布流程负责推）；
-    // 第三个是公开壳仓库「最新 Release」的 API —— 资产名固定 dashboard-trollstore.ipa，
-    // Release body 附带 build-manifest 字段，从那里能拼出真实的下载地址与校验信息。
-    static let metadataURLs = [
-        IOSRelease.root.appendingPathComponent("version.json"),
-        URL(string: "https://lswlc33.github.io/zeeho-3d-models/app/ios/version.json")!,
-        IOSRelease.releaseApi
-    ]
+    static let maximumMetadataSize = 32 * 1024
+    static let maximumRedirects = 5
 
-    /// 从 Release API 的 JSON 里挖出与 IOSRelease 兼容的清单。
-    /// Release body 由 CI 用 printf 写成固定几行：`version: x.y.z` / `build: n` /
-    /// `sha256: ...` / `size: n` / `minimumIOS: ...`（见 build-ios.yml 的 notes 生成段）。
-    /// 解不出来就抛 http，让调用方继续尝试下一个源。
-    /// internal 是为了 update-test.swift 能直接构造 body 做表驱动验证。
+    static func metadataURLs(for line: IOSPanelLine = .current) -> [URL] {
+        IOSUpdateSources.metadataSources(for: line).map { try! $0.url(for: IOSUpdateSources.manifestPath) }
+    }
+
+    static func allowsRedirect(from: URL, to: URL, source: IOSUpdateSource, relative: String) -> Bool {
+        IOSUpdateSources.allows(from, source: source, relative: relative)
+            && IOSUpdateSources.allows(to, source: source, relative: relative)
+    }
+
+    private static func metadata<T>(line: IOSPanelLine, relative: String, decode: (Data) throws -> T) async throws -> T {
+        let sources = IOSUpdateSources.metadataSources(for: line)
+        let deadline = ProcessInfo.processInfo.systemUptime + 8
+        var failure: Error = UpdateError.http
+        for (index, source) in sources.enumerated() {
+            try Task.checkCancellation()
+            let remaining = deadline - ProcessInfo.processInfo.systemUptime
+            guard remaining > 0 else { break }
+            do {
+                var parts = URLComponents(url: try source.url(for: relative), resolvingAgainstBaseURL: false)!
+                parts.queryItems = [URLQueryItem(name: "_", value: String(Int(Date().timeIntervalSince1970 * 1000)))]
+                let timeout = remaining / Double(sources.count - index)
+                let transfer = IOSUpdateTransfer(source: source, relative: relative, limit: maximumMetadataSize)
+                let (bytes, _) = try await transfer.read(url: parts.url!, timeout: timeout)
+                try Task.checkCancellation()
+                let value = try decode(bytes)
+                try Task.checkCancellation()
+                guard ProcessInfo.processInfo.systemUptime <= deadline else { throw URLError(.timedOut) }
+                return value
+            } catch {
+                if Task.isCancelled { throw CancellationError() }
+                failure = error
+            }
+        }
+        try Task.checkCancellation()
+        throw failure
+    }
+
+    static func latest(line: IOSPanelLine = .current) async throws -> IOSRelease {
+        try await metadata(line: line, relative: IOSUpdateSources.manifestPath) { bytes in
+            try IOSRelease.fromSource(bytes)
+        }
+    }
+
+    static func latestPanelBuild(line: IOSPanelLine) async throws -> String {
+        try await metadata(line: line, relative: IOSUpdateSources.panelPath) { try panelBuild(from: $0) }
+    }
+
+    static func panelBuild(from bytes: Data) throws -> String {
+        guard bytes.count <= maximumMetadataSize,
+              let object = try JSONSerialization.jsonObject(with: bytes) as? [String: Any],
+              let text = object["build"] as? String, text.utf8.count == 19 else { throw UpdateError.invalidRelease }
+        let digits = Array(text.utf8)
+        for index in digits.indices {
+            let separator: UInt8? = [4: 45, 7: 45, 10: 32, 13: 58, 16: 58][index]
+            guard separator.map({ digits[index] == $0 }) ?? (48...57).contains(digits[index]) else {
+                throw UpdateError.invalidRelease
+            }
+        }
+        guard Int(text.prefix(4)).map({ $0 > 0 }) == true else { throw UpdateError.invalidRelease }
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.calendar = Calendar(identifier: .gregorian)
+        formatter.timeZone = TimeZone(secondsFromGMT: 0)
+        formatter.dateFormat = "yyyy-MM-dd HH:mm:ss"
+        formatter.isLenient = false
+        guard let date = formatter.date(from: text), formatter.string(from: date) == text else {
+            throw UpdateError.invalidRelease
+        }
+        return text
+    }
+
+    static func download(_ release: IOSRelease, source: IOSUpdateSource) async throws -> URL {
+        try Task.checkCancellation()
+        try release.validate()
+        let url = try source.url(for: IOSUpdateSources.ipaPath, token: release.sha256)
+        let transfer = IOSUpdateTransfer(source: source, relative: IOSUpdateSources.ipaPath, limit: release.size)
+        let (bytes, _) = try await transfer.read(url: url, timeout: 45)
+        try Task.checkCancellation()
+        try release.verify(bytes)
+        try Task.checkCancellation()
+        let manager = FileManager.default
+        let directory = manager.temporaryDirectory.appendingPathComponent("ios-update-" + UUID().uuidString, isDirectory: true)
+        var handedOff = false
+        defer { if !handedOff { try? manager.removeItem(at: directory) } }
+        try Task.checkCancellation()
+        try manager.createDirectory(at: directory, withIntermediateDirectories: false)
+        let destination = directory.appendingPathComponent(release.file)
+        try Task.checkCancellation()
+        try bytes.write(to: destination, options: .atomic)
+        try Task.checkCancellation()
+        handedOff = true
+        return destination
+    }
+
+    static func latency(_ release: IOSRelease, source: IOSUpdateSource) async -> Int? {
+        let start = ProcessInfo.processInfo.systemUptime
+        do {
+            try Task.checkCancellation()
+            try release.validate()
+            let url = try source.url(for: IOSUpdateSources.ipaPath, token: release.sha256)
+            let transfer = IOSUpdateTransfer(source: source, relative: IOSUpdateSources.ipaPath, limit: 0, headersOnly: true)
+            let remaining = 6 - (ProcessInfo.processInfo.systemUptime - start)
+            guard remaining > 0 else { return nil }
+            _ = try await transfer.read(url: url, timeout: remaining)
+            try Task.checkCancellation()
+            let elapsed = ProcessInfo.processInfo.systemUptime - start
+            guard elapsed <= 6 else { return nil }
+            return max(0, Int(elapsed * 1000))
+        } catch { return nil }
+    }
+
+    // 仅供旧版清单迁移；最新检查不调用 API，也不采用资产里的任意下载 URL。
     static func releaseFromGitHubAPI(_ bytes: Data) throws -> IOSRelease {
-        guard let object = try? JSONSerialization.jsonObject(with: bytes) as? [String: Any],
+        guard bytes.count <= maximumMetadataSize,
+              let object = try JSONSerialization.jsonObject(with: bytes) as? [String: Any],
               let body = object["body"] as? String,
-              let asset = (object["assets"] as? [[String: Any]])?.first(where: {
-                  ($0["name"] as? String) == "dashboard-trollstore.ipa"
+              (object["assets"] as? [[String: Any]])?.contains(where: {
+                  ["dashboard-trollstore.ipa", "zeehowebnext.ipa"].contains($0["name"] as? String ?? "")
                       && (($0["state"] as? String) == "uploaded" || $0["state"] == nil)
-              }) else { throw UpdateError.http }
-        func field(_ key: String) -> String? {
-            // 只认行首的 `key: value`，避免从正文里误抓数字。
-            // escapedPattern(for:) 是 NSRegularExpression 的类方法标签；
-            // `(?m)` 是 NSRegularExpression 支持的行内多行标志（JS 不认，别照抄）。
-            let pattern = "(?m)^" + NSRegularExpression.escapedPattern(for: key) + ":\\s*(\\S+)"
-            guard let match = body.range(of: pattern, options: .regularExpression) else { return nil }
-            return String(body[match]).split(separator: ":").last.map { String($0).trimmingCharacters(in: .whitespaces) }
+              }) == true else { throw UpdateError.http }
+        var fields: [String: String] = [:]
+        for line in body.split(separator: "\n") {
+            let pair = line.split(separator: ":", maxSplits: 1, omittingEmptySubsequences: false)
+            guard pair.count == 2 else { continue }
+            let key = String(pair[0])
+            guard ["version", "build", "sha256", "size", "minimumIOS"].contains(key) else { continue }
+            guard fields[key] == nil else { throw UpdateError.invalidRelease }
+            fields[key] = pair[1].trimmingCharacters(in: .whitespaces)
         }
-        guard let version = field("version"), let build = field("build"),
-              let sha256 = field("sha256"), let sizeText = field("size"), let size = Int(sizeText) else {
-            throw UpdateError.http
-        }
-        let release = IOSRelease(version: version, build: build,
-                                 bundleIdentifier: IOSRelease.bundleID,
-                                 minimumIOS: field("minimumIOS") ?? "15.4",
-                                 architecture: "arm64", installer: "TrollStore",
-                                 file: "dashboard-trollstore.ipa", size: size, sha256: sha256)
+        guard let version = fields["version"], let build = fields["build"], let sha256 = fields["sha256"],
+              let sizeText = fields["size"], let size = Int(sizeText) else { throw UpdateError.http }
+        let release = IOSRelease(version: version, build: build, bundleIdentifier: IOSRelease.bundleID,
+                                 minimumIOS: fields["minimumIOS"] ?? "15.4", architecture: "arm64", installer: "TrollStore",
+                                 file: "zeehowebnext.ipa", size: size, sha256: sha256)
         try release.validate()
         return release
     }
+}
 
-    private static func checkResponse(_ response: URLResponse, url: URL) throws {
-        guard let http = response as? HTTPURLResponse, http.statusCode == 200,
-              http.url?.scheme == "https", http.url?.host == url.host, http.url?.path == url.path else {
-            throw UpdateError.http
+// 小清单与 IPA 都在接收过程中限量；HEAD 在响应头回调立即停止，不收完整包。
+private final class IOSUpdateTransfer: NSObject, URLSessionDataDelegate, @unchecked Sendable {
+    private let source: IOSUpdateSource
+    private let relative: String
+    private let limit: Int
+    private let headersOnly: Bool
+    private let lock = NSLock()
+    private var continuation: CheckedContinuation<(Data, HTTPURLResponse), Error>?
+    private var session: URLSession?
+    private var task: URLSessionDataTask?
+    private var timer: DispatchWorkItem?
+    private var bytes = Data()
+    private var response: HTTPURLResponse?
+    private var redirects = 0
+    private var deadline: TimeInterval = 0
+    private var finished = false
+
+    init(source: IOSUpdateSource, relative: String, limit: Int, headersOnly: Bool = false) {
+        self.source = source
+        self.relative = relative
+        self.limit = limit
+        self.headersOnly = headersOnly
+        super.init()
+    }
+
+    func read(url: URL, timeout: TimeInterval) async throws -> (Data, HTTPURLResponse) {
+        try Task.checkCancellation()
+        guard timeout > 0, IOSUpdateSources.allows(url, source: source, relative: relative) else { throw UpdateError.http }
+        return try await withTaskCancellationHandler(operation: {
+            try await withCheckedThrowingContinuation { continuation in
+                start(continuation, url: url, timeout: timeout)
+            }
+        }, onCancel: { self.finish(.failure(CancellationError())) })
+    }
+
+    private func request(url: URL, timeout: TimeInterval) -> URLRequest {
+        var request = URLRequest(url: url, cachePolicy: .reloadIgnoringLocalCacheData, timeoutInterval: timeout)
+        request.httpMethod = headersOnly ? "HEAD" : "GET"
+        request.httpShouldHandleCookies = false
+        request.setValue("no-cache, no-store", forHTTPHeaderField: "Cache-Control")
+        request.setValue("no-cache", forHTTPHeaderField: "Pragma")
+        request.setValue("identity", forHTTPHeaderField: "Accept-Encoding")
+        request.setValue(relative == IOSUpdateSources.ipaPath ? "application/octet-stream" : "application/json", forHTTPHeaderField: "Accept")
+        return request
+    }
+
+    private func start(_ continuation: CheckedContinuation<(Data, HTTPURLResponse), Error>, url: URL, timeout: TimeInterval) {
+        lock.lock()
+        guard !finished else { lock.unlock(); continuation.resume(throwing: CancellationError()); return }
+        self.continuation = continuation
+        deadline = ProcessInfo.processInfo.systemUptime + timeout
+        let config = URLSessionConfiguration.ephemeral
+        config.httpCookieStorage = nil
+        config.httpShouldSetCookies = false
+        config.urlCredentialStorage = nil
+        config.urlCache = nil
+        config.requestCachePolicy = .reloadIgnoringLocalCacheData
+        config.timeoutIntervalForRequest = timeout
+        config.timeoutIntervalForResource = timeout
+        config.waitsForConnectivity = false
+        let session = URLSession(configuration: config, delegate: self, delegateQueue: nil)
+        let task = session.dataTask(with: request(url: url, timeout: timeout))
+        let timer = DispatchWorkItem { [weak self] in self?.finish(.failure(URLError(.timedOut))) }
+        self.session = session
+        self.task = task
+        self.timer = timer
+        lock.unlock()
+        DispatchQueue.global().asyncAfter(deadline: .now() + timeout, execute: timer)
+        task.resume()
+    }
+
+    private func finish(_ proposed: Result<(Data, HTTPURLResponse), Error>) {
+        lock.lock()
+        guard !finished else { lock.unlock(); return }
+        finished = true
+        let result: Result<(Data, HTTPURLResponse), Error>
+        if case .success = proposed, ProcessInfo.processInfo.systemUptime > deadline {
+            result = .failure(URLError(.timedOut))
+        } else { result = proposed }
+        let continuation = self.continuation, session = self.session, task = self.task, timer = self.timer
+        self.continuation = nil
+        self.session = nil
+        self.task = nil
+        self.timer = nil
+        bytes = Data()
+        lock.unlock()
+        timer?.cancel()
+        task?.cancel()
+        session?.invalidateAndCancel()
+        continuation?.resume(with: result)
+    }
+
+    func urlSession(_ session: URLSession, task: URLSessionTask, willPerformHTTPRedirection response: HTTPURLResponse,
+                    newRequest request: URLRequest, completionHandler: @escaping (URLRequest?) -> Void) {
+        lock.lock()
+        let active = !finished && redirects < IOSUpdater.maximumRedirects
+        redirects += 1
+        lock.unlock()
+        guard active, [301, 302, 303, 307, 308].contains(response.statusCode),
+              let from = response.url, let to = request.url,
+              IOSUpdater.allowsRedirect(from: from, to: to, source: source, relative: relative) else {
+            completionHandler(nil)
+            finish(.failure(UpdateError.http))
+            return
+        }
+        completionHandler(self.request(url: to, timeout: task.originalRequest?.timeoutInterval ?? 8))
+    }
+
+    func urlSession(_ session: URLSession, task: URLSessionTask, didReceive challenge: URLAuthenticationChallenge,
+                    completionHandler: @escaping (URLSession.AuthChallengeDisposition, URLCredential?) -> Void) {
+        completionHandler(challenge.protectionSpace.authenticationMethod == NSURLAuthenticationMethodServerTrust
+                          ? .performDefaultHandling : .cancelAuthenticationChallenge, nil)
+    }
+
+    func urlSession(_ session: URLSession, dataTask: URLSessionDataTask, didReceive response: URLResponse,
+                    completionHandler: @escaping (URLSession.ResponseDisposition) -> Void) {
+        guard let http = response as? HTTPURLResponse, http.statusCode == 200, let url = http.url,
+              IOSUpdateSources.allows(url, source: source, relative: relative) else {
+            completionHandler(.cancel)
+            finish(.failure(UpdateError.http))
+            return
+        }
+        if !headersOnly && response.expectedContentLength > Int64(limit) {
+            completionHandler(.cancel)
+            finish(.failure(UpdateError.tooLarge))
+            return
+        }
+        lock.lock()
+        let active = !finished
+        self.response = http
+        lock.unlock()
+        guard active else { completionHandler(.cancel); return }
+        if headersOnly {
+            finish(.success((Data(), http)))
+            completionHandler(.cancel)
+        } else {
+            completionHandler(.allow)
         }
     }
 
-    static func latest() async throws -> IOSRelease {
-        var failure: Error = UpdateError.http
-        for url in metadataURLs {
-            do {
-                var request = URLRequest(url: url, cachePolicy: .reloadIgnoringLocalCacheData, timeoutInterval: 8)
-                request.setValue("application/vnd.github.raw+json", forHTTPHeaderField: "Accept")
-                let (bytes, response) = try await session.data(for: request)
-                try checkResponse(response, url: url)
-                guard bytes.count <= 32_768 else { throw UpdateError.tooLarge }
-                // Release API 的 JSON 结构与 version.json 不同，按主机分流解析。
-                let release: IOSRelease
-                if url.host == "api.github.com" {
-                    release = try releaseFromGitHubAPI(bytes)
-                } else {
-                    release = try JSONDecoder().decode(IOSRelease.self, from: bytes)
-                    try release.validate()
-                }
-                return release
-            } catch {
-                if Task.isCancelled { throw CancellationError() }
-                failure = error
-            }
+    func urlSession(_ session: URLSession, dataTask: URLSessionDataTask, didReceive data: Data) {
+        lock.lock()
+        guard !finished else { lock.unlock(); return }
+        guard data.count <= limit - bytes.count else {
+            lock.unlock()
+            finish(.failure(UpdateError.tooLarge))
+            return
         }
-        throw failure
+        bytes.append(data)
+        lock.unlock()
     }
 
-    static func download(_ release: IOSRelease) async throws -> URL {
-        try release.validate()
-        var failure: Error = UpdateError.http
-        for url in release.downloadURLs {
-            do {
-                let (temporary, response) = try await session.download(for: URLRequest(url: url, cachePolicy: .reloadIgnoringLocalCacheData, timeoutInterval: 45))
-                defer { try? FileManager.default.removeItem(at: temporary) }
-                try checkResponse(response, url: url)
-                let size = try FileManager.default.attributesOfItem(atPath: temporary.path)[.size] as? NSNumber
-                guard size?.intValue == release.size else { throw UpdateError.checksum }
-                try release.verify(Data(contentsOf: temporary))
-                let destination = FileManager.default.temporaryDirectory.appendingPathComponent("dashboard-trollstore.ipa")
-                if FileManager.default.fileExists(atPath: destination.path) { try FileManager.default.removeItem(at: destination) }
-                try FileManager.default.moveItem(at: temporary, to: destination)
-                return destination
-            } catch {
-                if Task.isCancelled { throw CancellationError() }
-                failure = error
-            }
-        }
-        throw failure
+    func urlSession(_ session: URLSession, task: URLSessionTask, didCompleteWithError error: Error?) {
+        lock.lock()
+        let bytes = self.bytes, response = self.response
+        lock.unlock()
+        if let error = error { finish(.failure(error)) }
+        else if let response = response { finish(.success((bytes, response))) }
+        else { finish(.failure(UpdateError.http)) }
     }
 }

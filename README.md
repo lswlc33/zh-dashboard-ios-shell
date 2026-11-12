@@ -1,6 +1,6 @@
 # zh-dashboard-ios-shell
 
-几何面板（极核面板）的 iOS 壳源码，用于构建 **未签名（ad-hoc）IPA**，供 TrollStore 侧载安装。
+几何面板（极核面板）的 iOS 壳源码，用于真实 Xcode 构建 **ad-hoc 签名 IPA**，供 TrollStore 侧载安装。
 
 ## 这是什么
 
@@ -12,24 +12,25 @@ Swift UIKit + WKWebView 壳，配合 Kotlin Multiplatform 共享协议层。网�
 
 ## 产物
 
-GitHub Actions 在 macOS runner 上构建，产物发布到 [Releases](../../releases)：
+GitHub Actions 在 macOS runner 上构建并上传五文件 artifact，由发布会话独立核对源码指纹和真实 IPA 后移交到[官方产物源仓库](https://github.com/lswlc33/zeeho-3d-models)。正式更新源是 [`app/version2.json`](https://lswlc33.github.io/zeeho-3d-models/app/version2.json)，采用 [AltStore 官方源格式](https://faq.altstore.io/developers/make-a-source)，只保留一个 App 和最新版；图标、名称与可换行介绍使用官方字段。
 
 | 项 | 说明 |
 |---|---|
-| 文件名 | `dashboard-trollstore.ipa` |
+| 文件名 | `app/zeehowebnext.ipa` |
 | 签名 | **ad-hoc**（`codesign --sign -`），无证书、无 provisioning profile |
-| 用途 | TrollStore 侧载；安装时由 TrollStore 重新签名 |
-| 不适用 | App Store、TestFlight、普通自签安装 |
+| 用途 | TrollStore 侧载，由用户确认覆盖安装，不静默安装 |
+| 尚未验证 | AltStore 重签安装与设备上的 App Group 授权 |
+| 不适用 | App Store、TestFlight |
 
-每个 Release 附带 `sourceTreeSha256` 与公开仓库 commit，便于核对产物对应的源码版本。
+软件版本与 build 由 `ios-shell/Info.plist` 唯一维护，每次正式迭代递增，CI 运行次数不作软件版本。构建报告记录 `sourceTreeSha256` 与公开仓库 commit，正式发布不上传这些诊断边车文件。
 
 ## 自行构建
 
 需要完整 Xcode（非仅 Command Line Tools）、JDK 21、Python 3.9+：
 
 ```bash
-bash ios-shell/build.sh
-# 产物：ios-shell/dist/dashboard-trollstore.ipa
+bash ios-shell/build.sh --output-dir /tmp/zeeho-ios-out
+# 产物：/tmp/zeeho-ios-out/zeehowebnext.ipa 与 version2.json、构建报告等
 ```
 
 `build.sh` 会先用 Gradle 生成 `ZeehoShared` framework，再编译 Swift host 与 Widget 扩展，由内到外 ad-hoc 签名并做结构校验；失败不会写出替代包。

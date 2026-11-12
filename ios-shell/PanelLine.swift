@@ -1,8 +1,6 @@
 import Foundation
 
-// 面板线路：同一份网页产物可以从两个入口拿。
-// 对应安卓 PanelLine.java 的语义，但 iOS 侧线路切换是「换基址 + 重新初始化快照」，
-// 不像安卓那样在原生层做下载代理，所以这里只保存线路选择与基址。
+// 面板线路只决定后续检查与下载，切换不替换当前文档或迁移账号。
 enum IOSPanelLine: String {
     case github
     case cf
@@ -10,6 +8,13 @@ enum IOSPanelLine: String {
     static let version = 1
 
     private static let defaultsKey = "io.github.lswlc33.dashboard.ios.panel-line"
+    private static let lock = NSLock()
+    private static var changeRevision: UInt64 = 0
+    static let didChangeNotification = Notification.Name("io.github.lswlc33.dashboard.ios.panel-line.changed")
+    static var revision: UInt64 {
+        lock.lock(); defer { lock.unlock() }
+        return changeRevision
+    }
 
     /// 当前选中的线路。默认 GitHub Pages。
     /// 注意：用户一旦在更新面板里选过，就会持久化在 UserDefaults 里——
@@ -20,9 +25,13 @@ enum IOSPanelLine: String {
             return IOSPanelLine(rawValue: raw) ?? .github
         }
         set {
+            guard newValue != current else { return }
+            lock.lock()
             UserDefaults.standard.set(newValue.rawValue, forKey: defaultsKey)
-            // 导航白名单与起始地址都跟着线路走，改完立刻同步。
+            changeRevision &+= 1
+            lock.unlock()
             PanelNavigation.base = baseURL(for: newValue)
+            NotificationCenter.default.post(name: didChangeNotification, object: nil)
         }
     }
 
@@ -37,8 +46,7 @@ enum IOSPanelLine: String {
         case .github:
             return URL(string: "https://lswlc33.github.io/zeeho-3d-models/")!
         case .cf:
-            // Cloudflare 线路是同一个静态根的反代；未配置时回落到 GitHub，避免整页打不开。
-            return URL(string: "https://zhb.xn--fiqz59cpva341l.top/") ?? URL(string: "https://lswlc33.github.io/zeeho-3d-models/")!
+            return URL(string: "https://zhb.xn--fiqz59cpva341l.top/")!
         }
     }
 

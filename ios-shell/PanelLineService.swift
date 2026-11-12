@@ -1,9 +1,7 @@
 import Foundation
 
-// 面板线路桥。对应安卓 PanelLine 的五个同步方法，但语义按 iOS 收敛：
-// 切换线路 = 换基址 + 让快照失效，下一次进入面板重新初始化。
-// 安卓的 beginPanelLine 已经改成「同步完成」，poll 恒失败，这里照抄同一形状，
-// 避免网页侧要写两套分支。
+// 面板线路桥。切换只保存后续更新来源，当前文档与账号保持不变。
+// begin 回执就是终态；poll 保留旧接口但不制造轮询票据。
 final class IOSPanelLineService: IOSBridgeService {
     let methods = ["panelLineVersion", "panelLineInfo", "beginPanelLine",
                    "pollPanelLine", "cancelPanelLine"]
@@ -50,18 +48,22 @@ final class IOSPanelLineService: IOSBridgeService {
             reply(["ticket": "", "done": true, "ok": false, "error": "bad_request"], nil)
             return
         }
+        guard !IOSPanelCache.shared.snapshot().busy else {
+            reply(["ticket": "", "done": true, "ok": false, "error": "panel_update_busy"], nil)
+            return
+        }
         let previous = IOSPanelLine.current
         IOSPanelLine.current = target
         worker.async { [weak self] in
             guard let self = self else { return }
             self.generation &+= 1
-            // 换线路后旧快照可能来自另一个源，必须重下；只标记失效，不在这里阻塞下载。
+            // 只确认已保存偏好，不启动下载或重载当前文档。
             DispatchQueue.main.async {
                 reply(["ticket": "", "done": true, "ok": true,
                        "error": "", "phase": "done",
                        "line": target.rawValue, "previous": previous.rawValue,
                        "logicalOrigin": IOSPanelLine.baseURL(for: target).absoluteString,
-                       "reinitialize": true], nil)
+                       "reinitialize": false], nil)
             }
         }
     }

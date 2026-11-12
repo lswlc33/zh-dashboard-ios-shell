@@ -1,7 +1,6 @@
-name: Build unsigned iOS IPA
+name: Build iOS TrollStore IPA
 
-# 公开仓库只负责构建：源码由私有仓库按白名单同步进来，产物回传到 Release。
-# 不做 Apple 登录、不使用证书/profile；产出 ad-hoc 签名的 IPA（TrollStore 侧载用）。
+# 公开仓库只负责真实 Xcode 构建与移交；最终分发由产物仓库的 version2.json 管理。
 on:
   push:
     branches: [main]
@@ -11,18 +10,13 @@ on:
       - 'public/icons/**'
       - '.github/workflows/build-ios.yml'
   workflow_dispatch:
-    inputs:
-      version:
-        description: '版本号（用于 Release tag，留空则用日期时间）'
-        required: false
-        default: ''
 
 permissions:
-  contents: write
+  contents: read
 
 concurrency:
   group: build-ios-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: false
 
 jobs:
   build:
@@ -65,12 +59,8 @@ jobs:
           chmod +x native-shared/gradlew ios-shell/build.sh
           # 用 pipefail 保住 build.sh 的退出码；否则 tee 会把失败吞成成功。
           set -o pipefail
-          # build 号必须显式传：checkout 是 fetch-depth=1 的浅克隆，
-          # build.sh 里的 `git rev-list --count HEAD` 兜底在浅仓库永远只数到 1，
-          # 内置更新器（isNewer 相同版本比 build）会因此永远「已是最新」。
-          # github.run_number 是仓库级单调递增计数器，正好当 build 号。
-          bash ios-shell/build.sh --output-dir "$RUNNER_TEMP/out" \
-            --build-number "${{ github.run_number }}" 2>&1 | tee build.log
+          # 正式版本和 build 仅由 host Info.plist 定版，CI 的运行次数不参与包版本。
+          bash ios-shell/build.sh --output-dir "$RUNNER_TEMP/out" 2>&1 | tee build.log
 
       - name: 摘要编译错误
         if: failure()
@@ -93,7 +83,7 @@ jobs:
 
       - name: 校验产物
         run: |
-          IPA="$RUNNER_TEMP/out/dashboard-trollstore.ipa"
+          IPA="$RUNNER_TEMP/out/zeehowebnext.ipa"
           [[ -f "$IPA" ]] || { echo "BLOCKED: IPA not produced"; ls -R "$RUNNER_TEMP/out" || true; exit 1; }
           ls -l "$IPA"
           shasum -a 256 "$IPA" | tee "$RUNNER_TEMP/SHA256SUMS"
@@ -108,45 +98,16 @@ jobs:
           path: build.log
           retention-days: 7
 
-      - name: 发布到 Release
+      - name: 上传构建产物供正式发布移交
         if: success()
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          VERSION="${{ github.event.inputs.version }}"
-          if [[ -z "$VERSION" ]]; then VERSION="$(date -u +%Y%m%d-%H%M%S)"; fi
-          TAG="ios-v${VERSION}"
-          FINGERPRINT="$(python3 -I -c "import json;print(json.load(open('$RUNNER_TEMP/build-inputs.json')).get('sourceTreeSha256','unknown'))" 2>/dev/null || echo unknown)"
-          # 机器可读段（`key: value` 行首格式）由 App 内置更新器的
-          # releaseFromGitHubAPI 解析（Update.swift）：version/build/sha256/size/
-          # minimumIOS 五个键缺一不可，改格式要两边同步。
-          SHA="$(cut -d' ' -f1 "$RUNNER_TEMP/SHA256SUMS")"
-          SIZE="$(stat -f%z "$RUNNER_TEMP/out/dashboard-trollstore.ipa")"
-          # version/build 都从 IPA 里的 Info.plist 读，保证「清单说的」与「包里是」一致：
-          # version 是 CFBundleShortVersionString（x.y.z，isNewer 用语义化比较），
-          # build 是 CFBundleVersion（本步已显式传 --build-number，浅克隆也不会是 1）。
-          # 多行 Python 会顶格破坏 YAML 缩进，所以压成一行分号写法。
-          PLIST_INFO="$(python3 -I -c "import plistlib,zipfile;z=zipfile.ZipFile('$RUNNER_TEMP/out/dashboard-trollstore.ipa');i=plistlib.loads(z.read('Payload/Dashboard.app/Info.plist'));print(i['CFBundleShortVersionString'],i['CFBundleVersion'])")"
-          VERSION_FIELD="${PLIST_INFO% *}"
-          BUILD="${PLIST_INFO#* }"
-          # 用 printf 拼多行 notes：避免 heredoc 缩进与 YAML 缩进互相干扰。
-          NOTES_FILE="$RUNNER_TEMP/notes.md"
-          {
-            printf '未签名（ad-hoc）IPA，用于 TrollStore 侧载，不适用于 App Store 或普通自签安装。\n\n'
-            printf 'version: %s\n' "$VERSION_FIELD"
-            printf 'build: %s\n' "$BUILD"
-            printf 'sha256: %s\n' "$SHA"
-            printf 'size: %s\n' "$SIZE"
-            printf 'minimumIOS: 15.4\n\n'
-            printf '`sourceTreeSha256`: `%s`\n' "$FINGERPRINT"
-            printf '公开仓库 commit: `%s`\n' "${{ github.sha }}"
-            printf '构建时间（UTC）: `%s`\n\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-            printf '本产物由公开仓库的 GitHub Actions 构建；源码由私有仓库按白名单同步，不含客户端密钥。\n'
-          } > "$NOTES_FILE"
-          gh release create "$TAG" \
-            --prerelease \
-            --title "iOS 未签名 IPA ${VERSION}" \
-            --notes-file "$NOTES_FILE" \
-            "$RUNNER_TEMP/out/dashboard-trollstore.ipa" \
-            "$RUNNER_TEMP/SHA256SUMS"
-          echo "Released $TAG"
+        uses: actions/upload-artifact@v4
+        with:
+          name: ios-ipa-${{ github.sha }}
+          path: |
+            ${{ runner.temp }}/out/zeehowebnext.ipa
+            ${{ runner.temp }}/out/version2.json
+            ${{ runner.temp }}/out/build-manifest.json
+            ${{ runner.temp }}/out/source-commit.txt
+            ${{ runner.temp }}/out/SHA256SUMS
+          if-no-files-found: error
+          retention-days: 30

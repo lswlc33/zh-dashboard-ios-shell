@@ -6,8 +6,8 @@ import UIKit
 // 内容分四段：
 //   1. 四行版本信息（软件 / 面板 / WebView / 最低要求）
 //   2. 面板资源（本地快照的构建号、资源数、大小、上次更新时间）
-//   3. 软件更新线路（单选，切换后立刻重新初始化资源）
-//   4. 操作（检查更新 / 重新初始化 / 查看诊断日志）
+//   3. 软件更新线路（单选，只影响下次更新）
+//   4. 操作（检查软件 / 面板更新 / 重新初始化 / 查看诊断日志）
 //
 // 所有可见文案都走 IOSStrings：这一页以前大段内联中文，
 // 和恢复页同一句话会出现两种措辞，文案审计也没法统一改。
@@ -29,7 +29,16 @@ final class UpdatePanelViewController: UIViewController,
     private let table = UITableView(frame: .zero, style: .insetGrouped)
     private var resourceInfo: [String: String] = [:]
     private var checking = false
-    /// 关闭通知只发一次：点「完成」与 viewWillDisappear 都会走到 notifyChange。
+    private var panelChecking = false
+    private var checkTask: Task<Void, Never>?
+    private var panelCheckTask: Task<Void, Never>?
+    private var checkID = UUID()
+    private var panelCheckID = UUID()
+    private var resourceLoadID = UUID()
+    private var initializeID = UUID()
+    private var initializing = false
+    private var closed = false
+    /// 关闭通知只发一次；展示其他页面不算关闭。
     private var changeNotified = false
 
     /// 关闭时通知调用方刷新（线路/资源可能变了）。
@@ -55,33 +64,77 @@ final class UpdatePanelViewController: UIViewController,
         ])
         // 初始化在途时禁止下滑关闭：formSheet 下滑会打断正在跑的资源下载，
         // 用户看不到进度也回不到这个页面。
+        NotificationCenter.default.addObserver(self, selector: #selector(cacheStateChanged),
+            name: IOSPanelCache.stateDidChangeNotification, object: IOSPanelCache.shared)
+        for name in [UIApplication.didEnterBackgroundNotification, IOSPanelLine.didChangeNotification] {
+            NotificationCenter.default.addObserver(self, selector: #selector(cancelChecks), name: name, object: nil)
+        }
         syncModalLock()
         loadResourceInfo()
+    }
+
+    deinit {
+        NotificationCenter.default.removeObserver(self)
+        checkTask?.cancel()
+        panelCheckTask?.cancel()
+    }
+
+    @objc private func cancelChecks() {
+        checkID = UUID(); panelCheckID = UUID()
+        checkTask?.cancel(); checkTask = nil
+        panelCheckTask?.cancel(); panelCheckTask = nil
+        checking = false; panelChecking = false
+    }
+
+    @objc private func cacheStateChanged() {
+        guard !closed else { return }
+        syncModalLock()
+        if active && !IOSPanelCache.shared.snapshot().busy { loadResourceInfo() }
     }
 
     override func viewWillAppear(_ animated: Bool) {
         super.viewWillAppear(animated)
         syncModalLock()
+        table.reloadData()
+    }
+
+    override func viewDidAppear(_ animated: Bool) {
+        super.viewDidAppear(animated)
+        syncModalLock()
+        loadResourceInfo()
     }
 
     override func viewWillDisappear(_ animated: Bool) {
         super.viewWillDisappear(animated)
-        // 只有「真的被关掉」才通知调用方。present 一个全屏 alert / 分享页
-        // 也会触发 viewWillDisappear，那种情况下通知只是在弹窗背后白刷新一次。
-        guard isBeingDismissed || navigationController?.isBeingDismissed == true else { return }
+        // 分享页遮住整个屏幕不算关闭；只取消本页等待，不取消中心的共用检查。
+        guard isBeingDismissed || navigationController?.isBeingDismissed == true || isMovingFromParent else { return }
+        checkTask?.cancel()
+        panelCheckTask?.cancel()
+    }
+
+    override func viewDidDisappear(_ animated: Bool) {
+        super.viewDidDisappear(animated)
+        guard isBeingDismissed || navigationController?.isBeingDismissed == true || isMovingFromParent else { return }
+        closed = true
+        checkTask?.cancel()
+        panelCheckTask?.cancel()
+        checkTask = nil
+        panelCheckTask = nil
         notifyChange()
     }
 
-    /// 初始化在途时锁住下滑关闭，结束后解锁。
-    ///
-    /// 只在 viewWillAppear 与初始化回调里调：`isModalInPresentation` 一旦置 true，
-    /// 用户就从「下滑能走」变成「必须点完成」，中途再点「取消本次任务」也得靠恢复页
-    /// 才能回到空闲——所以必须跟着真实状态来回切，不能只置不管。
+    private var active: Bool {
+        !closed && isViewLoaded && view.window != nil && !isBeingDismissed
+            && navigationController?.isBeingDismissed != true && !isMovingFromParent
+    }
+
+    /// 初始化只在真实终态解锁，不能把准备 / 下载回执当作完成。
     private func syncModalLock() {
-        // 初始化回调可能在面板已经关掉之后才到（比如线路确认后用户立刻点完成），
-        // 这时写 isModalInPresentation 会碰一个正在消失的控制器，别碰。
-        guard isViewLoaded, view.window != nil else { return }
-        isModalInPresentation = IOSPanelCache.shared.snapshot().busy
+        guard !closed, isViewLoaded else { return }
+        let busy = initializing || IOSPanelCache.shared.snapshot().busy
+        isModalInPresentation = busy
+        navigationController?.isModalInPresentation = busy
+        navigationItem.rightBarButtonItem?.isEnabled = !busy
     }
 
     private func notifyChange() {
@@ -91,8 +144,15 @@ final class UpdatePanelViewController: UIViewController,
     }
 
     @objc private func dismissSelf() {
-        notifyChange()
-        dismiss(animated: true)
+        guard active, !initializing, !IOSPanelCache.shared.snapshot().busy else { return }
+        // onChange 留到真正消失再发，检查等待先取消以拦住晚到的弹窗。
+        checkTask?.cancel()
+        panelCheckTask?.cancel()
+        dismiss(animated: true) { [weak self] in
+            guard let self = self else { return }
+            self.closed = true
+            self.notifyChange()
+        }
     }
 
     // MARK: - 数据
@@ -106,6 +166,9 @@ final class UpdatePanelViewController: UIViewController,
     /// 文件 IO 放后台：目录在 Application Support，走的可能是 encrypted 卷，
     /// 首帧同步扫十几个文件（含 2MB 的 index.html）会让页面停顿一拍。
     private func loadResourceInfo() {
+        guard !closed else { return }
+        let id = UUID()
+        resourceLoadID = id
         DispatchQueue.global(qos: .utility).async { [weak self] in
             let cache = IOSPanelCache.shared
             let directory = cache.snapshotDirectory()
@@ -140,7 +203,7 @@ final class UpdatePanelViewController: UIViewController,
                 "updated": modified
             ]
             DispatchQueue.main.async {
-                guard let self = self else { return }
+                guard let self = self, self.active, self.resourceLoadID == id else { return }
                 self.resourceInfo = info
                 self.table.reloadData()
             }
@@ -190,6 +253,7 @@ final class UpdatePanelViewController: UIViewController,
         case .actions:
             return [
                 (checking ? IOSStrings.updateChecking : IOSStrings.recoveryUpdate, ""),
+                (panelChecking ? IOSStrings.updateChecking : IOSStrings.updatePanelChecking, ""),
                 (IOSStrings.updateReinitializeRow, ""),
                 (IOSStrings.updateShowDiagnostics, "")
             ]
@@ -219,16 +283,21 @@ final class UpdatePanelViewController: UIViewController,
         guard let section = Section(rawValue: indexPath.section) else { return cell }
         let items = rows(for: section)
         // 防御：行数与 rows 现在同源，正常不会越界；留着避免以后有人只改一处。
-        guard indexPath.row < items.count else { return cell }
+        guard items.indices.contains(indexPath.row) else { return cell }
         cell.textLabel?.text = items[indexPath.row].0
         cell.detailTextLabel?.text = items[indexPath.row].1
 
         switch section {
+        case .versions where indexPath.row < 2:
+            cell.accessoryType = .disclosureIndicator
+            cell.selectionStyle = .default
         case .line:
             let line = [IOSPanelLine.github, IOSPanelLine.cf][indexPath.row]
             cell.accessoryType = line == IOSPanelLine.current ? .checkmark : .none
+            cell.selectionStyle = .default
         case .actions:
             cell.textLabel?.textColor = .tintColor
+            cell.selectionStyle = .default
         default:
             break
         }
@@ -239,16 +308,25 @@ final class UpdatePanelViewController: UIViewController,
 
     func tableView(_ tableView: UITableView, didSelectRowAt indexPath: IndexPath) {
         tableView.deselectRow(at: indexPath, animated: true)
+        guard active else { return }
         switch Section(rawValue: indexPath.section) {
+        case .versions:
+            switch indexPath.row {
+            case 0: checkUpdate()
+            case 1: checkPanelUpdate()
+            default: break
+            }
         case .line:
             let lines = [IOSPanelLine.github, IOSPanelLine.cf]
-            guard indexPath.row < lines.count else { return }
+            guard lines.indices.contains(indexPath.row) else { return }
             selectLine(lines[indexPath.row])
         case .actions:
             switch indexPath.row {
             case 0: checkUpdate()
-            case 1: reinitialize()
-            default: showDiagnostics()
+            case 1: checkPanelUpdate()
+            case 2: reinitialize()
+            case 3: showDiagnostics()
+            default: break
             }
         default:
             break
@@ -258,107 +336,99 @@ final class UpdatePanelViewController: UIViewController,
     // MARK: - 动作
 
     private func selectLine(_ line: IOSPanelLine) {
-        guard line != IOSPanelLine.current else { return }
+        guard active, presentedViewController == nil, line != IOSPanelLine.current else { return }
+        guard !initializing, !IOSPanelCache.shared.snapshot().busy else {
+            presentMessage(IOSStrings.updateLineChangedTitle, IOSStrings.busy)
+            return
+        }
         let alert = UIAlertController(
             title: IOSStrings.updateLineChangedTitle,
             message: String(format: IOSStrings.recoveryLineChanged, line.displayName),
             preferredStyle: .alert)
-        // 取消必须真的什么都不写：以前赋值在弹窗前，弹窗还只有「确定」，
-        // 用户一取消/杀 App 就留下「新线路 + 旧快照」，下次启动资源对不上。
-        alert.addAction(UIAlertAction(title: IOSStrings.cancel, style: .cancel) { [weak self] _ in
-            // 取消时什么都没写（赋值在 confirm 回调里），但选中态的勾选是由
-            // IOSPanelLine.current 决定的，这里刷新一次把 UI 恢复到真实值。
-            // 不能省略：不然用户会以为自己已经换线，下次进来才发现还是原线路。
-            self?.table.reloadData()
-        })
+        // 取消不写偏好；确认也只影响下次更新，不重载当前面板和账号。
+        alert.addAction(UIAlertAction(title: IOSStrings.cancel, style: .cancel))
         alert.addAction(UIAlertAction(title: IOSStrings.confirm, style: .default) { [weak self] _ in
-            guard let self = self else { return }
+            guard let self = self, self.active else { return }
+            guard !self.initializing, !IOSPanelCache.shared.snapshot().busy else {
+                self.presentMessage(IOSStrings.updateLineChangedTitle, IOSStrings.busy)
+                return
+            }
             IOSPanelLine.current = line
             self.table.reloadData()
-            self.syncModalLock()
-            // 换线路后旧快照可能来自另一个源，必须重下才能保证资源一致。
-            IOSPanelCache.shared.initialize(force: true) { _ in
-                self.syncModalLock()
-                self.loadResourceInfo()
-            }
         })
         present(alert, animated: true)
     }
 
     private func checkUpdate() {
-        guard !checking else { return }
+        guard active, !checking, presentedViewController == nil else { return }
         checking = true
+        let id = UUID()
+        checkID = id
         table.reloadData()
-        Task { @MainActor in
-            defer {
-                checking = false
-                table.reloadData()
-            }
-            do {
-                let release = try await IOSUpdater.latest()
-                let version = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? ""
-                let build = Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String ?? ""
-                if try release.isNewer(version: version, build: build) {
-                    // 最低系统闸门：与 Dashboard.checkUpdate 共用同一份实现，
-                    // 否则两个入口的判据会漂移（这里以前完全没判，直接弹「发现新版本」）。
-                    try release.requireSupportedSystem()
-                    let alert = UIAlertController(
-                        title: IOSStrings.updateNewVersionTitle,
-                        message: String(format: IOSStrings.updateNewVersionMessage,
-                                        version, build, release.version, release.build),
-                        preferredStyle: .alert)
-                    alert.addAction(UIAlertAction(title: IOSStrings.updateLater, style: .cancel))
-                    alert.addAction(UIAlertAction(title: IOSStrings.updateDownload, style: .default) { [weak self] _ in
-                        self?.downloadUpdate(release)
-                    })
-                    present(alert, animated: true)
-                } else {
-                    // 这里用恢复页那条「当前版本 + 更新渠道」的说明，而不是另写一句
-                    // 「已是最新」：它同时告诉用户 iOS 版更新从发布仓库来，
-                    // 也就顺带解释了为什么这里的手动检查和启动时提示要分别点。
-                    presentMessage(IOSStrings.updateUpToDateTitle,
-                                   String(format: IOSStrings.recoveryUpdateHint, version, build))
-                }
-            } catch {
-                presentMessage(IOSStrings.updateCheckFailedTitle, error.localizedDescription)
-            }
-        }
+        checkTask = IOSUpdatePresentation.checkApp(from: self, manual: true, completion: { [weak self] in
+            guard let self = self, !self.closed, self.checkID == id else { return }
+            self.checking = false
+            self.checkTask = nil
+            if self.active { self.table.reloadData() }
+        })
     }
 
-    private func downloadUpdate(_ release: IOSRelease) {
-        Task { @MainActor in
-            do {
-                let file = try await IOSUpdater.download(release)
-                let activity = UIActivityViewController(activityItems: [file], applicationActivities: nil)
-                if let popover = activity.popoverPresentationController {
-                    popover.sourceView = view
-                    popover.sourceRect = CGRect(x: view.bounds.midX, y: view.bounds.midY, width: 1, height: 1)
-                }
-                present(activity, animated: true)
-            } catch {
-                presentMessage(IOSStrings.updateDownloadFailedTitle, error.localizedDescription)
-            }
-        }
+    private func checkPanelUpdate() {
+        guard active, !panelChecking, presentedViewController == nil else { return }
+        panelChecking = true
+        let id = UUID()
+        panelCheckID = id
+        table.reloadData()
+        panelCheckTask = IOSUpdatePresentation.checkPanel(from: self, onUpdate: { [weak self] in
+            guard let self = self, self.active else { return }
+            self.reinitialize()
+        }, completion: { [weak self] in
+            guard let self = self, !self.closed, self.panelCheckID == id else { return }
+            self.panelChecking = false
+            self.panelCheckTask = nil
+            if self.active { self.table.reloadData() }
+        })
     }
 
     private func reinitialize() {
+        guard active else { return }
+        guard !initializing, !IOSPanelCache.shared.snapshot().busy else {
+            presentMessage(IOSStrings.updateReinitializeTitle, IOSStrings.busy)
+            return
+        }
         let alert = UIAlertController(
             title: IOSStrings.updateReinitializeTitle,
             message: IOSStrings.updateReinitializeMessage,
             preferredStyle: .alert)
         alert.addAction(UIAlertAction(title: IOSStrings.cancel, style: .cancel))
         alert.addAction(UIAlertAction(title: IOSStrings.confirm, style: .default) { [weak self] _ in
-            guard let self = self else { return }
+            guard let self = self, self.active, !self.initializing,
+                  !IOSPanelCache.shared.snapshot().busy else { return }
+            let id = UUID()
+            self.initializeID = id
+            self.initializing = true
             self.syncModalLock()
-            IOSPanelCache.shared.initialize(force: true) { _ in
+            IOSPanelCache.shared.initialize(force: true) { [weak self] state in
+                guard let self = self, !self.closed, self.initializeID == id else { return }
+                // preparing/downloading 是进度回执；只有终态才能刷新资源信息和解锁。
+                guard !state.busy else {
+                    self.syncModalLock()
+                    return
+                }
+                self.initializing = false
                 self.syncModalLock()
+                guard self.active else { return }
                 self.loadResourceInfo()
+                if !state.ready {
+                    self.presentMessage(IOSStrings.updateReinitializeTitle, IOSStrings.recoveryInitErrorGeneric)
+                }
             }
         })
         present(alert, animated: true)
     }
 
     private func showDiagnostics() {
+        guard active, presentedViewController == nil else { return }
         // 裸 present 时看不到标题，也没有关闭按钮（唯一出口是那个名叫「重试」的按钮）。
         // 包一层导航容器，诊断页自己挂「完成」与标题。
         let controller = DiagnosticsViewController()
@@ -370,7 +440,7 @@ final class UpdatePanelViewController: UIViewController,
     private func presentMessage(_ title: String, _ message: String) {
         // 已经有一个弹窗在显示时不要再 present，UIKit 会在控制台刷
         // 「Attempt to present ... which is already presenting」并且这次提示直接丢掉。
-        guard presentedViewController == nil else { return }
+        guard active, presentedViewController == nil else { return }
         let alert = UIAlertController(title: title, message: message, preferredStyle: .alert)
         alert.addAction(UIAlertAction(title: IOSStrings.confirm, style: .default))
         present(alert, animated: true)

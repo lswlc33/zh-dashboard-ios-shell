@@ -17,6 +17,7 @@ import Foundation
 //      之后退化成一次 fileExists，不在主线程做目录创建之类的 IO。
 final class IOSPanelCache {
     static let shared = IOSPanelCache()
+    static let stateDidChangeNotification = Notification.Name("io.github.lswlc33.dashboard.ios.panel-cache.state")
 
     // 顺序即资源序号；与 build-static.mjs 生成的产物集合保持一致。
     // 首个是 index.html，它决定整份快照是否可用。
@@ -138,6 +139,8 @@ final class IOSPanelCache {
     /// 但这期间网页的子资源请求不该 404，指向备份目录是零成本且正确的。
     private var pendingBackup: URL?
     private var generation = 0
+    private var downloadLine = IOSPanelLine.current
+    private var downloadLineRevision: UInt64 = 0
     private var cancelled = false
     /// 本次初始化正在用的 staging 目录。取消/失败时显式删除：
     /// 被取消的 dataTask 回调会因 generation 变化被丢弃，没人会再来清理它。
@@ -351,6 +354,8 @@ final class IOSPanelCache {
             }
             self.generation += 1
             let ticket = self.generation
+            self.downloadLine = IOSPanelLine.current
+            self.downloadLineRevision = IOSPanelLine.revision
             self.cancelled = false
             self.state = State(phase: .preparing, resourceCount: Self.resources.count)
             self.emit(ticket, completion)
@@ -415,6 +420,15 @@ final class IOSPanelCache {
     private func commit(staging: URL, root: URL, ticket: Int,
                         completion: @escaping (State) -> Void) {
         let manager = FileManager.default
+        guard ticket == generation, !cancelled,
+              IOSPanelLine.current == downloadLine, IOSPanelLine.revision == downloadLineRevision else {
+            try? manager.removeItem(at: staging)
+            stagingDirectory = nil
+            state.phase = .error
+            state.error = "panel_line_changed"
+            emit(ticket, completion)
+            return
+        }
         let current = root.appendingPathComponent("current", isDirectory: true)
         let backup = root.appendingPathComponent(".old-" + UUID().uuidString, isDirectory: true)
         let hadOld = manager.fileExists(atPath: current.path)
@@ -450,7 +464,7 @@ final class IOSPanelCache {
             let build = Self.readBuild(from: current)
             // 提交成功才写 meta：失败时留着旧的 downloadedAt 反而更诚实
             // （needsRefresh 会把它判成过期并重试）。
-            Self.writeMeta(root: root, build: build, line: IOSPanelLine.current.rawValue)
+            Self.writeMeta(root: root, build: build, line: downloadLine.rawValue)
             lock.lock()
             cachedCurrent = current
             lock.unlock()
@@ -518,7 +532,10 @@ final class IOSPanelCache {
     private func emit(_ ticket: Int, _ completion: @escaping (State) -> Void) {
         guard generation == ticket else { return }
         let current = state
-        DispatchQueue.main.async { completion(current) }
+        DispatchQueue.main.async {
+            completion(current)
+            NotificationCenter.default.post(name: Self.stateDidChangeNotification, object: self)
+        }
     }
 
     // MARK: - 下载
@@ -615,7 +632,7 @@ final class IOSPanelCache {
 
     private func downloadAll(into staging: URL, ticket: Int, strict: Bool,
                              completion: @escaping (Result<Void, Error>) -> Void) {
-        let base = IOSPanelLine.baseURL()
+        let base = IOSPanelLine.baseURL(for: downloadLine)
         let batch = Batch(ticket: ticket, count: Self.resources.count, strict: strict, completion: completion)
         state.phase = .downloading
         state.resourceCount = Self.resources.count
@@ -801,7 +818,10 @@ final class IOSPanelCache {
     private func emitState(_ ticket: Int) {
         guard generation == ticket else { return }
         let current = state
-        DispatchQueue.main.async { self.onState?(current) }
+        DispatchQueue.main.async {
+            self.onState?(current)
+            NotificationCenter.default.post(name: Self.stateDidChangeNotification, object: self)
+        }
     }
 
     private func finishBatch(_ batch: Batch) {

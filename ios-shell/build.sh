@@ -1,13 +1,8 @@
 #!/bin/bash
 # 只在真实 macOS/Xcode 上出包；Windows/缺失 KMP 框架时绝不生成占位 IPA。
 #
-# `--build-number` 的语义（CFBundleVersion）：
-#   显式传了就用它（必须是 [1-9][0-9]*）；没传则用 `git rev-list --count HEAD`
-#   （当前 checkout 的提交数，天然单调递增），git 不可用/没有 .git 时退回 1。
-#   为什么要有默认值：Info.plist 里硬编码的 1 会让 CI（不传 --build-number）
-#   永远产出 build=1 的包，Update.swift 的 isNewer 在版本相同时比较 build，
-#   于是设备永远判定「已是最新」；BootHealth.needsWelcome() 也拿它当键，
-#   升级后欢迎页不再出现。提交数只是本地/CI 的兜底，正式发版仍建议显式传值。
+# host Info.plist 是 version/build 的唯一来源；CI run_number 只能写日志。
+# --build-number 只作为显式一致性断言，不能覆盖正式产物的 CFBundleVersion。
 set -euo pipefail
 script_dir="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd -P)"
 repo_dir="$(CDPATH= cd -- "$script_dir/.." && pwd -P)"
@@ -24,7 +19,7 @@ offline=false
 
 usage() {
     printf '%s\n' 'Usage: build.sh [--preflight-only] [--build-number POSITIVE_INTEGER] [--output-dir DIR] [--source-manifest FILE] [--offline]'
-    printf '%s\n' 'Default build number is `git rev-list --count HEAD` (falls back to 1); default output is ios-shell/dist/<UTC timestamp>.'
+    printf '%s\n' 'Default version/build come from ios-shell/Info.plist; --build-number must equal that plist. Default output is ios-shell/dist/<UTC timestamp>.'
     printf '%s\n' 'Output is ad-hoc signed with public App Group entitlement templates; their Apple provisioning approval and TrollStore compatibility are not verified. Ordinary Apple installation needs matching identity/profiles and inside-out signing.'
 }
 while [[ $# -gt 0 ]]; do
@@ -49,20 +44,11 @@ done
 # 想固定路径就用 --output-dir 显式指定一个空目录。
 if [[ -z "$output_dir" ]]; then output_dir="$script_dir/dist/$(date -u +%Y%m%d-%H%M%S)"; fi
 [[ "$output_dir" = /* ]] || output_dir="$PWD/$output_dir"
-# 没显式传 --build-number 时用提交数兜底（见文件头的说明）；git 不可用时退回 1。
-if [[ -z "$build_number" ]]; then
-    build_number="$(git -C "$repo_dir" rev-list --count HEAD 2>/dev/null || true)"
-    [[ "$build_number" =~ ^[1-9][0-9]*$ ]] || build_number=1
-    # 浅克隆（actions/checkout 默认 fetch-depth=1）下 rev-list 只数到 1，
-    # 会静默退化成「每次都是 build 1」——内置更新器从此永远「已是最新」。
-    # 这种情况必须喊出来，而不是让产物带着错误的 build 号悄无声息地发布。
-    if [[ "$build_number" == 1 ]] && git -C "$repo_dir" rev-parse --is-shallow-repository 2>/dev/null | grep -q true; then
-        printf '%s\n' 'BLOCKED: shallow clone makes `git rev-list --count HEAD` useless (always 1).' >&2
-        printf '%s\n' '        Pass --build-number explicitly (CI 用 github.run_number).' >&2
-        exit 2
-    fi
-fi
+# 先读唯一版本源；即使显式传参，也只能与 host 一致，浅克隆不再影响版本。
 if command -v python3 >/dev/null 2>&1; then
+    version_args=()
+    if [[ -n "$build_number" ]]; then version_args+=(--build-number "$build_number"); fi
+    build_number="$(python3 -I "$support" build-number --source "$script_dir/Info.plist" "${version_args[@]}")"
     python3 -I "$support" output-check --root "$repo_dir" --output "$output_dir" >/dev/null
 fi
 if [[ -n "$source_manifest" && "$source_manifest" != /* ]]; then source_manifest="$PWD/$source_manifest"; fi
@@ -131,7 +117,7 @@ else
     printf '%s\n' 'note: navigation-test 已跳过（缺 ios-shell/navigation-test.swift，上传快照不含 *-test.swift）'
 fi
 if [[ -f "$script_dir/update-test.swift" ]]; then
-    xcrun swiftc "$script_dir/Update.swift" "$script_dir/update-test.swift" -o "$build_dir/update-test"
+    xcrun swiftc "$script_dir/Update.swift" "$script_dir/IOSStrings.swift" "$script_dir/PanelLine.swift" "$script_dir/Navigation.swift" "$script_dir/update-test.swift" -o "$build_dir/update-test"
     "$build_dir/update-test"
 else
     printf '%s\n' 'note: update-test 已跳过（缺 ios-shell/update-test.swift，上传快照不含 *-test.swift）'
@@ -259,10 +245,10 @@ plutil -lint "$app_dir/Info.plist"
 
 # 构建过程中源码变化也要阻塞；清单记录工作树哈希，不能只拿旧 commit 冒充全部来源。
 python3 -I "$support" inputs --root "$repo_dir" --source-manifest "$inputs" >/dev/null
-(cd "$build_dir" && zip -qry "$staged_dist/dashboard-trollstore.ipa" Payload)
-python3 -I "$support" write-release --ipa "$staged_dist/dashboard-trollstore.ipa" --inputs "$inputs" --framework "$shared_framework" --app "$app_dir"
-python3 -I "$script_dir/test.py" "$staged_dist/dashboard-trollstore.ipa"
+(cd "$build_dir" && zip -qry "$staged_dist/zeehowebnext.ipa" Payload)
+python3 -I "$support" write-release --ipa "$staged_dist/zeehowebnext.ipa" --inputs "$inputs" --framework "$shared_framework" --app "$app_dir"
+python3 -I "$script_dir/test.py" "$staged_dist/zeehowebnext.ipa"
 # 只有完整校验成功后才更新输出；失败不能残留一个假成功的新包。
 python3 -I "$support" publish --root "$repo_dir" --staged "$staged_dist" --output "$output_dir"
-python3 -I "$support" verify --ipa "$output_dir/dashboard-trollstore.ipa"
-printf 'Built and verified %s\n' "$output_dir/dashboard-trollstore.ipa"
+python3 -I "$support" verify --ipa "$output_dir/zeehowebnext.ipa"
+printf 'Built and verified %s\n' "$output_dir/zeehowebnext.ipa"

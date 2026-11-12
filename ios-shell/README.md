@@ -1,8 +1,8 @@
 # 几何面板 iOS 壳
 
-Swift UIKit + WKWebView 在线面板壳，固定打开 `https://lswlc33.github.io/zeeho-3d-models/`。网页是 App 内唯一业务 UI 与官方 API 请求签名实现；Swift 提供系统服务，[KMP 核心](../native-shared/README.md) 提供协议、数值与历史算法，不使用 Compose Multiplatform UI 或 Skia。IPA 不内置本轮网页快照，首次启动需联网；构建脚本不发布网页。
+Swift UIKit + WKWebView 面板壳，默认从 `https://lswlc33.github.io/zeeho-3d-models/` 加载，也可选择固定 Cloudflare 线路。网页是 App 内唯一业务 UI 与官方 API 请求签名实现；Swift 提供系统服务，[KMP 核心](../native-shared/README.md) 提供协议、数值与历史算法，不使用 Compose Multiplatform UI 或 Skia。IPA 不内置本轮网页快照，首次初始化需联网；构建脚本不发布网页。
 
-账号与 `Store` 数据经 AES-GCM 私有文件及本机 Keychain 保存；轻量网页偏好使用持久 WKWebsiteDataStore，不与 Safari 或 Android 互通。WebView 由原生安全区约束；远程页面到达前显示骨架屏。资产沿用网页自身发布机制，没有 Android 原生签名快照更新器。
+账号与 `Store` 数据经 AES-GCM 私有文件及本机 Keychain 保存；轻量网页偏好使用持久 WKWebsiteDataStore，不与 Safari 或 Android 互通。WebView 铺满页面，网页按原生 safeArea 留白；需要初始化资源时先显示原生欢迎页。资产沿用网页自身发布机制，没有 Android 原生签名快照更新器。
 
 构建目标仍是 arm64 iPhone / iPad、**iOS 15.4**。网页检查真实 `HTMLElement.inert`，参考基线为 **iOS / Safari 15.5**；只补确定性的 `findLast`，不伪造 `inert`，不能保证 15.4 可用。Live Activities 另需 **iOS 16.1+**；更高系统版本、方法存在或合成回执均不是设备验收证明。
 
@@ -22,21 +22,25 @@ Swift UIKit + WKWebView 在线面板壳，固定打开 `https://lswlc33.github.i
 
 ## iOS 软件更新与面板更新
 
-顶部“软件更新”读取官方仓库 Release 的机器可读清单（`releaseFromGitHubAPI`），不请求 Android 版本或 APK。IPA 使用 ghfast、gh-proxy、GitHub raw、jsDelivr、Pages 镜像下载。镜像失败、旧缓存或校验不符会换源，第三方镜像不提供可信版本清单。
+在面板或原生「版本与更新」检查软件更新，读取 `zeeho-3d-models/app/version2.json`；IPA 固定为 `app/zeehowebnext.ipa`，不请求 Android 的 `app/version.json` / APK。清单使用 [AltStore source 格式](https://faq.altstore.io/developers/make-a-source)，仅含本 App 最新版本；简介注明官方产物 / 公开 iOS 源码仓库与 TrollStore ad-hoc 现状，不表示 AltStore 重签安装已验收。GitHub 线路的下载来源有 GitHub Pages、ghfast、ghproxy、raw、jsDelivr、Cloudflare 六项；CF 专线仅有 Cloudflare。来源页显示 HEAD 响应头延迟，不是下载速率；用户点击才选定 source，下载失败明确报错，不暗中换源。清单查询的 GitHub 线路可依次尝试 Pages、raw、CF，CF 专线不串外源。
 
-启动自动检查，也可手动检查；比较 iOS 版本与 build，拒绝降级及不支持当前系统的包。下载后核对大小和 SHA-256，再交系统分享菜单，由用户选择 TrollStore 并确认覆盖安装，不是静默安装。初始信任依赖固定官方 HTTPS，SHA-256 是完整性校验，不是独立发布者签名。
+进入面板时仅在前台自动检查，手动检查与自动检查共用按线路缓存的 `IOSUpdateCenter`；自动检查结果在 30 分钟内复用，网页状态刷新只读中心缓存，不是后台联网轮询。比较 iOS 版本与 build，只提供较新的、支持当前系统的包；IPA 最多 30 MiB，下载后核对大小与 SHA-256。通过后打开系统 `UIActivityViewController`，由用户选择 TrollStore 并确认覆盖安装；分享回执不是安装成功，也不是静默安装。HTTPS 与清单哈希不构成独立发布者签名。
 
-顶部“刷新面板”重新加载当前网页，不能把本工作树未发布的页面变成线上功能。覆盖安装保留原 App 的账号与快照，不迁移 Safari 数据；新版在欢迎页检查快照对应的 IPA build，升级、换线或缓存到期时自动重新初始化资源，下载失败/取消仍保留旧快照。普通冷启动的过期刷新在后台执行，新快照供下次进入使用；也可在「版本与更新」手动重新初始化。
+「登录与账号 → 欢迎与恢复」通过 `app.recovery` 回到正常原生欢迎页，不记成启动失败、不删除账号。账号管理与面板资源分别处理：资源初始化、换线或软件检查不读写 token，快照与账号存储独立。首次、升级或启动失败可进入欢迎 / 恢复页；升级、换线、缺元数据或快照超过 24 小时会触发资源刷新，失败 / 取消保留旧快照。普通冷启动先用可用快照，过期刷新异步执行，新资源供下次进入使用；手动面板更新成功后重载当前页面，「版本与更新」也可重新初始化资源。未发布的工作树网页不会因此变成线上功能。
 
 诊断日志记录 App build、实际加载的网页 build、桥握手与受限错误码，不记录账号参数或 token。消息按本条 JSON 的保守字节上界计入 32MiB 在途预算，不按每个方法的最大包大小预占；普通读取与偏好写入可以同时受理，真正超出预算时仍拒绝并记录大小与数量。文档加载完成后仍继续观察业务就绪，避免卡住的骨架被误判成功；原生服务未就绪时会打开可复制/分享的诊断页，也可在「版本与更新 → 查看诊断日志」主动导出。
 
 ## 构建与发布（唯一路线：公开镜像仓库 CI）
 
-**构建只通过公开镜像仓库 [`lswlc33/zh-dashboard-ios-shell`](https://github.com/lswlc33/zh-dashboard-ios-shell) 的 GitHub Actions（macOS runner + 真实 Xcode）进行，只产出未签名（ad-hoc）IPA**，发布到该仓库的 Release。私有仓库（本仓库）是唯一源码来源，按白名单用 `tools/sync-public-ios.sh` 同步过去；公开仓库永远是投影，不在公开侧改代码。本仓库不再包含本地 Apple 构建入口，`build.sh` 只服务于 CI。
+**构建只通过公开镜像仓库 [`lswlc33/zh-dashboard-ios-shell`](https://github.com/lswlc33/zh-dashboard-ios-shell) 的 GitHub Actions（macOS runner + 真实 Xcode）进行，产出 ad-hoc 签名 IPA，不是 Apple 分发签名包**。私有仓库是唯一源码来源，按白名单用 `tools/sync-public-ios.sh` 同步；公开仓库是投影，不在公开侧维护业务源码。`build.sh` 服务于这条 CI 路线，Windows 不编译 Swift 或生成 IPA。
 
-CI 流程（`.github/workflows/build-ios.yml`）：源码契约检查（`python3 -I ios-shell/test.py`）→ Gradle 出 KMP framework → swiftc 编译 host / Shared / Widget appex → ad-hoc 由内到外签名 → 结构校验 → 发 Release（版本 / build / SHA-256 / sourceTreeSha256 记进 Release notes，`Update.swift` 解析）。
+CI 经源码契约检查、KMP framework 构建、Swift host / Shared / Widget 编译、由内到外 ad-hoc 签名与结构校验后，仅上传五个文件：`zeehowebnext.ipa`、`version2.json`、`build-manifest.json`、`source-commit.txt`、`SHA256SUMS`。不自动创建日期 pre-release，不持有产物仓库写密钥；CI 绿色或 artifact 存在不等于正式发布。
 
-不恢复本地 CI，不出正式签名的 IPA；TrollStore 侧载是唯一安装途径，兼容范围见 <https://github.com/opa334/TrollStore>。公开 App Group entitlement 模板不代表 Apple 授权已批准。
+版本与 build 唯一取自 host `Info.plist` 的 `CFBundleShortVersionString` / `CFBundleVersion`，打包时派生 Widget 同值；`--build-number` 只能断言一致，不覆盖版本，不从 CI run number 定号。每次获授权的正式迭代前，主会话核对真实已发包及烧号记录后递增两项；`1.1.0 (47)` 只是格式示例，实际版本由主发布会话定号，不继续沿用 1.0 发布新字节。
+
+主会话用当前可信 `tools/ios-release.mjs` / helper 复验下载的五文件、私有源码与公开 CI 双 SHA、白名单输入、包版本和高水位，再只将 `app/zeehowebnext.ipa`、`app/version2.json`、`app/icon-ios-1024.png` 移交到 `zeeho-3d-models`；图标直接取获批准源码的 `public/icons/icon-ios-1024.png`，不重新绘制。不动 Android 清单 / APK，不另建私有 IPA Release 备份；命令与失败恢复见 [iOS 发布规范](../docs/发布规范.md#ios-发布规范)。
+
+不恢复 Android CI，不出 Apple 分发签名 IPA；TrollStore 侧载是安装路线，兼容范围见 <https://github.com/opa334/TrollStore>。公开 App Group entitlement 模板不代表 Apple 授权已批准。
 
 ## 验证边界
 

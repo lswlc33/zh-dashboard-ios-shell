@@ -86,6 +86,10 @@ def main():
     helper_spec.loader.exec_module(helper)
     inputs = helper.inventory(repo)
     assert all(path.count('/') == 1 for path in inputs['swiftSources'])
+    # 新增更新业务源仍由 inventory 自动发现，不维护另一份硬编码上传表。
+    for name in ('UpdateService.swift', 'UpdateSourceViewController.swift'):
+        if (root / name).is_file():
+            assert 'ios-shell/' + name in inputs['swiftSources'], name
     assert inputs['sharedSwiftSources'] and inputs['widgetSwiftSources']
     assert 'ZeehoShared' not in inputs['sharedSwiftImports'] + inputs['widgetSwiftImports']
     assert not any(r['path'].endswith('-test.swift') or '/commonTest/' in r['path'] or '/jvmTest/' in r['path'] for r in inputs['files'])
@@ -116,20 +120,20 @@ def main():
     # 图标源必须真的存在，缺失时 build.sh 会 BLOCKED 退出。
     assert (repo / 'public/icons/icon-ios-1024.png').is_file()
 
-    # ③ CFBundleVersion 必须能被 --build-number 覆盖。
-    # 注意：绝不断言 plist 里的字面值不等于 1——本地不传参的构建会因此误杀；
-    # 要检查的是「覆盖链路存在」，不是「某个具体数字」。
-    assert '--build-number' in build_sh, 'build.sh 必须解析 --build-number'
-    assert 'prepare-plist' in build_sh, 'build.sh 必须调用 prepare-plist 展开 Info.plist'
-    # 只要求「plist_args 里追加了 --build-number 和某个变量」，不锁死变量名/引号写法，
-    # 免得并行改脚本时因为格式调整误报；真正要防的是「解析了参数但没传给 plist」。
-    assert re.search(r'plist_args\+=\s*\(\s*--build-number\s+"\$\{?[A-Za-z_][A-Za-z0-9_]*\}?"\s*\)', build_sh), \
-        'prepare-plist 调用必须带 --build-number 变量'
-    # 不传 --build-number 时的兜底必须是单调量：硬编码 1 会让 CI 永远「已是最新」。
-    assert re.search(r'git -C "\$repo_dir" rev-list --count HEAD', build_sh), '默认 build number 必须来自提交数'
+    # version/build 只由 host plist 决定；显式参数只能断言一致，不用 CI 运行次数抬号。
+    assert '--build-number' in build_sh and 'prepare-plist' in build_sh
+    assert 'build-number --source "$script_dir/Info.plist"' in build_sh
+    assert 'rev-list --count' not in build_sh and 'github.run_number' not in build_sh
     support_source = (root / 'build-support.py').read_text(encoding='utf-8')
     assert "p.add_argument('--build-number')" in support_source
-    assert "info['CFBundleVersion'] = args.build_number" in support_source
+    assert "args.build_number == info['CFBundleVersion']" in support_source
+    assert inputs['version'] == info['CFBundleShortVersionString']
+    assert inputs['sourceBuild'] == info['CFBundleVersion']
+    assert helper.IPA_NAME == 'zeehowebnext.ipa' and helper.VERSION_NAME == 'version2.json'
+    assert helper.PUBLISHED_ARTIFACTS == ('zeehowebnext.ipa', 'version2.json', 'build-manifest.json', 'source-commit.txt', 'SHA256SUMS')
+    assert helper.IPA_URL == 'https://zhb.xn--fiqz59cpva341l.top/app/zeehowebnext.ipa'
+    assert helper.RELEASE_NOTES == '解决了一些已知问题。\n\n目前软件处于快速更新迭代中，请及时更新并反馈问题'
+    assert 'dashboard-trollstore.ipa' not in build_sh
 
     # ④ 默认输出目录不能是固定 `dist/`：第二次构建必被 OUTPUT_ARTIFACT_EXISTS 拦下。
     assert 'date -u +%Y%m%d-%H%M%S' in build_sh, '默认输出目录必须带时间戳或用 --output-dir'
@@ -299,8 +303,11 @@ def main():
     commit = cache_code.split('private func commit(', 1)[1].split('\n    }', 1)[0]
     before_commit, after_commit = commit.split('try manager.moveItem(at: staging, to: current)', 1)
     committed, commit_failed = after_commit.split('} catch {', 1)
-    assert 'Self.writeMeta(root: root, build: build, line: IOSPanelLine.current.rawValue)' in committed, \
-        '新快照成功成为 current 后必须写入 meta'
+    assert 'Self.writeMeta(root: root, build: build, line: downloadLine.rawValue)' in committed, \
+        '新快照成功成为 current 后必须按实际下载线路写入 meta'
+    assert 'self.downloadLine = IOSPanelLine.current' in initialize and 'self.downloadLineRevision = IOSPanelLine.revision' in initialize
+    assert 'IOSPanelLine.current == downloadLine' in before_commit and 'IOSPanelLine.revision == downloadLineRevision' in before_commit, \
+        '发布快照前必须拒绝已切换线路或代次的旧下载'
     assert 'Self.writeMeta(' not in initialize + before_commit + commit_failed, \
         '下载或提交失败时不能写新 shellBuild，把旧快照伪装成已更新'
 
