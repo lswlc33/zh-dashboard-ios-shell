@@ -59,10 +59,15 @@ enum UpdateTest {
         let apiRelease = try IOSUpdater.releaseFromGitHubAPI(apiEnvelope(releaseBody(apiFields)))
         try expect(apiRelease.isNewer(version: "1.0.0", build: "99"))
         try expect(!apiRelease.isNewer(version: "1.0.1", build: "7"))
-        for missing in ["version", "build", "sha256", "size", "minimumIOS"] {
+        // version/build/sha256/size 四键缺一即拒；minimumIOS 缺省回落 15.4 是
+        // 解析器的设计行为（validate() 仍会校验其格式），不在这条拒绝清单里。
+        for missing in ["version", "build", "sha256", "size"] {
             var broken = apiFields; broken[missing] = nil
             rejects { try IOSUpdater.releaseFromGitHubAPI(apiEnvelope(releaseBody(broken))) }
         }
+        // minimumIOS 给了垃圾值时 validate() 必须拒。
+        var badMinimum = apiFields; badMinimum["minimumIOS"] = "15..4"
+        rejects { try IOSUpdater.releaseFromGitHubAPI(apiEnvelope(releaseBody(badMinimum))) }
         // 资产名不对 / body 缺键 / 正文值带垃圾，都不允许假成功。
         rejects {
             try IOSUpdater.releaseFromGitHubAPI(try! JSONSerialization.data(withJSONObject: [
