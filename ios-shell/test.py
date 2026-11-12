@@ -230,6 +230,31 @@ def main():
     assert 'contentLayoutGuide' not in recovery_code
     assert 'UIScrollView()' not in recovery_code
 
+    # viewDidLoad / viewWillAppear 都会刷新状态；自动下载只能每页一次，失败或取消不循环重试。
+    assert re.search(r'(?m)^\s*private\s+var\s+checkedCacheRefresh\s*=\s*false\b', recovery_code), \
+        '欢迎页必须持有初始为 false 的一次性刷新标记'
+    assert not re.search(r'(?m)^\s*(?:self\??\.)?checkedCacheRefresh\s*=\s*false\b', recovery_code), \
+        '本页不能重置 checkedCacheRefresh，否则返回页面会反复自动下载'
+    refresh_cache = recovery_code.split('private func refreshCache()', 1)[1].split('\n    }', 1)[0]
+    assert refresh_cache.index('cacheRefreshGeneration += 1') < refresh_cache.index('IOSPanelCache.shared.refresh'), \
+        '每次预检先推进代次，旧 ready 回执不得覆盖自动下载状态'
+    assert 'self.cacheRefreshGeneration == generation' in refresh_cache, \
+        '欢迎页只能渲染最新预检回执'
+    auto_refresh = re.search(
+        r'if\s+!self\.checkedCacheRefresh\s*,\s*!state\.busy\s*\{\s*'
+        r'self\.checkedCacheRefresh\s*=\s*true\s*'
+        r'if\s+state\.ready\s*,\s*IOSPanelCache\.shared\.needsRefresh\(\)\s*\{'
+        r'(.*?)\}\s*\}\s*self\.render\(state\)', refresh_cache, re.S)
+    assert auto_refresh, '自动刷新必须在非 busy 时先消费一次性标记，再检查 ready + needsRefresh'
+    automatic = auto_refresh.group(1)
+    assert 'IOSPanelCache.shared.initialize(force: false)' in automatic, \
+        '旧快照自动刷新必须调用非强制 initialize，使用共用的刷新判据'
+    assert automatic.index('self.render(IOSPanelCache.State(phase: .preparing))') < \
+        automatic.index('IOSPanelCache.shared.initialize(force: false)'), \
+        '自动下载前必须先渲染 preparing，不能让旧 ready 状态继续放行'
+    assert 'self?.render(next)' in automatic and automatic.rstrip().endswith('return'), \
+        '自动刷新要渲染下载回执并早退，不能再用旧 ready 状态覆盖进度'
+
     # 资源快照：清单与自定义 scheme 必须一致，否则本地页面缺资源。
     cache_code = strip_comments((root / 'PanelCache.swift').read_text(encoding='utf-8'))
     scheme_code = strip_comments((root / 'PanelSchemeHandler.swift').read_text(encoding='utf-8'))
@@ -239,6 +264,46 @@ def main():
     assert 'httpMaximumConnectionsPerHost' in cache_code
     # 进度要实时推给界面，不能只在最后回调一次。
     assert 'var onState' in cache_code and 'throttledEmit' in cache_code
+
+    # initialize 与对外 needsRefresh 共用 policy：有快照也不能跳过升级、过期或缺失元数据。
+    refresh_policy = cache_code.split('private static func needsRefresh(meta:', 1)[1].split('\n    }', 1)[0]
+    assert 'IOSPanelCachePolicy.needsRefresh(' in refresh_policy, '缓存刷新必须使用独立 policy'
+    for argument in ('downloadedAt: meta.downloadedAt', 'line: meta.line', 'shellBuild: meta.shellBuild',
+                     'currentLine: IOSPanelLine.current.rawValue', 'currentShellBuild: shellBuild',
+                     'now: Date().timeIntervalSince1970', 'maxAgeHours: maxAgeHours'):
+        assert argument in refresh_policy, '刷新 policy 缺少实际元数据或当前环境参数：' + argument
+    public_refresh = cache_code.split('func needsRefresh(maxAgeHours:', 1)[1].split('\n    }', 1)[0]
+    assert 'guard let meta = snapshotMeta() else { return true }' in public_refresh, \
+        '缺失元数据必须要求刷新'
+    assert 'Self.needsRefresh(meta: meta, maxAgeHours: maxAgeHours)' in public_refresh, \
+        '对外 needsRefresh 与 initialize 必须走同一刷新判据'
+    initialize = cache_code.split('func initialize(force:', 1)[1].split('\n    }', 1)[0]
+    assert re.search(r'let\s+refreshNeeded\s*=\s*meta\.map\s*\{\s*Self\.needsRefresh\(meta:\s*\$0\)\s*\}\s*\?\?\s*true', initialize), \
+        'initialize 必须用共用 policy 计算 refreshNeeded，缺 meta 时不能复用'
+    reuse = re.search(r'if\s+([^{}]*self\.snapshotDirectory\(\)\s*!=\s*nil)\s*\{([^{}]*)\}', initialize, re.S)
+    assert reuse and '!force' in reuse.group(1) and '!refreshNeeded' in reuse.group(1) and 'return' in reuse.group(2), \
+        'initialize 有快照时早退必须带 !refreshNeeded，不能只检查 !force 或 !lineChanged'
+
+    # shellBuild 是成功下载时的 IPA build，不是网页 version.json 的 build；旧记录缺字段时保留未知值。
+    snapshot_meta = cache_code.split('struct SnapshotMeta', 1)[1].split('\n    }', 1)[0]
+    assert re.search(r'var\s+shellBuild\s*:\s*String\s*=\s*""', snapshot_meta), \
+        'SnapshotMeta 必须保存下载时的 shellBuild，旧记录默认未知'
+    shell_build = cache_code.split('private static var shellBuild:', 1)[1].split('\n    }', 1)[0]
+    assert 'Bundle.main.infoDictionary?["CFBundleVersion"]' in shell_build, \
+        'shellBuild 必须来自当前 IPA 的 CFBundleVersion'
+    read_meta = cache_code.split('private static func readMeta(', 1)[1].split('\n    }', 1)[0]
+    assert 'meta.shellBuild = object["shellBuild"] as? String ?? ""' in read_meta, \
+        '读取 meta 必须恢复 shellBuild；旧字段缺失不能伪装成当前 build'
+    write_meta = cache_code.split('private static func writeMeta(', 1)[1].split('\n    }', 1)[0]
+    assert re.search(r'"shellBuild"\s*:\s*shellBuild\b', write_meta), '成功写入的 meta 必须包含当前 shellBuild'
+    commit = cache_code.split('private func commit(', 1)[1].split('\n    }', 1)[0]
+    before_commit, after_commit = commit.split('try manager.moveItem(at: staging, to: current)', 1)
+    committed, commit_failed = after_commit.split('} catch {', 1)
+    assert 'Self.writeMeta(root: root, build: build, line: IOSPanelLine.current.rawValue)' in committed, \
+        '新快照成功成为 current 后必须写入 meta'
+    assert 'Self.writeMeta(' not in initialize + before_commit + commit_failed, \
+        '下载或提交失败时不能写新 shellBuild，把旧快照伪装成已更新'
+
     assert 'zeeho-panel' in scheme_code
     assert 'didFailWithError' in scheme_code and 'resolvingSymlinksInPath' in scheme_code
     navigation = (root / 'Navigation.swift').read_text(encoding='utf-8')
@@ -289,7 +354,7 @@ def main():
     # build.sh 从 build-support.py 的 inventory 读文件表，所以检查 inventory 而不是 shell 脚本。
     # inventory 里的路径带 `ios-shell/` 前缀（相对仓库根）。
     listed = set(inputs['swiftSources'])
-    for name in ('RecoveryView.swift', 'PanelCache.swift', 'PanelSchemeHandler.swift',
+    for name in ('RecoveryView.swift', 'PanelCache.swift', 'PanelCachePolicy.swift', 'PanelSchemeHandler.swift',
                  'PanelLine.swift', 'PanelLineService.swift', 'Dashboard.swift',
                  'Diagnostics.swift', 'DiagnosticsViewController.swift', 'UpdatePanelViewController.swift'):
         assert f'ios-shell/{name}' in listed, name

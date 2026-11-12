@@ -10,6 +10,10 @@ final class RecoveryViewController: UIViewController {
     private var cacheState = IOSPanelCache.State()
     /// 上一次写进诊断日志的错误码，避免进度推送把同一行刷进日志几十次。
     private var lastLoggedErrorCode: String?
+    /// 本次欢迎页只自动更新一次；失败或取消后保留旧快照，由用户决定是否重试。
+    private var checkedCacheRefresh = false
+    /// 两个生命周期回调都可能预检；只接受最新一轮，不能让旧 ready 盖住下载中的状态。
+    private var cacheRefreshGeneration = 0
 
     // toolbar
     private let versionButton = UIButton(type: .system)
@@ -397,8 +401,22 @@ final class RecoveryViewController: UIViewController {
     // MARK: - 状态
 
     private func refreshCache() {
+        cacheRefreshGeneration += 1
+        let generation = cacheRefreshGeneration
         IOSPanelCache.shared.refresh { [weak self] state in
-            self?.render(state)
+            guard let self = self, self.cacheRefreshGeneration == generation else { return }
+            if !self.checkedCacheRefresh, !state.busy {
+                self.checkedCacheRefresh = true
+                // 升级后的欢迎页不能直接放行旧网页；下载期间显示真实进度，账号不动。
+                if state.ready, IOSPanelCache.shared.needsRefresh() {
+                    self.render(IOSPanelCache.State(phase: .preparing))
+                    IOSPanelCache.shared.initialize(force: false) { [weak self] next in
+                        self?.render(next)
+                    }
+                    return
+                }
+            }
+            self.render(state)
         }
     }
 
@@ -519,6 +537,7 @@ final class RecoveryViewController: UIViewController {
     // MARK: - 动作
 
     @objc private func initializeTapped() {
+        cacheRefreshGeneration += 1
         initializeButton.isEnabled = false
         IOSPanelCache.shared.initialize(force: true) { [weak self] state in
             self?.render(state)
@@ -526,6 +545,7 @@ final class RecoveryViewController: UIViewController {
     }
 
     @objc private func cancelTapped() {
+        cacheRefreshGeneration += 1
         IOSPanelCache.shared.cancel { [weak self] state in
             self?.render(state)
         }

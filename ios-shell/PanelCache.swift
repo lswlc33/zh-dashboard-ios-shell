@@ -90,6 +90,8 @@ final class IOSPanelCache {
         var line: String = ""
         /// 下载完成时间，毫秒时间戳；0 表示未知（旧版本留下的快照没有这个文件）。
         var downloadedAt: Int64 = 0
+        /// 成功下载时的 IPA build。覆盖安装保留旧文件，build 变化必须重新拉取网页。
+        var shellBuild: String = ""
     }
 
     private enum Failure: Error {
@@ -281,16 +283,22 @@ final class IOSPanelCache {
         return Self.readMeta(root: root)
     }
 
-    /// 快照是否该刷新了。三种情况返回 true：
-    ///   1. 元数据缺失（从没成功下载过，或旧版本快照没有 meta）；
-    ///   2. `downloadedAt` 超过 `maxAgeHours`；
-    ///   3. 元数据里的线路和当前线路不一致。
-    /// 这里只做判定，不发起网络请求：拉取与提交由上层（Dashboard / 欢迎页）决定。
+    /// 快照过期、换线、升级 IPA 或缺少元数据时都要重新下载。
+    /// 这里只做判定；初始化与欢迎页共用同一规则，避免发现过期后又因「有缓存」早退。
     func needsRefresh(maxAgeHours: Int = 24) -> Bool {
-        guard let meta = snapshotMeta(), meta.downloadedAt > 0 else { return true }
-        if meta.line != IOSPanelLine.current.rawValue { return true }
-        let age = Date().timeIntervalSince1970 - Double(meta.downloadedAt) / 1000
-        return age > Double(maxAgeHours) * 3600
+        guard let meta = snapshotMeta() else { return true }
+        return Self.needsRefresh(meta: meta, maxAgeHours: maxAgeHours)
+    }
+
+    private static var shellBuild: String {
+        Bundle.main.infoDictionary?["CFBundleVersion"] as? String ?? ""
+    }
+
+    private static func needsRefresh(meta: SnapshotMeta, maxAgeHours: Int = 24) -> Bool {
+        IOSPanelCachePolicy.needsRefresh(downloadedAt: meta.downloadedAt, line: meta.line,
+                                        shellBuild: meta.shellBuild, currentLine: IOSPanelLine.current.rawValue,
+                                        currentShellBuild: shellBuild, now: Date().timeIntervalSince1970,
+                                        maxAgeHours: maxAgeHours)
     }
 
     private static func readMeta(root: URL) -> SnapshotMeta? {
@@ -302,6 +310,7 @@ final class IOSPanelCache {
         var meta = SnapshotMeta()
         meta.build = object["build"] as? String ?? ""
         meta.line = object["line"] as? String ?? ""
+        meta.shellBuild = object["shellBuild"] as? String ?? ""
         if let number = object["downloadedAt"] as? NSNumber {
             meta.downloadedAt = number.int64Value
         }
@@ -313,6 +322,7 @@ final class IOSPanelCache {
         let object: [String: Any] = [
             "build": build,
             "line": line,
+            "shellBuild": shellBuild,
             // 毫秒：秒级精度在「刚下载完就判过期」的边界上容易误判。
             "downloadedAt": Int64(Date().timeIntervalSince1970 * 1000)
         ]
@@ -353,18 +363,17 @@ final class IOSPanelCache {
                 self.removeLeftovers(in: root)
 
                 let meta = Self.readMeta(root: root)
-                // 线路变了就整批当「必需重下」：旧快照的资源来自另一个源，
-                // 混合两份产物会出现引用对不上的空白，宁可整批失败也别交出半套。
-                // meta 缺失（旧版本留下的快照）不算线路变化——此时无从判断，
-                // 但 needsRefresh() 会把它判成过期，正常流程照样会重下。
+                // 线路变了就整批当「必需重下」，不交付混源快照。
                 let lineChanged = meta != nil && meta?.line != IOSPanelLine.current.rawValue
-                if !force, !lineChanged, self.snapshotDirectory() != nil {
+                let refreshNeeded = meta.map { Self.needsRefresh(meta: $0) } ?? true
+                if !force, !refreshNeeded, self.snapshotDirectory() != nil {
                     self.state.phase = .ready
                     self.state.build = self.snapshotBuild()
                     self.state.error = ""
                     self.emit(ticket, completion)
                     return
                 }
+                IOSDiagnostics.shared.log("panelCache: 下载快照 force=\(force) refresh=\(refreshNeeded) oldBuild=\(meta?.build ?? "unknown") shellBuild=\(Self.shellBuild) line=\(IOSPanelLine.current.rawValue)")
 
                 let staging = root.appendingPathComponent(".staging-" + UUID().uuidString, isDirectory: true)
                 try FileManager.default.createDirectory(at: staging, withIntermediateDirectories: true,
@@ -448,6 +457,7 @@ final class IOSPanelCache {
             state.phase = .ready
             state.build = build
             state.error = ""
+            IOSDiagnostics.shared.log("panelCache: 快照提交成功 build=\(build) shellBuild=\(Self.shellBuild)")
         } catch {
             if hadOld { try? manager.moveItem(at: backup, to: current) }
             try? manager.removeItem(at: staging)

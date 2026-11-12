@@ -28,6 +28,10 @@ final class IOSDiagnostics {
             manager.createFile(atPath: url.path, contents: nil)
         }
         write("=== session start \(Self.stamp()) ===")
+        let info = Bundle.main.infoDictionary ?? [:]
+        let version = info["CFBundleShortVersionString"] as? String ?? "unknown"
+        let build = info["CFBundleVersion"] as? String ?? "unknown"
+        write("app: version=\(version) build=\(build) os=\(ProcessInfo.processInfo.operatingSystemVersionString)")
     }
 
     /// 公开路径，供界面显示。

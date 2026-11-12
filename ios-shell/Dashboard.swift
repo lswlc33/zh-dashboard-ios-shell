@@ -195,6 +195,8 @@ final class PanelController: UIViewController, WKNavigationDelegate, WKUIDelegat
     private var localFallbackUsed = false
     private var bootWatchTimer: Timer?
     private var bootWatchTick = 0
+    private var bootWatchStartedAt: TimeInterval = 0
+    private var documentFinished = false
     /// 白屏诊断页只弹一次，别在每次看门狗探测时都弹。
     private var diagnosticsShown = false
     private var progressToken: NSKeyValueObservation?
@@ -379,7 +381,7 @@ final class PanelController: UIViewController, WKNavigationDelegate, WKUIDelegat
         // 进度日志按导航重置，否则第一次加载到 100% 之后，后续导航的 0→100
         // 全部落在阈值以下，唯一的「卡在哪」取证通道就失效了。
         lastLoggedProgress = -10
-        IOSDiagnostics.shared.log("preparePanel: url=\(url.absoluteString) target=\(target.absoluteString) local=\(usingLocalSnapshot)")
+        IOSDiagnostics.shared.log("preparePanel: url=\(url.absoluteString) target=\(target.absoluteString) local=\(usingLocalSnapshot) snapshotBuild=\(IOSPanelCache.shared.snapshotBuild())")
         bridge.prepareNavigation(to: target) { [weak self] result in
             guard let self = self else { return }
             switch result {
@@ -424,10 +426,8 @@ final class PanelController: UIViewController, WKNavigationDelegate, WKUIDelegat
 
     func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
         IOSDiagnostics.shared.log("didFinish: \(webView.url?.absoluteString ?? "nil")")
-        // 页面首帧就绪后清掉失败标记，下次冷启动直接进面板。
-        BootHealth.clear()
-        stopBootWatch()
-        // 诊断：didFinish 只代表文档加载完，不代表网页画出了内容。
+        // 文档下载完不等于业务就绪，先探测；仍卡骨架时保留有界诊断计时器。
+        documentFinished = true
         diagnoseIfBlank()
     }
 
@@ -445,7 +445,7 @@ final class PanelController: UIViewController, WKNavigationDelegate, WKUIDelegat
 
     // MARK: - 启动看门狗
 
-    /// 导航开始后每 2 秒探一次页面状态，最多 10 次（20 秒）。
+    /// 导航开始后每 2 秒探一次，文档完成但业务未就绪时继续，最多 40 秒。
     ///
     /// 为什么不能只靠 didFinish：真机上出现过 didCommit 成功、didFinish 永不触发
     /// 的情况（页面一直没进 load 完成态），那时所有挂在 didFinish 上的诊断都不会跑，
@@ -453,12 +453,14 @@ final class PanelController: UIViewController, WKNavigationDelegate, WKUIDelegat
     private func beginBootWatch() {
         stopBootWatch()
         bootWatchTick = 0
+        bootWatchStartedAt = ProcessInfo.processInfo.systemUptime
+        documentFinished = false
         scheduleBootWatch()
     }
 
     private func scheduleBootWatch() {
-        guard bootWatchTick < 10 else {
-            IOSDiagnostics.shared.log("bootWatch: 20 秒内未收到 didFinish，停止探测")
+        guard bootWatchTick < 20 else {
+            IOSDiagnostics.shared.log("bootWatch: 40 秒内业务尚未就绪，停止探测")
             return
         }
         bootWatchTick += 1
@@ -507,6 +509,14 @@ final class PanelController: UIViewController, WKNavigationDelegate, WKUIDelegat
               iosbrCandidate: !!(window.IOSBR && window.IOSBR.candidate && window.IOSBR.candidate()),
               iosbrAvailable: !!(window.IOSBR && window.IOSBR.available && window.IOSBR.available()),
               preview: window.__zeehoWebPreview === true,
+              panelBuild: (document.querySelector('meta[name="build"]') || {}).content || '',
+              apiSource: window.API ? window.API.source : '',
+              apiReady: !!(window.API && window.API.ready),
+              storeError: window.Store && window.Store.error ? window.Store.error() : '',
+              bootVisible: !!(document.getElementById('bootskel') || document.querySelector('.boot-skeleton')),
+              bootSettled: window.__zeehoBootSettled === true,
+              bootPercent: (document.getElementById('bootseg') || {}).getAttribute ? document.getElementById('bootseg').getAttribute('aria-valuenow') : '',
+              bootState: (document.getElementById('bootfallback') || {}).getAttribute ? document.getElementById('bootfallback').getAttribute('data-state') : '',
               hasZeehoShell: typeof window.ZeehoShell !== 'undefined',
               stage: !!document.querySelector('.stage'),
               phone: !!document.querySelector('.phone'),
@@ -533,6 +543,24 @@ final class PanelController: UIViewController, WKNavigationDelegate, WKUIDelegat
                   let data = text.data(using: .utf8),
                   let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return }
             let fatal = object["fatal"] as? Bool ?? false
+            let available = object["iosbrAvailable"] as? Bool ?? false
+            let preview = object["preview"] as? Bool ?? false
+            let settled = object["bootSettled"] as? Bool ?? false
+            let bootVisible = object["bootVisible"] as? Bool ?? false
+            if self.documentFinished, available, !preview, settled || !bootVisible {
+                BootHealth.clear()
+                self.stopBootWatch()
+            }
+            // 真实壳不能把桥失败说成正常演示；30 秒握手期限后把日志直接交给用户。
+            let watchAge = ProcessInfo.processInfo.systemUptime - self.bootWatchStartedAt
+            if watchAge >= 36, !available || preview, !self.diagnosticsShown {
+                self.diagnosticsShown = true
+                BootHealth.failed(reason: "ready_timeout")
+                self.stopBootWatch()
+                IOSDiagnostics.shared.log("[\(tag)] iOS 原生服务未就绪，打开诊断日志")
+                self.presentDiagnostics()
+                return
+            }
             if fatal, let detail = object["fatalText"] as? String, !detail.isEmpty {
                 self.showDiagnosticBanner(detail)
                 return

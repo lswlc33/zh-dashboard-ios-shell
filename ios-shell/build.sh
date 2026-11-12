@@ -137,6 +137,13 @@ else
     printf '%s\n' 'note: update-test 已跳过（缺 ios-shell/update-test.swift，上传快照不含 *-test.swift）'
 fi
 
+if [[ -f "$script_dir/panel-cache-policy-test.swift" ]]; then
+    xcrun swiftc "$script_dir/PanelCachePolicy.swift" "$script_dir/panel-cache-policy-test.swift" -o "$build_dir/panel-cache-policy-test"
+    "$build_dir/panel-cache-policy-test"
+else
+    printf '%s\n' 'note: panel-cache-policy-test 已跳过（缺 ios-shell/panel-cache-policy-test.swift）'
+fi
+
 gradle_args=(--project-dir "$shared_dir" --no-daemon --console=plain)
 if [[ "$offline" == true ]]; then gradle_args+=(--offline); fi
 # 原样传播 KMP 编译/链接失败；不捕获成成功，也不使用 canImport 假回退。

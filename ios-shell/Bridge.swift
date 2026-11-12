@@ -106,6 +106,8 @@ final class IOSBridge {
     private var foreground = UIApplication.shared.applicationState != .background
     private var generation = 0
     private var preparation = 0
+    /// 每轮导航只记有限条桥错误，不记录参数、token 或 nonce 值。
+    private var loggedFailures = 0
     private var epoch = 0
     private var session: Session?
     private var mediaReply: ((WKPermissionDecision) -> Void)?
@@ -182,6 +184,7 @@ final class IOSBridge {
         services.forEach { $0.navigationChanged() }
         generation += 1
         preparation += 1
+        loggedFailures = 0
         prepared = false
         navigationPermit = nil
         // 新一轮导航：清掉上一轮的重试计数与源码，避免旧导航的计数继续生效。
@@ -354,6 +357,9 @@ final class IOSBridge {
         let requestID = (args.first as? [String: Any])?["id"] as? String ?? ""
         guard message.name == IOSBridgePolicy.handlerName, message.webView === webView,
               object["nonce"] as? String == nonce, authorized(message.frameInfo) else {
+            let origin = message.frameInfo.securityOrigin
+            logFailure(method: method, code: "untrusted_document",
+                       detail: "main=\(message.frameInfo.isMainFrame) prepared=\(prepared) nonceMatch=\(object["nonce"] as? String == nonce) scheme=\(origin.protocol) host=\(origin.host) port=\(origin.port)")
             replyHandler(IOSBridgePolicy.failure(method: method, code: "untrusted_document", requestID: requestID), nil)
             return
         }
@@ -426,6 +432,7 @@ final class IOSBridge {
         switch reply.method {
         case "hello":
             guard reply.args.isEmpty else { reject(reply, "invalid_args"); return }
+            IOSDiagnostics.shared.log("bridge: hello 成功 generation=\(generation) storeReady=\(snapshot.readError == nil)")
             finish(reply, ["ok": true, "version": 1, "platform": "ios", "capabilities": capabilities])
         case "store.commit":
             guard reply.args.count == 1, let changes = reply.args.first as? [String: Any] else {
@@ -605,7 +612,15 @@ final class IOSBridge {
         }
     }
 
+    private func logFailure(method: String, code: String, detail: String = "") {
+        guard loggedFailures < 20 else { return }
+        loggedFailures += 1
+        let safeMethod = IOSBridgePolicy.methodName(method) ? method : "invalid"
+        IOSDiagnostics.shared.log("bridge: 拒绝 method=\(safeMethod) code=\(code) generation=\(generation) \(detail)")
+    }
+
     private func reject(_ reply: Pending, _ code: String) {
+        logFailure(method: reply.method, code: code)
         var failure = IOSBridgePolicy.failure(method: reply.method, code: code, requestID: reply.requestID)
         if reply.backgroundHandoff { failure["operationMayComplete"] = true }
         finish(reply, failure)
