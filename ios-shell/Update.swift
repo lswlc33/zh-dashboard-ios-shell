@@ -128,7 +128,9 @@ enum IOSUpdater {
               }) else { throw UpdateError.http }
         func field(_ key: String) -> String? {
             // 只认行首的 `key: value`，避免从正文里误抓数字。
-            let pattern = "(?m)^" + NSRegularExpression.escapedPattern(forKey: key) + R":\s*(\S+)"
+            // escapedPattern(for:) 是 NSRegularExpression 的类方法标签；
+            // `(?m)` 是 NSRegularExpression 支持的行内多行标志（JS 不认，别照抄）。
+            let pattern = "(?m)^" + NSRegularExpression.escapedPattern(for: key) + ":\\s*(\\S+)"
             guard let match = body.range(of: pattern, options: .regularExpression) else { return nil }
             return String(body[match]).split(separator: ":").last.map { String($0).trimmingCharacters(in: .whitespaces) }
         }
