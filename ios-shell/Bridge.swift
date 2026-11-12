@@ -372,6 +372,7 @@ final class IOSBridge {
             return
         }
         guard pending[id] == nil, pending.count < IOSBridgePolicy.maxPending else {
+            logFailure(method: method, code: "pending_limit", detail: "count=\(pending.count)")
             replyHandler(IOSBridgePolicy.failure(method: method, code: "pending_limit", requestID: requestID), nil)
             return
         }
@@ -379,16 +380,20 @@ final class IOSBridge {
             : (method == "txn.request" ? IOSBridgePolicy.maxRequestBytes
                : (method == "store.commit" ? IOSStore.maxArchiveBytes : IOSBridgePolicy.maxServiceBytes))
         let measuredSize: Int
-        do { measuredSize = try Self.measure(object, limit: limit) }
+        do { measuredSize = try IOSBridgeBudget.measure(object, limit: limit) }
         catch {
-            replyHandler(IOSBridgePolicy.failure(method: method, code: "request_too_large", requestID: requestID), nil)
+            let code = (error as? IOSBridgeBudget.Failure)?.code ?? "request_too_large"
+            logFailure(method: method, code: code)
+            replyHandler(IOSBridgePolicy.failure(method: method, code: code, requestID: requestID), nil)
             return
         }
-        // 同一串行 worker 验证尚未完成的消息先按方法上限预留，避免多条排队超出总内存预算。
-        let size = limit
-        guard measuredSize <= size, size <= IOSBridgePolicy.maxPendingBytes - pendingBytes,
+        // 按本条消息的保守 JSON 大小预留；按方法最大值预扣会让三条小请求就把 32MB 判满。
+        let size = measuredSize
+        guard size <= IOSBridgePolicy.maxPendingBytes - pendingBytes,
               !IOSBridgePolicy.fileMethods.contains(method)
                 || !pending.values.contains(where: { IOSBridgePolicy.fileMethods.contains($0.method) }) else {
+            logFailure(method: method, code: "pending_bytes_limit",
+                       detail: "pending=\(pendingBytes) incoming=\(size) count=\(pending.count)")
             replyHandler(IOSBridgePolicy.failure(method: method, code: "pending_bytes_limit", requestID: requestID), nil)
             return
         }
@@ -403,14 +408,18 @@ final class IOSBridge {
             var validatedBytes = size
             do {
                 validatedBytes = try IOSBridgePolicy.json(object, limit: limit).utf8.count
+                guard validatedBytes <= size else { throw IOSBridgePolicy.Failure("request_too_large") }
                 validationError = nil
             } catch { validationError = (error as? IOSBridgePolicy.Failure)?.code ?? "invalid_json" }
             DispatchQueue.main.async { [weak self, weak reply] in
                 guard let self = self, let reply = reply, self.isCurrent(reply) else { return }
+                if let error = validationError {
+                    self.reject(reply, error)
+                    return
+                }
                 self.pendingBytes += validatedBytes - reply.bytes
                 reply.bytes = validatedBytes
-                if let error = validationError { self.finish(reply, IOSBridgePolicy.failure(method: method, code: error, requestID: requestID)) }
-                else { self.dispatch(reply) }
+                self.dispatch(reply)
             }
         }
     }
@@ -708,31 +717,5 @@ final class IOSBridge {
         reply(decision)
     }
 
-    // 先按 UTF-8 和节点数保守预留内存，后台再核实际序列化大小；不递归无界对象。
-    private static func measure(_ object: Any, limit: Int) throws -> Int {
-        var total = 0
-        var nodes = 0
-        func visit(_ value: Any, depth: Int) throws {
-            nodes += 1
-            guard depth <= 20, nodes <= 20_000 else { throw IOSBridgePolicy.Failure("invalid_json") }
-            if let text = value as? String {
-                total += text.utf8.count + 2
-                for scalar in text.unicodeScalars {
-                    if scalar.value < 32 { total += 5 }
-                    else if scalar.value == 34 || scalar.value == 92 { total += 1 }
-                }
-            }
-            else if let array = value as? [Any] {
-                total += array.count + 2
-                for item in array { try visit(item, depth: depth + 1) }
-            } else if let dictionary = value as? [String: Any] {
-                total += dictionary.count * 4 + 2
-                for (key, item) in dictionary { total += key.utf8.count; try visit(item, depth: depth + 1) }
-            } else if value is NSNumber || value is NSNull { total += 24 }
-            else { throw IOSBridgePolicy.Failure("invalid_json") }
-            guard total <= limit else { throw IOSBridgePolicy.Failure("request_too_large") }
-        }
-        try visit(object, depth: 0)
-        return total
-    }
+    // 保留字节预留与序列化校验在独立 Foundation helper 中，真实 CI 可直接验证并发预算。
 }

@@ -144,6 +144,13 @@ else
     printf '%s\n' 'note: panel-cache-policy-test 已跳过（缺 ios-shell/panel-cache-policy-test.swift）'
 fi
 
+if [[ -f "$script_dir/bridge-budget-test.swift" ]]; then
+    xcrun swiftc "$script_dir/BridgeBudget.swift" "$script_dir/bridge-budget-test.swift" -o "$build_dir/bridge-budget-test"
+    "$build_dir/bridge-budget-test"
+else
+    printf '%s\n' 'note: bridge-budget-test 已跳过（缺 ios-shell/bridge-budget-test.swift）'
+fi
+
 gradle_args=(--project-dir "$shared_dir" --no-daemon --console=plain)
 if [[ "$offline" == true ]]; then gradle_args+=(--offline); fi
 # 原样传播 KMP 编译/链接失败；不捕获成成功，也不使用 canImport 假回退。

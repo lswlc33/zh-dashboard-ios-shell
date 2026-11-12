@@ -315,6 +315,46 @@ def main():
     # 线上基址可被线路切换覆写，但默认值仍是 GitHub Pages。
     assert 'https://lswlc33.github.io/zeeho-3d-models/' in navigation
 
+    # 小消息按真实 JSON 上界预留，而不是 txn/store 的 12MB/24MB 方法上限；
+    # Foundation 行为由 bridge-budget-test.swift 验证，这里只钉住生产桥确实接入它。
+    bridge_code = strip_comments((root / 'Bridge.swift').read_text(encoding='utf-8'))
+    receive = bridge_code.split('fileprivate func receive(', 1)[1].split('private func authorized(', 1)[0]
+    measurement = re.search(r'measuredSize\s*=\s*try\s+IOSBridgeBudget\.measure\(object,\s*limit:\s*limit\)', receive)
+    reservation_size = re.search(r'let\s+size\s*=\s*measuredSize\b', receive)
+    assert measurement and reservation_size and measurement.start() < reservation_size.start(), \
+        'receive 必须用 IOSBridgeBudget 测量本条消息，size = measuredSize 才能让小请求并发入队'
+    assert not re.search(r'\blet\s+size\s*=\s*limit\b|\bpendingBytes\s*\+=\s*limit\b|bytes:\s*limit\b', receive), \
+        '不能退回按方法上限预扣 pending 字节'
+    assert 'bytes: size' in receive and 'pendingBytes += size' in receive
+    assert receive.index('let size = measuredSize') < receive.index('pendingBytes += size') < receive.index('worker.async'), \
+        '必须在 worker 开始前按 measuredSize 预留整条消息'
+    assert re.search(r'size\s*<=\s*IOSBridgePolicy\.maxPendingBytes\s*-\s*pendingBytes', receive), \
+        'pending 字节闸门必须 overflow-safe，不能先相加再比较'
+    assert 'pending.count < IOSBridgePolicy.maxPending' in receive, '48 条 pending 闸门不能绕过'
+    assert '!pending.values.contains(where: { IOSBridgePolicy.fileMethods.contains($0.method) })' in receive, \
+        '文件消息的单条并发闸门不能放宽'
+    for selector in ('IOSBridgePolicy.maxFileEnvelopeBytes', 'IOSBridgePolicy.maxRequestBytes',
+                     'IOSStore.maxArchiveBytes', 'IOSBridgePolicy.maxServiceBytes'):
+        assert selector in receive, '本条消息仍必须遵守原方法上限：' + selector
+    worker = receive.split('worker.async', 1)[1]
+    assert re.search(r'validatedBytes\s*=\s*try\s+IOSBridgePolicy\.json\(object,\s*limit:\s*limit\)\.utf8\.count', worker), \
+        'worker 必须保留实际 JSON 编码与原 limit 校验'
+    validation_guard = re.search(r'guard\s+validatedBytes\s*<=\s*size\s+else\s*\{\s*throw\s+IOSBridgePolicy\.Failure\("request_too_large"\)\s*\}', worker)
+    shrink = re.search(r'self\.pendingBytes\s*\+=\s*validatedBytes\s*-\s*reply\.bytes', worker)
+    assert validation_guard and shrink and validation_guard.start() < shrink.start(), \
+        '实际 JSON 不能超过预留；只允许验证成功后缩小 pending 总量'
+    assert 'self.isCurrent(reply)' in worker and 'if let error = validationError' in worker
+    assert worker.index('self.reject(reply, error)') < shrink.start(), '验证失败必须释放原预留，不能先改账'
+    assert 'reply.bytes = validatedBytes' in worker and worker.index('reply.bytes = validatedBytes') < worker.index('self.dispatch(reply)')
+    assert 'pendingBytes -= reply.bytes' in bridge_code, '完成时必须释放更新后的实际字节数'
+    policy_code = strip_comments((root / 'BridgePolicy.swift').read_text(encoding='utf-8'))
+    for name, value in (('maxPending', '48'), ('maxRequestBytes', '12 * 1024 * 1024'),
+                        ('maxServiceBytes', '512 * 1024'), ('maxFileEnvelopeBytes', '28 * 1024 * 1024'),
+                        ('maxPendingBytes', '32 * 1024 * 1024')):
+        expression = r'\s*'.join(re.escape(part) for part in value.split())
+        assert re.search(r'static\s+let\s+' + name + r'\s*=\s*' + expression + r'\s*(?://[^\n]*)?$', policy_code, re.M), \
+            '修正预留不能放宽安全上限：' + name
+
     # 线路选择：五个同步方法齐全，begin 同步完成（与安卓现状一致）。
     line = (root / 'PanelLineService.swift').read_text(encoding='utf-8')
     for method in ('panelLineVersion', 'panelLineInfo', 'beginPanelLine', 'pollPanelLine', 'cancelPanelLine'):
@@ -355,7 +395,7 @@ def main():
     # inventory 里的路径带 `ios-shell/` 前缀（相对仓库根）。
     listed = set(inputs['swiftSources'])
     for name in ('RecoveryView.swift', 'PanelCache.swift', 'PanelCachePolicy.swift', 'PanelSchemeHandler.swift',
-                 'PanelLine.swift', 'PanelLineService.swift', 'Dashboard.swift',
+                 'PanelLine.swift', 'PanelLineService.swift', 'Dashboard.swift', 'BridgeBudget.swift',
                  'Diagnostics.swift', 'DiagnosticsViewController.swift', 'UpdatePanelViewController.swift'):
         assert f'ios-shell/{name}' in listed, name
     # 首屏骨架已由欢迎页取代，不能留孤儿文件。
