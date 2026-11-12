@@ -2,7 +2,17 @@ import Foundation
 import CryptoKit
 
 struct IOSRelease: Decodable {
+    // 清单与 IPA 的真实落点是公开壳仓库（zh-dashboard-ios-shell）的 Release 资产：
+    // CI 每次构建都把 `dashboard-trollstore.ipa` + `SHA256SUMS` 发到那里，
+    // 而 zeeho-3d-models 的 app/ios/ 目录自始至终不存在（实测三个源全 404）。
+    // 清单文件 version.json 由发布流程推到产物仓库 zeeho-3d-models/app/ios/
+    // （见 build-support.write-release 的字段，publish 由人工/脚本执行）；
+    // 在那份清单出现之前，这里优先走 Release 侧的 API 读取。
     static let root = URL(string: "https://raw.githubusercontent.com/lswlc33/zeeho-3d-models/main/app/ios/")!
+    // 公开壳仓库的最新 pre-release 资产直链（GitHub 会 302 到 objects.githubusercontent.com，
+    // checkResponse 会拒绝跨主机重定向，所以只用于清单兜底之外的 IPA 下载不做——
+    // IPA 下载仍走 root 的五个镜像，靠 sha256 校验兜住）。
+    static let releaseApi = URL(string: "https://api.github.com/repos/lswlc33/zh-dashboard-ios-shell/releases/latest")!
     static let bundleID = "io.github.lswlc33.dashboard.ios"
     let version: String
     let build: String
@@ -85,7 +95,7 @@ enum UpdateError: LocalizedError {
         switch self {
         case .invalidRelease: return "iOS 更新清单无效，已停止更新。"
         case .checksum: return "IPA 大小或 SHA-256 校验失败，请稍后重试。"
-        case .http: return "暂时无法读取 iOS 发布文件。若安装包 PR 尚未合并，请等待发布后重试。"
+        case .http: return "暂时无法读取 iOS 发布信息（三个来源都不可达）。请稍后重试，或到 GitHub Releases 页面手动下载。"
         case .systemTooOld: return "新版要求更高的 iOS 系统，当前设备无法安装。"
         case .tooLarge: return "更新文件超出大小限制，已停止更新。"
         }
@@ -95,11 +105,45 @@ enum UpdateError: LocalizedError {
 enum IOSUpdater {
     private static let session = URLSession(configuration: .ephemeral)
     // 小清单仅从官方 HTTPS 来源读取，第三方 CDN 只运输经过哈希校验的 IPA。
+    // 前两个源是产物仓库的 app/ios/version.json（发布流程负责推）；
+    // 第三个是公开壳仓库「最新 Release」的 API —— 资产名固定 dashboard-trollstore.ipa，
+    // Release body 附带 build-manifest 字段，从那里能拼出真实的下载地址与校验信息。
     static let metadataURLs = [
         IOSRelease.root.appendingPathComponent("version.json"),
         URL(string: "https://lswlc33.github.io/zeeho-3d-models/app/ios/version.json")!,
-        URL(string: "https://api.github.com/repos/lswlc33/zeeho-3d-models/contents/app/ios/version.json?ref=main")!
+        IOSRelease.releaseApi
     ]
+
+    /// 从 Release API 的 JSON 里挖出与 IOSRelease 兼容的清单。
+    /// Release body 由 CI 用 printf 写成固定几行：`version: x.y.z` / `build: n` /
+    /// `sha256: ...` / `size: n` / `minimumIOS: ...`（见 build-ios.yml 的 notes 生成段）。
+    /// 解不出来就抛 http，让调用方继续尝试下一个源。
+    /// internal 是为了 update-test.swift 能直接构造 body 做表驱动验证。
+    static func releaseFromGitHubAPI(_ bytes: Data) throws -> IOSRelease {
+        guard let object = try? JSONSerialization.jsonObject(with: bytes) as? [String: Any],
+              let body = object["body"] as? String,
+              let asset = (object["assets"] as? [[String: Any]])?.first(where: {
+                  ($0["name"] as? String) == "dashboard-trollstore.ipa"
+                      && (($0["state"] as? String) == "uploaded" || $0["state"] == nil)
+              }) else { throw UpdateError.http }
+        func field(_ key: String) -> String? {
+            // 只认行首的 `key: value`，避免从正文里误抓数字。
+            let pattern = "(?m)^" + NSRegularExpression.escapedPattern(forKey: key) + R":\s*(\S+)"
+            guard let match = body.range(of: pattern, options: .regularExpression) else { return nil }
+            return String(body[match]).split(separator: ":").last.map { String($0).trimmingCharacters(in: .whitespaces) }
+        }
+        guard let version = field("version"), let build = field("build"),
+              let sha256 = field("sha256"), let sizeText = field("size"), let size = Int(sizeText) else {
+            throw UpdateError.http
+        }
+        let release = IOSRelease(version: version, build: build,
+                                 bundleIdentifier: IOSRelease.bundleID,
+                                 minimumIOS: field("minimumIOS") ?? "15.4",
+                                 architecture: "arm64", installer: "TrollStore",
+                                 file: "dashboard-trollstore.ipa", size: size, sha256: sha256)
+        try release.validate()
+        return release
+    }
 
     private static func checkResponse(_ response: URLResponse, url: URL) throws {
         guard let http = response as? HTTPURLResponse, http.statusCode == 200,
@@ -117,8 +161,14 @@ enum IOSUpdater {
                 let (bytes, response) = try await session.data(for: request)
                 try checkResponse(response, url: url)
                 guard bytes.count <= 32_768 else { throw UpdateError.tooLarge }
-                let release = try JSONDecoder().decode(IOSRelease.self, from: bytes)
-                try release.validate()
+                // Release API 的 JSON 结构与 version.json 不同，按主机分流解析。
+                let release: IOSRelease
+                if url.host == "api.github.com" {
+                    release = try releaseFromGitHubAPI(bytes)
+                } else {
+                    release = try JSONDecoder().decode(IOSRelease.self, from: bytes)
+                    try release.validate()
+                }
                 return release
             } catch {
                 if Task.isCancelled { throw CancellationError() }

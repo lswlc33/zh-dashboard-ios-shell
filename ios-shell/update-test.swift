@@ -41,6 +41,36 @@ enum UpdateTest {
             assert(URLComponents(url: url, resolvingAgainstBaseURL: false)!.queryItems?.first?.value == release.sha256)
         }
         assert(IOSUpdater.metadataURLs.map { $0.host! } == ["raw.githubusercontent.com", "lswlc33.github.io", "api.github.com"])
+        // Release API 兜底源：CI 的 Release notes 里带机器可读段（version/build/sha256/
+        // size/minimumIOS），releaseFromGitHubAPI 从中拼出合法清单。五键缺一即拒。
+        func releaseBody(_ fields: [String: String]) -> String {
+            fields.map { "\($0.key): \($0.value)" }.sorted().joined(separator: "\n")
+        }
+        func apiEnvelope(_ body: String) -> Data {
+            try! JSONSerialization.data(withJSONObject: [
+                "body": body,
+                "assets": [["name": "dashboard-trollstore.ipa", "state": "uploaded"]]
+            ])
+        }
+        let apiFields = [
+            "version": "1.0.1", "build": "7", "sha256": good["sha256"] as! String,
+            "size": String(bytes.count), "minimumIOS": "15.4"
+        ]
+        let apiRelease = try IOSUpdater.releaseFromGitHubAPI(apiEnvelope(releaseBody(apiFields)))
+        try expect(apiRelease.isNewer(version: "1.0.0", build: "99"))
+        try expect(!apiRelease.isNewer(version: "1.0.1", build: "7"))
+        for missing in ["version", "build", "sha256", "size", "minimumIOS"] {
+            var broken = apiFields; broken[missing] = nil
+            rejects { try IOSUpdater.releaseFromGitHubAPI(apiEnvelope(releaseBody(broken))) }
+        }
+        // 资产名不对 / body 缺键 / 正文值带垃圾，都不允许假成功。
+        rejects {
+            try IOSUpdater.releaseFromGitHubAPI(try! JSONSerialization.data(withJSONObject: [
+                "body": releaseBody(apiFields),
+                "assets": [["name": "other.ipa", "state": "uploaded"]]
+            ]))
+        }
+        rejects { try IOSUpdater.releaseFromGitHubAPI(Data("not json".utf8)) }
         func rejects(_ action: () throws -> Void) {
             do { try action(); assertionFailure("invalid update accepted") } catch { }
         }

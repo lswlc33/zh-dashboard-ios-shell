@@ -53,6 +53,14 @@ if [[ -z "$output_dir" ]]; then output_dir="$script_dir/dist/$(date -u +%Y%m%d-%
 if [[ -z "$build_number" ]]; then
     build_number="$(git -C "$repo_dir" rev-list --count HEAD 2>/dev/null || true)"
     [[ "$build_number" =~ ^[1-9][0-9]*$ ]] || build_number=1
+    # 浅克隆（actions/checkout 默认 fetch-depth=1）下 rev-list 只数到 1，
+    # 会静默退化成「每次都是 build 1」——内置更新器从此永远「已是最新」。
+    # 这种情况必须喊出来，而不是让产物带着错误的 build 号悄无声息地发布。
+    if [[ "$build_number" == 1 ]] && git -C "$repo_dir" rev-parse --is-shallow-repository 2>/dev/null | grep -q true; then
+        printf '%s\n' 'BLOCKED: shallow clone makes `git rev-list --count HEAD` useless (always 1).' >&2
+        printf '%s\n' '        Pass --build-number explicitly (CI 用 github.run_number).' >&2
+        exit 2
+    fi
 fi
 if command -v python3 >/dev/null 2>&1; then
     python3 -I "$support" output-check --root "$repo_dir" --output "$output_dir" >/dev/null

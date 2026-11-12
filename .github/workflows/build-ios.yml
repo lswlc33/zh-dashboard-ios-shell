@@ -65,7 +65,12 @@ jobs:
           chmod +x native-shared/gradlew ios-shell/build.sh
           # 用 pipefail 保住 build.sh 的退出码；否则 tee 会把失败吞成成功。
           set -o pipefail
-          bash ios-shell/build.sh --output-dir "$RUNNER_TEMP/out" 2>&1 | tee build.log
+          # build 号必须显式传：checkout 是 fetch-depth=1 的浅克隆，
+          # build.sh 里的 `git rev-list --count HEAD` 兜底在浅仓库永远只数到 1，
+          # 内置更新器（isNewer 相同版本比 build）会因此永远「已是最新」。
+          # github.run_number 是仓库级单调递增计数器，正好当 build 号。
+          bash ios-shell/build.sh --output-dir "$RUNNER_TEMP/out" \
+            --build-number "${{ github.run_number }}" 2>&1 | tee build.log
 
       - name: 摘要编译错误
         if: failure()
@@ -112,10 +117,31 @@ jobs:
           if [[ -z "$VERSION" ]]; then VERSION="$(date -u +%Y%m%d-%H%M%S)"; fi
           TAG="ios-v${VERSION}"
           FINGERPRINT="$(python3 -I -c "import json;print(json.load(open('$RUNNER_TEMP/build-inputs.json')).get('sourceTreeSha256','unknown'))" 2>/dev/null || echo unknown)"
+          # 机器可读段（`key: value` 行首格式）由 App 内置更新器的
+          # releaseFromGitHubAPI 解析（Update.swift）：version/build/sha256/size/
+          # minimumIOS 五个键缺一不可，改格式要两边同步。
+          SHA="$(cut -d' ' -f1 "$RUNNER_TEMP/SHA256SUMS")"
+          SIZE="$(stat -f%z "$RUNNER_TEMP/out/dashboard-trollstore.ipa")"
+          # version/build 都从 IPA 里的 Info.plist 读，保证「清单说的」与「包里是」一致：
+          # version 是 CFBundleShortVersionString（x.y.z，isNewer 用语义化比较），
+          # build 是 CFBundleVersion（本步已显式传 --build-number，浅克隆也不会是 1）。
+          PLIST_INFO="$(python3 -I -c "
+import plistlib, zipfile
+with zipfile.ZipFile('$RUNNER_TEMP/out/dashboard-trollstore.ipa') as z:
+    info = plistlib.loads(z.read('Payload/Dashboard.app/Info.plist'))
+print(info['CFBundleShortVersionString'], info['CFBundleVersion'])
+")"
+          VERSION_FIELD="${PLIST_INFO% *}"
+          BUILD="${PLIST_INFO#* }"
           # 用 printf 拼多行 notes：避免 heredoc 缩进与 YAML 缩进互相干扰。
           NOTES_FILE="$RUNNER_TEMP/notes.md"
           {
             printf '未签名（ad-hoc）IPA，用于 TrollStore 侧载，不适用于 App Store 或普通自签安装。\n\n'
+            printf 'version: %s\n' "$VERSION_FIELD"
+            printf 'build: %s\n' "$BUILD"
+            printf 'sha256: %s\n' "$SHA"
+            printf 'size: %s\n' "$SIZE"
+            printf 'minimumIOS: 15.4\n\n'
             printf '`sourceTreeSha256`: `%s`\n' "$FINGERPRINT"
             printf '公开仓库 commit: `%s`\n' "${{ github.sha }}"
             printf '构建时间（UTC）: `%s`\n\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
