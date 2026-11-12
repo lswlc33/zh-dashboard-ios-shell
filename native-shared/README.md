@@ -64,7 +64,6 @@ cbf43926
 
 ## Apple 构建
 
-Mac 上才配置 `iosArm64` 与 `iosSimulatorArm64`，输出静态 `ZeehoShared` framework。设备包使用 `:linkReleaseFrameworkIosArm64`；完整流程由 `ios-shell/build.sh` 执行，不用单独拼接未验证框架。
-Windows 的对应 Apple 任务会明确失败，不能用空 framework 代替。Kotlin/Native 的最终 Apple framework 编译 / 链接仍需 macOS 与 Xcode，官方限制见 https://kotlinlang.org/docs/native-target-support.html 。这是 **KMP Apple 最终产物**的限制，不是「Windows / WSL 不能构建任何 iOS App」：Linux / WSL 上的 Swift 6.4+、xtool 1.24.0 与合法 SDK 可以构建 Swift App 和传统 WidgetKit extension。
+Mac 上才配置 `iosArm64` 与 `iosSimulatorArm64`，输出静态 `ZeehoShared` framework。设备包使用 `:linkReleaseFrameworkIosArm64`；完整流程由 `ios-shell/build.sh` 执行，不用单独拼接未验证框架。Windows 的对应 Apple 任务会明确失败，不能用空 framework 代替；Kotlin/Native 的最终 Apple framework 编译 / 链接仍需 macOS 与 Xcode，官方限制见 https://kotlinlang.org/docs/native-target-support.html 。
 
-本项目完整 xtool App 仍链接 `ZeehoShared`，须提供可信 Mac 实际生成的 `ZeehoShared.xcframework` 与当前 KMP 源码匹配的 manifest；入口检查模块 / 头文件、真实 arm64 iOS 对象与源码哈希。manifest 是构建输入记录，不代替产物来源可信度，也不生成 framework。当前用户没有 SDK 或该 Apple 产物，完整构建被阻塞；独立 `SwiftProbe` 不包含 KMP，也不能证明完整 App 可构建。步骤与签名边界见 [iOS 能力与 Windows 构建](../docs/iOS能力与Windows构建.md)。
+完整 App 链接 `ZeehoShared`，CI 上由 Gradle 任务真实生成该 framework，不做空 framework 回退。iOS 壳整体只通过公开镜像仓库 `zh-dashboard-ios-shell` 的 GitHub Actions 构建（未签名 ad-hoc IPA），边界见 [iOS 能力与构建路线](../docs/iOS能力与Windows构建.md)。

@@ -97,7 +97,7 @@ def main():
 
     # ② Shell 脚本必须按 LF 打包。read_text 会自动归一换行，撒谎，
     # 所以这里必须用 read_bytes 看真实工作树字节。
-    for name in ('ios-shell/build.sh', 'ios-shell/build-xtool.sh', 'native-shared/gradlew'):
+    for name in ('ios-shell/build.sh', 'native-shared/gradlew'):
         data = (repo / name).read_bytes()
         assert b'\r\n' not in data, name + ' 含 CRLF：bash 会把反斜杠续行打断'
     # .gitattributes 只在私有仓库根存在（公开镜像仓库是白名单复制，不带它）。
@@ -107,20 +107,6 @@ def main():
         attributes = attributes_path.read_text(encoding='utf-8')
         for rule in ('*.sh text eol=lf', '*/gradlew text eol=lf', 'ios-shell/*.py text eol=lf'):
             assert rule in attributes, rule
-
-    package = (root / 'Package.swift').read_text(encoding='utf-8')
-    assert '// swift-tools-version: 6.0' in package and 'swiftLanguageModes: [.v5]' in package
-    assert '.iOS("15.4")' in package and '.binaryTarget(name: "ZeehoShared", path: frameworkPath)' in package
-    assert 'dependencies: ["ZeehoSystemShared"]' in package and 'KMP_FRAMEWORK_MISSING' in package
-    assert 'canImport' not in package
-    config = (root / 'xtool.yml').read_text(encoding='utf-8')
-    assert 'product: DashboardIOS' in config and 'product: DashboardWidgets' in config
-    assert 'infoPath: Widgets/Info.plist' in config and 'entitlementsPath: XtoolSupport/Widgets.entitlements' in config
-    # ⑥ xtool 后端也必须用满出血图标，否则会重新引入「四角白边」。
-    # 只看 iconPath 那一行：注释里提到 icon-512.png（解释为什么不用它）是允许的。
-    icon_lines = [line.strip() for line in config.splitlines() if line.strip().startswith('iconPath:')]
-    assert icon_lines == ['iconPath: ../public/icons/icon-ios-1024.png'], \
-        'xtool.yml 的 iconPath 必须唯一且指向满出血图标，实际: ' + repr(icon_lines)
 
     # ① build.sh 必须真的用这张满出血图，且归上传白名单管。
     build_sh = (root / 'build.sh').read_text(encoding='utf-8')
@@ -158,7 +144,7 @@ def main():
     widget_id = bundle_id + '.widgets'
     assert helper.WIDGET_ID == widget_id and helper.APP_GROUP == app_group
     for name in ('App.entitlements', 'Widgets.entitlements'):
-        with (root / 'XtoolSupport' / name).open('rb') as f:
+        with (root / 'Entitlements' / name).open('rb') as f:
             entitlements = plistlib.load(f)
         assert entitlements.get('com.apple.security.application-groups') == [app_group], name
     assert app_group in (root / 'Shared/SystemSnapshotStore.swift').read_text(encoding='utf-8'), \

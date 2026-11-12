@@ -72,7 +72,7 @@ if [[ ! "$build_number" =~ ^[1-9][0-9]*$ ]]; then
 fi
 
 missing=()
-[[ "$(uname -s)" == Darwin ]] || missing+=('macOS (Darwin) for this Xcode backend; use build-xtool.sh for explicit Linux/WSL xtool')
+[[ "$(uname -s)" == Darwin ]] || missing+=('macOS (Darwin) for this Xcode backend')
 for tool in bash python3 java git xcrun xcodebuild codesign plutil zip sips file; do
     command -v "$tool" >/dev/null 2>&1 || missing+=("$tool")
 done
@@ -180,8 +180,8 @@ xcrun --sdk iphoneos swiftc -O -swift-version 5 -parse-as-library -application-e
 plist_args=(--source "$script_dir/Info.plist" --destination "$app_dir/Info.plist")
 if [[ -n "$build_number" ]]; then plist_args+=(--build-number "$build_number"); fi
 python3 -I "$support" prepare-plist "${plist_args[@]}"
-python3 -I "$script_dir/XtoolSupport/xtool-support.py" prepare-widget --source "$script_dir/Widgets/Info.plist" \
-    --host-info "$app_dir/Info.plist" --output "$widget_dir/Info.plist"
+python3 -I "$support" prepare-widget --source "$script_dir/Widgets/Info.plist" \
+    --host-info "$app_dir/Info.plist" --destination "$widget_dir/Info.plist"
 cp "$script_dir/bridge-bootstrap.js" "$app_dir/bridge-bootstrap.js"
 # iOS 自己会给 App 图标切圆角，源图必须是「满出血」的正方形：
 # 用普通 icon-512.png 会在四角留透明区（iOS 底下衬白/黑底 → 四角白边），
@@ -234,9 +234,9 @@ if [[ "$shared_kind" == dynamic ]]; then
     codesign --verify --strict "$app_dir/Frameworks/ZeehoShared.framework"
 fi
 # 两个真实 bundle 内到外签名。公开 App Group entitlement 不代表 Apple profile 已批准；不保证普通安装/TrollStore能力。
-codesign --force --sign - --timestamp=none --entitlements "$script_dir/XtoolSupport/Widgets.entitlements" --identifier io.github.lswlc33.dashboard.ios.widgets "$widget_dir"
+codesign --force --sign - --timestamp=none --entitlements "$script_dir/Entitlements/Widgets.entitlements" --identifier io.github.lswlc33.dashboard.ios.widgets "$widget_dir"
 codesign --verify --strict "$widget_dir"
-codesign --force --sign - --timestamp=none --entitlements "$script_dir/XtoolSupport/App.entitlements" --identifier io.github.lswlc33.dashboard.ios "$app_dir"
+codesign --force --sign - --timestamp=none --entitlements "$script_dir/Entitlements/App.entitlements" --identifier io.github.lswlc33.dashboard.ios "$app_dir"
 codesign --verify --deep --strict "$app_dir"
 file "$app_dir/Dashboard" | grep -q 'Mach-O 64-bit executable arm64'
 xcrun lipo "$app_dir/Dashboard" -verify_arch arm64

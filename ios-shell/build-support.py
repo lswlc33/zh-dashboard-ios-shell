@@ -28,18 +28,15 @@ FRAMEWORK_RELATIVE = 'native-shared/build/bin/iosArm64/releaseFramework/ZeehoSha
 WIDGET_ID = BUNDLE_ID + '.widgets'
 WIDGET_DIRECTORY = 'PlugIns/DashboardWidgets.appex/'
 APP_GROUP = 'group.io.github.lswlc33.dashboard.ios'
-# iOS 图标源：必须满出血（radius=0）、1024×1024。build.sh 与 xtool.yml 都指向它。
+# iOS 图标源：必须满出血（radius=0）、1024×1024。build.sh 指向它。
 IOS_ICON = 'public/icons/icon-ios-1024.png'
 # 归档进 zip 时必须是 LF 的脚本：CRLF 会让 Mac/Linux 的 bash 把 `\` 续行吃掉。
-SHELL_SCRIPTS = ('ios-shell/build.sh', 'ios-shell/build-xtool.sh', 'native-shared/gradlew')
+SHELL_SCRIPTS = ('ios-shell/build.sh', 'native-shared/gradlew')
 FIXED_INPUTS = {
     'ios-shell/Info.plist', 'ios-shell/build.sh', 'ios-shell/build-support.py',
     'ios-shell/test.py', 'ios-shell/bridge-bootstrap.js',
-    'ios-shell/Package.swift', 'ios-shell/xtool.yml', 'ios-shell/build-xtool.sh',
-    'ios-shell/XtoolSupport/xtool-support.py', 'ios-shell/XtoolSupport/xtool-wsl.ps1',
-    'ios-shell/XtoolSupport/App.entitlements', 'ios-shell/XtoolSupport/Widgets.entitlements',
-    'ios-shell/XtoolSupport/Probe.entitlements', 'ios-shell/XtoolSupport/SwiftProbe/Probe.swift',
-    'ios-shell/XtoolSupport/SwiftProbe/Info.plist', 'ios-shell/Widgets/Info.plist',
+    'ios-shell/Entitlements/App.entitlements', 'ios-shell/Entitlements/Widgets.entitlements',
+    'ios-shell/Widgets/Info.plist',
     'native-shared/build.gradle.kts', 'native-shared/settings.gradle.kts',
     'native-shared/gradlew', 'native-shared/gradle/wrapper/gradle-wrapper.jar',
     'native-shared/gradle/wrapper/gradle-wrapper.properties',
@@ -148,7 +145,7 @@ def public_input(name):
     if any(p.startswith('.') or p in {'private', 'config', 'node_modules', 'build', 'dist'} for p in parts):
         return False
     if parts[0] == 'ios-shell' and name.endswith('.swift') and not name.endswith('-test.swift'):
-        return (len(parts) == 2 and name != 'ios-shell/Package.swift') or (
+        return (len(parts) == 2) or (
             len(parts) == 3 and parts[1] in {'Shared', 'Widgets'})
     return (len(parts) >= 5 and parts[:2] == ('native-shared', 'src')
             and parts[2] in SOURCE_SETS and parts[3] == 'kotlin' and name.endswith('.kt')
@@ -199,7 +196,7 @@ def inventory(root, expected=None):
     for directory in ('', 'Shared', 'Widgets'):
         for path in (root / 'ios-shell' / directory).glob('*.swift'):
             name = path.relative_to(root).as_posix()
-            if path.name == 'Package.swift' or path.name.endswith('-test.swift'):
+            if path.name.endswith('-test.swift'):
                 continue
             require(public_input(name), 'Swift source outside public build paths: ' + name)
             names.add(name)
@@ -221,7 +218,7 @@ def inventory(root, expected=None):
     require(header.startswith(b'\x89PNG\r\n\x1a\n') and struct.unpack_from('>II', header, 16) == (1024, 1024),
             IOS_ICON + ' must be a 1024x1024 PNG (full-bleed, radius=0)')
     swift = sorted(n for n in names if n.startswith('ios-shell/') and n.endswith('.swift')
-                   and len(n.split('/')) == 2 and n != 'ios-shell/Package.swift')
+                   and len(n.split('/')) == 2)
     shared = sorted(n for n in names if n.startswith('ios-shell/Shared/') and n.endswith('.swift'))
     widgets = sorted(n for n in names if n.startswith('ios-shell/Widgets/') and n.endswith('.swift'))
     require(swift and len(shared) >= 3 and widgets, 'Host/Shared/Widgets sources missing; no replacement extension is generated')
@@ -238,7 +235,7 @@ def inventory(root, expected=None):
     require('ZeehoShared' not in target_modules['shared'] | target_modules['widgets'], 'Shared/Widgets must not import KMP')
     require({'SwiftUI', 'WidgetKit', 'ZeehoSystemShared'} <= target_modules['widgets'], 'Widget target/module contract is missing')
     for template in ('App.entitlements', 'Widgets.entitlements'):
-        with regular_source(root, 'ios-shell/XtoolSupport/' + template).open('rb') as stream:
+        with regular_source(root, 'ios-shell/Entitlements/' + template).open('rb') as stream:
             entitlements = plistlib.load(stream)
         require(entitlements == {'com.apple.security.application-groups': [APP_GROUP]}, 'Only the public App Group template may enter source archives')
     with regular_source(root, 'ios-shell/Widgets/Info.plist').open('rb') as stream:
@@ -294,11 +291,10 @@ def validate_output_directory(root, output):
         require(len(relative) >= 2 and relative[:2] in {('ios-shell', 'dist'), ('ios-shell', '.build-local')},
                 'OUTPUT_DIRECTORY_FORBIDDEN: only ios-shell/dist or .build-local may contain build output inside source')
     elif output.exists():
-        permitted = {'xtool-preflight.json', 'xtool-blocked.log', 'xtool-build.log'}
-        require(output.is_dir() and all(p.is_file() and p.name in permitted for p in output.iterdir()),
-                'OUTPUT_DIRECTORY_FORBIDDEN: external output must be new/empty or contain only this task blocking logs')
+        require(output.is_dir() and not any(output.iterdir()),
+                'OUTPUT_DIRECTORY_FORBIDDEN: external output must be a new/empty directory')
     if output.exists():
-        require(not any(p.name.endswith(('.app', '.appex', '.ipa')) or p.name in {'xtool-build-manifest.json', 'version.json', 'build-manifest.json'}
+        require(not any(p.name.endswith(('.app', '.appex', '.ipa')) or p.name in {'version.json', 'build-manifest.json'}
                         for p in output.iterdir()), 'OUTPUT_ARTIFACT_EXISTS: choose a fresh output directory; do not overwrite examined artifacts')
     return output
 
@@ -434,7 +430,7 @@ def extract_sources(archive_path, manifest_path, destination):
             target.parent.mkdir(parents=True, exist_ok=True)
             with target.open('xb') as stream:
                 stream.write(data)
-            target.chmod(0o755 if name.endswith(('/gradlew', '/build.sh', '/build-xtool.sh')) else 0o644)
+            target.chmod(0o755 if name.endswith(('/gradlew', '/build.sh')) else 0o644)
     inventory(destination, manifest)
     return manifest
 
@@ -579,7 +575,7 @@ def macho(data, expected_type, signed=True, expected_minimum=0x000F0400):
                 if symbol_type & 0x0E == 0x0E:
                     extension_entry_address = struct.unpack_from('<Q', data, symbol_offset + index * 16 + 8)[0]
                     widget_symbols.append(name.decode('utf-8'))
-            if symbol_type & 0x0E == 0x0E and name in (b'_main', b'_DashboardIOS_main', b'_SwiftProbe_main'):
+            if symbol_type & 0x0E == 0x0E and name in (b'_main', b'_Dashboard_main'):
                 main_symbols.append(name.decode('utf-8'))
         # 扩展的 LC_MAIN 通常落在 lazy 绑定的 `_NSExtensionMain` stub 上（真机产物实测），
         # 那种形态下符号表里只有 undef；这里用 __stubs + 间接符号表把入口解析回符号名。
@@ -672,92 +668,75 @@ def resolve_imports(reports, names, app_prefix=APP_PREFIX):
             raise ValueError('Unresolved/non-iOS dylib import in ' + name + ': ' + dependency)
 
 
-def validate_ipa(path, expected_info=None, backend='mac', probe=False):
+def validate_ipa(path, expected_info=None):
     path = pathlib.Path(path).resolve()
-    product = 'SwiftProbe' if probe else ('DashboardIOS' if backend == 'xtool' else 'Dashboard')
-    app_prefix = 'Payload/' + product + '.app/'
-    base_id = BUNDLE_ID + '.swiftprobe' if probe else BUNDLE_ID
+    product = 'Dashboard'
+    app_prefix = APP_PREFIX
+    base_id = BUNDLE_ID
     with checked_zip(path, MAX_IPA_BYTES) as archive:
         names = set(archive.namelist())
         require(all(n in ('Payload/', app_prefix) or n.startswith(app_prefix) for n in names), 'IPA contains files outside the expected app')
         require(not any(n.endswith(('.jks', '.p12', '.pem', '.key')) for n in names), 'IPA must not contain private signing material')
-        if backend == 'mac':
-            require(not any(n.endswith('.mobileprovision') for n in names), 'Ad-hoc IPA must not contain provisioning profiles')
+        require(not any(n.endswith('.mobileprovision') for n in names), 'Ad-hoc IPA must not contain provisioning profiles')
         info = plistlib.loads(archive.read(app_prefix + 'Info.plist'))
         actual_id = info.get('CFBundleIdentifier', '')
-        require(actual_id == base_id or (backend == 'xtool' and re.fullmatch(r'XTL-[A-Za-z0-9-]+\.' + re.escape(base_id), actual_id)), 'Unexpected bundle ID/prefix')
-        if probe:
-            require(info.get('ZeehoArtifactKind') == 'swift-toolchain-probe-not-full-app'
-                    and info.get('MinimumOSVersion') == MINIMUM_IOS and info.get('CFBundleExecutable') == product, 'Probe must remain explicitly separate from the full app')
-        else:
-            validate_info(info, executable=product, bundle_id=actual_id)
+        require(actual_id == base_id, 'Unexpected bundle ID/prefix')
+        validate_info(info, executable=product, bundle_id=actual_id)
         if expected_info:
             require(actual_id == expected_info['CFBundleIdentifier'] and info['CFBundleShortVersionString'] == expected_info['CFBundleShortVersionString'], 'Packaged version/bundle differs from source')
         resource_name = app_prefix + '_CodeSignature/CodeResources'
         require(resource_name in names, 'App resource code signature missing')
         require(isinstance(plistlib.loads(archive.read(resource_name)), dict), 'Invalid app resource signature')
-        # 两个后端都要查图标：xtool 后端同样产出一个可安装的 App 包，
-        # 绕过检查就会重新引入「四角白边」（xtool.yml 曾经指到带圆角的 icon-512.png）。
-        # probe 是明确声明的工具链探针（不是完整 App），不要求图标。
-        #
-        # 通用部分（两个后端）：包内必须存在图标 PNG，且每张都是正方形、边长 ≥ 60。
-        # mac 部分额外钉住 sips 产出的四个固定尺寸——那是 build.sh 的既有契约；
-        # 不在 xtool 上也写死 Icon{120,152,167,180}，因为图标产物命名由 xtool 决定，
-        # 写死名字只会在真实 xtool 产物上误杀。
-        if not probe:
-            icon_entries = sorted(
-                name for name in names
-                if name.startswith(app_prefix) and '/_CodeSignature/' not in name
-                and re.fullmatch(r'(?:Icon|AppIcon)[^/]*\.png', name.rsplit('/', 1)[-1]))
-            require(icon_entries, 'App bundle has no icon PNG; iOS would show a blank icon')
-            for name in icon_entries:
-                icon = archive.read(name)
-                require(icon.startswith(b'\x89PNG\r\n\x1a\n') and len(icon) >= 24, 'Invalid icon PNG: ' + name)
-                width, height = struct.unpack_from('>II', icon, 16)
-                require(width == height and width >= 60, 'Icon must be a square PNG at least 60px: ' + name)
-            if backend == 'mac':
-                for size in (120, 152, 167, 180):
-                    name = app_prefix + f'Icon{size}.png'
-                    require(name in names, f'Missing fixed icon size: Icon{size}.png')
-                    icon = archive.read(name)
-                    require(struct.unpack_from('>II', icon, 16) == (size, size), f'Icon{size}.png is not {size}x{size}')
-        bridge = b'' if probe else archive.read(app_prefix + 'bridge-bootstrap.js')
-        require(probe or bridge.strip(), 'bridge-bootstrap.js is missing/empty')
+        # 包内必须存在图标 PNG，且每张都是正方形、边长 ≥ 60；
+        # mac 后端额外钉住 sips 产出的四个固定尺寸——那是 build.sh 的既有契约。
+        icon_entries = sorted(
+            name for name in names
+            if name.startswith(app_prefix) and '/_CodeSignature/' not in name
+            and re.fullmatch(r'(?:Icon|AppIcon)[^/]*\.png', name.rsplit('/', 1)[-1]))
+        require(icon_entries, 'App bundle has no icon PNG; iOS would show a blank icon')
+        for name in icon_entries:
+            icon = archive.read(name)
+            require(icon.startswith(b'\x89PNG\r\n\x1a\n') and len(icon) >= 24, 'Invalid icon PNG: ' + name)
+            width, height = struct.unpack_from('>II', icon, 16)
+            require(width == height and width >= 60, 'Icon must be a square PNG at least 60px: ' + name)
+        for size in (120, 152, 167, 180):
+            name = app_prefix + f'Icon{size}.png'
+            require(name in names, f'Missing fixed icon size: Icon{size}.png')
+            icon = archive.read(name)
+            require(struct.unpack_from('>II', icon, 16) == (size, size), f'Icon{size}.png is not {size}x{size}')
+        bridge = archive.read(app_prefix + 'bridge-bootstrap.js')
+        require(bridge.strip(), 'bridge-bootstrap.js is missing/empty')
         binary_name = app_prefix + product
         reports = {binary_name: macho(archive.read(binary_name), 2)}
         main = reports[binary_name]
-        allowed_entrypoints = {'_main', '_' + product + '_main'} if backend == 'xtool' else {'_main'}
-        require(allowed_entrypoints.intersection(main['mainSymbols']), 'Host executable main/module entrypoint symbol missing')
+        require({'_main'}.intersection(main['mainSymbols']), 'Host executable main/module entrypoint symbol missing')
         signature_id = main['signature'].get('identifier')
         require(signature_id == actual_id, 'CodeDirectory identifier must match actual Info.plist bundle ID')
         widget_prefix = app_prefix + WIDGET_DIRECTORY
         widget_binary = widget_prefix + 'DashboardWidgets'
-        if probe:
-            require(not any('.appex' in n or 'ZeehoShared' in n for n in names), 'Probe must not contain a fake widget/KMP bundle')
-        else:
-            require(widget_binary in names, 'Expected real PlugIns/DashboardWidgets.appex executable is missing')
-            require(all('.appex' not in n or n.startswith(widget_prefix) for n in names), 'Unexpected extension bundle')
-            widget_info = plistlib.loads(archive.read(widget_prefix + 'Info.plist'))
-            require(widget_info.get('CFBundlePackageType') == 'XPC!' and widget_info.get('CFBundleExecutable') == 'DashboardWidgets'
-                    and widget_info.get('CFBundleIdentifier') == actual_id + '.widgets'
-                    and widget_info.get('NSExtension', {}).get('NSExtensionPointIdentifier') == 'com.apple.widgetkit-extension'
-                    and 'EXAppExtensionAttributes' not in widget_info, 'Invalid WidgetKit appex identity/extension point')
-            require(widget_info.get('CFBundleVersion') == info['CFBundleVersion']
-                    and widget_info.get('CFBundleShortVersionString') == info['CFBundleShortVersionString'], 'Host/appex version mismatch')
-            require(widget_prefix + '_CodeSignature/CodeResources' in names, 'Widget resource signature missing')
-            reports[widget_binary] = macho(archive.read(widget_binary), 2)
-            widget = reports[widget_binary]
-            # 只「导入」_NSExtensionMain 不算数（旧实现在任何 Objective-C 依赖都会带上这个 undef），
-            # 必须同时满足：符号真的是入口目标，且 LC_MAIN 正好落在它的定义地址或它的 stub 上。
-            require(widget['extensionEntrypointSymbols']
-                    and widget['extensionEntryAddress'] is not None
-                    and widget['entryAddress'] == widget['extensionEntryAddress']
-                    and widget['signature'].get('identifier') == widget_info['CFBundleIdentifier'],
-                    'Widget _NSExtensionMain must be the real LC_MAIN entrypoint and match the signature identity')
-            require(widget['sharedClassSymbolCount'] == 0 and not any('ZeehoShared.framework' in i['path'] for i in widget['imports']), 'KMP must not be linked into Widgets')
-            for code in (main, widget):
-                groups = code['signature'].get('entitlements', {}).get('com.apple.security.application-groups')
-                require(groups == [APP_GROUP], 'App/Widget signature is missing the matching App Group template; this is not proof of provisioning approval')
+        require(widget_binary in names, 'Expected real PlugIns/DashboardWidgets.appex executable is missing')
+        require(all('.appex' not in n or n.startswith(widget_prefix) for n in names), 'Unexpected extension bundle')
+        widget_info = plistlib.loads(archive.read(widget_prefix + 'Info.plist'))
+        require(widget_info.get('CFBundlePackageType') == 'XPC!' and widget_info.get('CFBundleExecutable') == 'DashboardWidgets'
+                and widget_info.get('CFBundleIdentifier') == actual_id + '.widgets'
+                and widget_info.get('NSExtension', {}).get('NSExtensionPointIdentifier') == 'com.apple.widgetkit-extension'
+                and 'EXAppExtensionAttributes' not in widget_info, 'Invalid WidgetKit appex identity/extension point')
+        require(widget_info.get('CFBundleVersion') == info['CFBundleVersion']
+                and widget_info.get('CFBundleShortVersionString') == info['CFBundleShortVersionString'], 'Host/appex version mismatch')
+        require(widget_prefix + '_CodeSignature/CodeResources' in names, 'Widget resource signature missing')
+        reports[widget_binary] = macho(archive.read(widget_binary), 2)
+        widget = reports[widget_binary]
+        # 只「导入」_NSExtensionMain 不算数（旧实现在任何 Objective-C 依赖都会带上这个 undef），
+        # 必须同时满足：符号真的是入口目标，且 LC_MAIN 正好落在它的定义地址或它的 stub 上。
+        require(widget['extensionEntrypointSymbols']
+                and widget['extensionEntryAddress'] is not None
+                and widget['entryAddress'] == widget['extensionEntryAddress']
+                and widget['signature'].get('identifier') == widget_info['CFBundleIdentifier'],
+                'Widget _NSExtensionMain must be the real LC_MAIN entrypoint and match the signature identity')
+        require(widget['sharedClassSymbolCount'] == 0 and not any('ZeehoShared.framework' in i['path'] for i in widget['imports']), 'KMP must not be linked into Widgets')
+        for code in (main, widget):
+            groups = code['signature'].get('entitlements', {}).get('com.apple.security.application-groups')
+            require(groups == [APP_GROUP], 'App/Widget signature is missing the matching App Group template; this is not proof of provisioning approval')
         for name in sorted(names):
             if name.endswith('/') or name in reports:
                 continue
@@ -770,54 +749,21 @@ def validate_ipa(path, expected_info=None, backend='mac', probe=False):
             elif data.startswith((b'\xcf\xfa\xed\xfe', b'\xfe\xed\xfa\xcf', b'\xca\xfe\xba\xbe', b'!<arch>\n')):
                 raise ValueError('Unexpected executable/archive in IPA: ' + name)
         dynamic = app_prefix + 'Frameworks/ZeehoShared.framework/ZeehoShared'
-        linkage = 'none' if probe else 'static'
-        if not probe:
-            if dynamic in reports:
-                require(any(i['path'].endswith('/ZeehoShared.framework/ZeehoShared') for i in main['imports']), 'Embedded ZeehoShared is not linked')
-                require(reports[dynamic]['sharedClassSymbolCount'] > 0, 'Dynamic KMP framework has no real classes')
-                linkage = 'dynamic'
-            else:
-                require(main['sharedClassSymbolCount'] > 0, 'KMP_FRAMEWORK_MISSING: no real ZeehoShared classes linked into app')
+        linkage = 'static'
+        if dynamic in reports:
+            require(any(i['path'].endswith('/ZeehoShared.framework/ZeehoShared') for i in main['imports']), 'Embedded ZeehoShared is not linked')
+            require(reports[dynamic]['sharedClassSymbolCount'] > 0, 'Dynamic KMP framework has no real classes')
+            linkage = 'dynamic'
+        else:
+            require(main['sharedClassSymbolCount'] > 0, 'KMP_FRAMEWORK_MISSING: no real ZeehoShared classes linked into app')
         resolve_imports(reports, names, app_prefix)
-        return {'info': info, 'linkage': linkage, 'machO': reports, 'artifactKind': 'swift-probe' if probe else 'full-app',
+        return {'info': info, 'linkage': linkage, 'machO': reports, 'artifactKind': 'full-app',
                 'bridgeSha256': hashlib.sha256(bridge).hexdigest(),
                 'executableSha256': hashlib.sha256(archive.read(binary_name)).hexdigest()}
 
 
 def verify_artifacts(path, expected_info=None, source_manifest=None):
     path = pathlib.Path(path).resolve()
-    if path.name in {'dashboard-xtool.ipa', 'swift-probe.ipa'}:
-        probe = path.name == 'swift-probe.ipa'
-        report = validate_ipa(path, expected_info, backend='xtool', probe=probe)
-        manifest = load_json(path.parent / 'xtool-build-manifest.json')
-        digest = sha256_file(path)
-        require(manifest.get('backend') == 'xtool' and manifest.get('schemaVersion') == 1
-                and manifest.get('artifactKind') == report['artifactKind'], 'xtool artifact kind/backend mismatch')
-        require(manifest.get('file') == path.name and manifest.get('ipaSha256') == digest
-                and manifest.get('ipaSize') == path.stat().st_size and manifest.get('machO') == report['machO']
-                and manifest.get('bundleIdentifier') == report['info']['CFBundleIdentifier'], 'xtool artifact hash/Mach-O/actual bundle ID mismatch')
-        tools, sdk = manifest.get('tools', {}), manifest.get('sdk', {})
-        require('1.24.0' in tools.get('xtool', {}).get('text', '') and tools.get('swift', {}).get('code') == 0
-                and sdk.get('id') == 'darwin' and sdk.get('root'), 'Actual xtool/Swift/darwin SDK metadata is missing')
-        require(manifest.get('appleCryptographicVerification') is False and manifest.get('appGroupProvisioningVerified') is False
-                and manifest.get('deviceInstalled') is False and manifest.get('authenticationAttempted') is False
-                and manifest.get('trollStoreCompatibility') == 'unverified', 'Do not claim unperformed Apple signing/profile/device verification')
-        require((path.parent / 'SHA256SUMS').read_text(encoding='utf-8') == digest + '  ' + path.name + '\n', 'xtool checksum sidecar mismatch')
-        if not probe:
-            records = manifest.get('sourceInputs', [])
-            require(records and all(public_input(r['path']) for r in records)
-                    and tree_digest(records) == manifest.get('sourceTreeSha256'), 'xtool source manifest mismatch')
-            bridge = next((r for r in records if r['path'] == 'ios-shell/bridge-bootstrap.js'), None)
-            require(bridge and bridge['sha256'] == report['bridgeSha256'], 'xtool packaged bridge differs from source')
-            kmp = manifest.get('kmp', {})
-            require(kmp.get('module') == 'ZeehoShared' and kmp.get('architectures') == ['arm64']
-                    and kmp.get('platform') == 'iOS' and kmp.get('linkage') == report['linkage']
-                    and re.fullmatch(r'[0-9a-f]{64}', kmp.get('binarySha256', ''))
-                    and tree_digest(kmp.get('sourceInputs', [])) == kmp.get('sourceTreeSha256'), 'xtool KMP binary/source contract is missing')
-            if source_manifest:
-                approved = load_json(source_manifest)
-                require(approved.get('files') == records and approved.get('sourceTreeSha256') == manifest['sourceTreeSha256'], 'xtool source differs from approved snapshot')
-        return report
     report = validate_ipa(path, expected_info)
     metadata, manifest = load_json(path.parent / 'version.json'), load_json(path.parent / 'build-manifest.json')
     require((path.parent / 'version.json').stat().st_size <= 32_768, 'Release metadata exceeds Update.swift size limit')
@@ -912,6 +858,23 @@ def write_release(ipa, inputs_path, framework, app):
     return metadata
 
 
+def prepare_widget_info(source, destination, host):
+    """由 host Info.plist 派生 Widget appex 的 Info.plist。
+
+    版本/build 号必须与 host 完全一致：内置更新器按 CFBundleVersion 比新旧，
+    appex 与 host 不一致时 widget 侧会停留在旧版本数据上。
+    """
+    with pathlib.Path(source).open('rb') as stream:
+        info = plistlib.load(stream)
+    info.update({'CFBundleName': 'DashboardWidgets', 'CFBundleExecutable': 'DashboardWidgets',
+                 'CFBundleIdentifier': host['CFBundleIdentifier'] + '.widgets', 'CFBundlePackageType': 'XPC!',
+                 'CFBundleShortVersionString': host['CFBundleShortVersionString'], 'CFBundleVersion': host['CFBundleVersion'],
+                 'MinimumOSVersion': '15.4', 'CFBundleSupportedPlatforms': ['iPhoneOS']})
+    require(info.get('NSExtension', {}).get('NSExtensionPointIdentifier') == 'com.apple.widgetkit-extension', 'Widget Info.plist must be supplied by its source owner')
+    with pathlib.Path(destination).open('wb') as stream:
+        plistlib.dump(info, stream)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     commands = parser.add_subparsers(dest='command', required=True)
@@ -947,6 +910,10 @@ def main():
     p.add_argument('--source', required=True)
     p.add_argument('--destination', required=True)
     p.add_argument('--build-number')
+    p = commands.add_parser('prepare-widget')
+    p.add_argument('--source', required=True)
+    p.add_argument('--destination', required=True)
+    p.add_argument('--host-info', required=True)
     p = commands.add_parser('write-release')
     p.add_argument('--ipa', required=True)
     p.add_argument('--inputs', required=True)
@@ -989,6 +956,10 @@ def main():
         validate_info(info)
         with pathlib.Path(args.destination).open('wb') as stream:
             plistlib.dump(info, stream)
+    elif args.command == 'prepare-widget':
+        with pathlib.Path(args.host_info).open('rb') as stream:
+            host = plistlib.load(stream)
+        prepare_widget_info(args.source, args.destination, host)
     elif args.command == 'write-release':
         value = write_release(args.ipa, args.inputs, args.framework, args.app)
         print(f"Verified real arm64 TrollStore IPA: {value['file']} ({value['sha256']})")

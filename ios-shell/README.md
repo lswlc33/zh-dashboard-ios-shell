@@ -1,6 +1,4 @@
-# 几何面板 iOS（TrollStore）
-
-Windows 可以经 **WSL / Linux、Swift 6.4+、xtool 1.24.0 和合法 iPhoneOS SDK** 构建 Swift iOS App 与传统 WidgetKit extension；完整面板还需可信 Mac 实际构建的 KMP Apple XCFramework。**2026-11-11 本轮新源码尚未发布**，WSL 功能已启用但待用户重启，专用 distro / 工具链未装，用户没有 SDK 或 KMP Apple 产物。构建入口仅完成阻塞预检（exit 2），未执行真实 xtool 命令、Swift 编译、IPA 或 iPhone / iPad 验收。步骤见 [iOS 能力与 Windows 构建](../docs/iOS能力与Windows构建.md)。
+# 几何面板 iOS 壳
 
 Swift UIKit + WKWebView 在线面板壳，固定打开 `https://lswlc33.github.io/zeeho-3d-models/`。网页是 App 内唯一业务 UI 与官方 API 请求签名实现；Swift 提供系统服务，[KMP 核心](../native-shared/README.md) 提供协议、数值与历史算法，不使用 Compose Multiplatform UI 或 Skia。IPA 不内置本轮网页快照，首次启动需联网；构建脚本不发布网页。
 
@@ -24,50 +22,24 @@ Swift UIKit + WKWebView 在线面板壳，固定打开 `https://lswlc33.github.i
 
 ## iOS 软件更新与面板更新
 
-顶部“软件更新”读取官方仓库 `main/app/ios/version.json`，不请求 Android 版本或 APK。清单从 GitHub raw / Pages / API 依次读取；IPA 使用 ghfast、gh-proxy、GitHub raw、jsDelivr、Pages。镜像失败、旧缓存或校验不符会换源，第三方镜像不提供可信版本清单。
+顶部“软件更新”读取官方仓库 Release 的机器可读清单（`releaseFromGitHubAPI`），不请求 Android 版本或 APK。IPA 使用 ghfast、gh-proxy、GitHub raw、jsDelivr、Pages 镜像下载。镜像失败、旧缓存或校验不符会换源，第三方镜像不提供可信版本清单。
 
 启动自动检查，也可手动检查；比较 iOS 版本与 build，拒绝降级及不支持当前系统的包。下载后核对大小和 SHA-256，再交系统分享菜单，由用户选择 TrollStore 并确认覆盖安装，不是静默安装。初始信任依赖固定官方 HTTPS，SHA-256 是完整性校验，不是独立发布者签名。
 
-顶部“刷新面板”重新加载在线网页，不能把本工作树未发布的页面变成线上功能。保持原 Bundle ID 的覆盖安装可延用原 App 网页空间，不迁移 Safari 数据；旧 1.0.0 首次须手动安装带更新入口的 1.0.1。
+顶部“刷新面板”重新加载在线网页，不能把本工作树未发布的页面变成线上功能。保持原 Bundle ID 的覆盖安装可延用原 App 网页空间，不迁移 Safari 数据。
 
-## 构建与发布
+## 构建与发布（唯一路线：公开镜像仓库 CI）
 
-GitHub Actions 已停用，本轮不恢复。Windows 本地源码 / JVM 测试使用已有 JDK 21、Python 3.9+ 和缓存 Gradle 9.6.1：
+**构建只通过公开镜像仓库 [`lswlc33/zh-dashboard-ios-shell`](https://github.com/lswlc33/zh-dashboard-ios-shell) 的 GitHub Actions（macOS runner + 真实 Xcode）进行，只产出未签名（ad-hoc）IPA**，发布到该仓库的 Release。私有仓库（本仓库）是唯一源码来源，按白名单用 `tools/sync-public-ios.sh` 同步过去；公开仓库永远是投影，不在公开侧改代码。本仓库不再包含本地 Apple 构建入口，`build.sh` 只服务于 CI。
 
-```powershell
-powershell -NoProfile -File D:/zeeho-ios-20261110/source/ios-shell/build-windows.ps1 `
-  -Mode Test -GradleUserHome C:/Users/lswlc/.gradle `
-  -PythonPath C:/Users/lswlc/AppData/Local/Programs/Python/Python312/python.exe
-```
+CI 流程（`.github/workflows/build-ios.yml`）：源码契约检查（`python3 -I ios-shell/test.py`）→ Gradle 出 KMP framework → swiftc 编译 host / Shared / Widget appex → ad-hoc 由内到外签名 → 结构校验 → 发 Release（版本 / build / SHA-256 / sourceTreeSha256 记进 Release notes，`Update.swift` 解析）。
 
-`Test` 只执行源码检查与真实离线 `:jvmTest`，不编译 Swift。默认 `Preflight` 检查传统 Mac 后端；WSL 路线须显式选择：
-
-```powershell
-powershell -NoProfile -File D:/zeeho-ios-20261110/source/ios-shell/build-windows.ps1 `
-  -Mode XtoolPreflight -WslDistribution Zeeho-iOS -Product DashboardIOS
-
-# 独立 UIKit / WebKit 探针，不是完整 App；当前无 SDK，入口仍被阻塞。
-powershell -NoProfile -File D:/zeeho-ios-20261110/source/ios-shell/build-windows.ps1 `
-  -Mode XtoolBuild -WslDistribution Zeeho-iOS -Product SwiftProbe `
-  -OutputDirectory D:/zeeho-ios-20261110/environment/artifacts/swift-probe
-```
-
-`DashboardIOS` 构建须另给真实 `-KmpXCFramework`、`-KmpManifest` 与已有 SDK 的 `-SwiftSDKRoot`。`Package.swift` 将 host `DashboardIOS`、共享模块 `ZeehoSystemShared`、Widget product `DashboardWidgets` 分开；独立 `SwiftProbe` 无 KMP、业务、appex 或真实账号共享。构建实际调用 `xtool dev build --configuration release`，不加 `--sign`，不登录或安装设备，不杜撰 `--no-install` / `--skip-signing`。
-
-完整 Xcode / 已接受许可、JDK 21、Python 3.9+ 齐备的 Mac 可用现有后端；把路径换成该 Mac 的源码绝对路径：
-
-```bash
-bash /path/to/dashboard/ios-shell/build.sh
-```
-
-脚本先生成真实 KMP device framework，再编译 Swift host / shared / Widget appex，由内到外 ad-hoc 签名并校验；失败不写替代包。成功后才输出 `dashboard-trollstore.ipa` 与匹配 `version.json`、构建 / 源码摘要、`SHA256SUMS`。xtool 路线另用 `dashboard-xtool.ipa` / `swift-probe.ipa` 和 `xtool-build-manifest.json`，不冒充 TrollStore 更新清单。
-
-普通开发 / 正式签名仍须有效身份、匹配 profile / entitlements 和群组权限；ad-hoc 包不是任意 iPhone 都能安装，TrollStore 兼容范围见 <https://github.com/opa334/TrollStore>。当前 App Group、Apple 验签与安装均未验证。远程 Mac 后端还需另行确认源码外传，并显式选择 `-Mode Build -MacHost -AllowSourceUpload`；默认入口不外传、登录、重启或自动安装工具 / SDK。
+不恢复本地 CI，不出正式签名的 IPA；TrollStore 侧载是唯一安装途径，兼容范围见 <https://github.com/opa334/TrollStore>。公开 App Group entitlement 模板不代表 Apple 授权已批准。
 
 ## 验证边界
 
 2026-11-10 第一阶段记录：Windows `Test` exit 0、KMP JVM **9 tests / 0 failures / 0 errors / 0 skipped**、iOS 网页桥 / 存储 / 设备 UI **21 组**、旧入口 **31 组**，以及 Android debug 与离线原生回归。旧 31 组对应当时的下载导流契约，已被新入口规则替代，不能当新预览通过证据。
 
-2026-11-11 第二阶段有限 8 脚本：七个计数组共 **149 case groups**（4 + 4 + 6 + 15 + 16 + 90 + 14），model-smoke 原断言另通过；均为真实 JS 的离线 Node VM / linkedom / 合成 WK 检查，不是 iPhone。官方 Browser Skill / IAB 本机预览看到两种 only 标签、不可执行的系统活动按钮与 Android Widget 预览，性能资源记录未见实际 `tapi` / H5 请求。最后 changed JS 语法及 `python -I test.py` source contracts 通过；完整网页回归、发布和最终本地网页构建产物验证不在该结果内。完整计数、入口与未测项见 [验证记录](../docs/iOS能力与Windows构建.md#验证记录)。
+2026-11-11 第二阶段有限 8 脚本：七个计数组共 **149 case groups**（4 + 4 + 6 + 15 + 16 + 90 + 14），model-smoke 原断言另通过；均为真实 JS 的离线 Node VM / linkedom / 合成 WK 检查，不是 iPhone。完整计数、入口与未测项见 [验证记录](../docs/iOS能力与Windows构建.md#验证记录)。
 
-2026-11-11 两个 xtool `XtoolBuild` 入口均在预检返回 **exit 2**：这是阻塞报告，不是 Swift 编译或构建成功。尚无 framework / IPA、Apple 验签、iPhone / iPad 安装、实际 WebKit / Keychain / 权限 / BLE / GPS / Widget / ActivityKit 或实车验收。实际 IPA 字节与设备安装占用仍待测量，不作体积、性能或 App Store 上架承诺。
+CI 出的 ad-hoc IPA 通过了 ZIP / Mach-O / appex / 签名结构校验，但 Apple 加密验签、iPhone / iPad 安装、实际 WebKit / Keychain / 权限 / BLE / GPS / Widget / ActivityKit 或实车验收仍以真机记录为准；离线与 CI 检查不能代替。

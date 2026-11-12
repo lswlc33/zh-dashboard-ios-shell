@@ -1,11 +1,7 @@
 ﻿[CmdletBinding()]
 param(
-    [ValidateSet('Preflight', 'Test', 'Build', 'XtoolPreflight', 'XtoolBuild')]
+    [ValidateSet('Preflight', 'Test', 'Build')]
     [string]$Mode = 'Preflight',
-    [ValidatePattern('^[A-Za-z0-9][A-Za-z0-9_.-]*$')]
-    [string]$WslDistribution = 'Zeeho-iOS',
-    [ValidateSet('DashboardIOS', 'SwiftProbe')]
-    [string]$Product = 'DashboardIOS',
     [string]$KmpXCFramework,
     [string]$KmpManifest,
     [string]$SwiftSDKRoot,
@@ -19,17 +15,6 @@ param(
 # 只读：不启动 Gradle、不下载工具、不探测 SSH 网络、不改全局配置。
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
-if ($Mode -in @('XtoolPreflight', 'XtoolBuild')) {
-    if ($MacHost -or $AllowSourceUpload) { throw 'xtool preflight is local WSL-only; remote/upload parameters are not accepted.' }
-    $arguments = @{ Mode = 'Preflight'; WslDistribution = $WslDistribution; Product = $Product }
-    if ($KmpXCFramework) { $arguments.KmpXCFramework = $KmpXCFramework }
-    if ($KmpManifest) { $arguments.KmpManifest = $KmpManifest }
-    if ($SwiftSDKRoot) { $arguments.SwiftSDKRoot = $SwiftSDKRoot }
-    if ($PythonPath) { $arguments.PythonPath = $PythonPath }
-    if ($AsJson) { $arguments.AsJson = $true }
-    & (Join-Path $PSScriptRoot 'XtoolSupport\xtool-wsl.ps1') @arguments
-    exit $LASTEXITCODE
-}
 $repoRoot = [System.IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..'))
 $sharedRoot = Join-Path $repoRoot 'native-shared'
 $checks = New-Object System.Collections.Generic.List[object]
@@ -116,7 +101,7 @@ if ($pythonOK -and $git -and (Test-Path -LiteralPath (Join-Path $PSScriptRoot 'b
 }
 
 $appleMissing = @(
-    'macOS (Darwin) for the default Xcode backend; use explicit XtoolPreflight/XtoolBuild for WSL',
+    'macOS (Darwin) for the Xcode backend; build only via the public mirror repo CI (macos runner)',
     'Full Xcode with iPhoneOS SDK and accepted license/first-launch setup',
     'Xcode xcrun/swiftc, swift-stdlib-tool, lipo and otool',
     'macOS codesign, plutil, sips, file, zip and /usr/libexec/PlistBuddy',

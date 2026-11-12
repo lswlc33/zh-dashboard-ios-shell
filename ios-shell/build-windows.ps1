@@ -1,11 +1,7 @@
 ﻿[CmdletBinding()]
 param(
-    [ValidateSet('Preflight', 'Test', 'Build', 'XtoolPreflight', 'XtoolBuild')]
+    [ValidateSet('Preflight', 'Test', 'Build')]
     [string]$Mode = 'Preflight',
-    [ValidatePattern('^[A-Za-z0-9][A-Za-z0-9_.-]*$')]
-    [string]$WslDistribution = 'Zeeho-iOS',
-    [ValidateSet('DashboardIOS', 'SwiftProbe')]
-    [string]$Product = 'DashboardIOS',
     [string]$KmpXCFramework,
     [string]$KmpManifest,
     [string]$SwiftSDKRoot,
@@ -26,18 +22,6 @@ param(
 # 本机 Test 仅使用现有缓存 --offline；不安装 Xcode/JDK/Gradle，不恢复 GitHub Actions。
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
-if ($Mode -in @('XtoolPreflight', 'XtoolBuild')) {
-    if ($MacHost -or $AllowSourceUpload -or $SshIdentityFile) { throw 'xtool is local WSL-only; remote/upload parameters are not accepted.' }
-    $arguments = @{ Mode = $(if ($Mode -eq 'XtoolBuild') { 'Build' } else { 'Preflight' }); WslDistribution = $WslDistribution; Product = $Product }
-    if ($KmpXCFramework) { $arguments.KmpXCFramework = $KmpXCFramework }
-    if ($KmpManifest) { $arguments.KmpManifest = $KmpManifest }
-    if ($SwiftSDKRoot) { $arguments.SwiftSDKRoot = $SwiftSDKRoot }
-    if ($OutputDirectory) { $arguments.OutputDirectory = $OutputDirectory }
-    if ($BuildNumber) { $arguments.BuildNumber = $BuildNumber }
-    if ($PythonPath) { $arguments.PythonPath = $PythonPath }
-    & (Join-Path $PSScriptRoot 'XtoolSupport\xtool-wsl.ps1') @arguments
-    exit $LASTEXITCODE
-}
 $repoRoot = [System.IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..'))
 $sharedRoot = Join-Path $repoRoot 'native-shared'
 $support = Join-Path $PSScriptRoot 'build-support.py'
