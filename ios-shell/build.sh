@@ -46,9 +46,9 @@ if [[ -z "$output_dir" ]]; then output_dir="$script_dir/dist/$(date -u +%Y%m%d-%
 [[ "$output_dir" = /* ]] || output_dir="$PWD/$output_dir"
 # 先读唯一版本源；即使显式传参，也只能与 host 一致，浅克隆不再影响版本。
 if command -v python3 >/dev/null 2>&1; then
-    version_args=()
+    version_args=(build-number --source "$script_dir/Info.plist")
     if [[ -n "$build_number" ]]; then version_args+=(--build-number "$build_number"); fi
-    build_number="$(python3 -I "$support" build-number --source "$script_dir/Info.plist" "${version_args[@]}")"
+    build_number="$(python3 -I "$support" "${version_args[@]}")"
     python3 -I "$support" output-check --root "$repo_dir" --output "$output_dir" >/dev/null
 fi
 if [[ -n "$source_manifest" && "$source_manifest" != /* ]]; then source_manifest="$PWD/$source_manifest"; fi
