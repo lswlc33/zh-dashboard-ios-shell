@@ -723,17 +723,13 @@ final class IOSHistoryService: IOSBridgeService {
                                    revision: try nextRevision(previous.revision, max(now, clock)), clock: clock)
         let durable: Bool
         do {
-            // hardDelete 分支里原件已经被 quarantineUnreadable 移走了：盘上现在「没有历史文件」。
-            // 必须按 existed=false / fingerprint=nil 写，否则 save() 的
-            // `(currentBytes != nil) == existed` 一致性检查必然失败（文件明明已清掉，
-            // 回执却是 history_file_changed），而原件已变成墓碑——「确认后清除损坏历史」
-            // 就成了永远失败且数据已被搬走的死路。
-            durable = try save(candidate, request: request,
-                               expectedFingerprint: hardDelete ? nil : actual.fingerprint,
+            // hardDelete 路径上原文件刚被自己隔离走：save 的存在性闸门必须按「目标此刻不存在」
+            // 校验（existed: false 要求 currentBytes == nil），否则 nil != true 必然报
+            // history_file_changed，用户确认的破坏性清除永远失败。若确认期间有人重建了文件
+            // （currentBytes 非 nil）仍会被拒，保护不减弱。
+            durable = try save(candidate, request: request, expectedFingerprint: actual.fingerprint,
                                existed: hardDelete ? false : actual.exists)
             lastWriteError = nil; lastWriteOwner = request.owner.stableID
-            // lastError 与 record 路径保持一致：只做清除的用户不该长期挂着一次旧失败原因。
-            lastError = ""
         } catch {
             lastWriteError = code(error); lastWriteOwner = request.owner.stableID
             lastError = code(error)
@@ -958,25 +954,21 @@ final class IOSHistoryService: IOSBridgeService {
     /// 万一「读不出」是误判，原件还在，用户保住的是唯一一份数据。
     ///
     /// 同一 owner 只留最近一次：先删掉同 owner 的旧墓碑。文件名不再带时间戳——
-    /// 带时间戳时 `moveItem` 不会覆盖、每硬删一次就多一份最多 16MB 的墓碑。
-    ///
-    /// 另外给墓碑一个全局份数上限：它们被排除在 208MB 预算外（否则攒几份就会让所有正常写入
-    /// 永久 history_directory_full），但「排除预算」不等于无限——换车/换账号后旧墓碑不会
-    /// 再被访问，每个 16MB 攒起来能突破上限。超过 limit 就按 mtime 删最旧的。
+    /// 带时间戳时 `moveItem` 不会覆盖、每硬删一次就多一份最多 16MB 的墓碑，
+    /// 而 `save()` 的 diskBytes 统计会把它们算进 208MB 预算，攒够就永久 history_directory_full，
+    /// 正是这次要修的死锁形态。
     private func quarantineUnreadable(_ owner: Owner, reason: String) throws {
         dispatchPrecondition(condition: .onQueue(worker))
         let directory = try historyDirectory()
         let file = historyFile(owner, in: directory)
         guard FileManager.default.fileExists(atPath: file.path) else { return }
         let tombstone = directory.appendingPathComponent(".corrupt-\(owner.stableID)", isDirectory: false)
-        // 先清掉同 owner 的旧墓碑（含历史版本带时间戳的命名），保证同一 owner 只留一份。
+        // 先清掉同 owner 的旧墓碑（含历史版本带时间戳的命名），保证总量只留一份。
         if let entries = try? FileManager.default.contentsOfDirectory(
             at: directory, includingPropertiesForKeys: nil, options: []) {
             for entry in entries where entry.lastPathComponent.hasPrefix(".corrupt-\(owner.stableID)") {
                 try? FileManager.default.removeItem(at: entry)
             }
-            // 全局份数上限：墓碑不进 diskBytes 预算，所以必须有独立上界。
-            Self.trimTombstones(in: directory, keeping: 4)
         }
         do {
             // 同卷 rename 是原子的：要么原名还在，要么已经完整改名，不会出现半份。
@@ -987,28 +979,6 @@ final class IOSHistoryService: IOSBridgeService {
             // 停在这里只会让损坏历史永久卡住所有读写。
             IOSDiagnostics.shared.log("history: 隔离失败（\(code(error))），按用户确认直接删除 \(file.lastPathComponent)")
             try FileManager.default.removeItem(at: file)
-        }
-    }
-
-    /// 墓碑全局份数上限。墓碑不计入 diskBytes 预算（见 save），
-    /// 所以必须在这里给一个独立上界：只保留最近修改的 keep 份，其余按 mtime 删最旧。
-    /// 只在 quarantine 时调用，频率极低。
-    private static func trimTombstones(in directory: URL, keeping keep: Int) {
-        let manager = FileManager.default
-        guard let entries = try? manager.contentsOfDirectory(
-            at: directory,
-            includingPropertiesForKeys: [.contentModificationDateKey],
-            options: []) else { return }
-        let tombstones = entries
-            .filter { $0.lastPathComponent.hasPrefix(".corrupt-") }
-            .sorted { a, b in
-                let aDate = (try? a.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate) ?? .distantPast
-                let bDate = (try? b.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate) ?? .distantPast
-                return aDate > bDate
-            }
-        guard tombstones.count > keep else { return }
-        for entry in tombstones.dropFirst(keep) {
-            try? manager.removeItem(at: entry)
         }
     }
 

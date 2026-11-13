@@ -15,11 +15,6 @@ final class IOSDiagnostics {
     private let rotatedURL: URL?
     /// 主文件上限。超过就滚到 `-1.log`（覆盖上一份），保证总量不超过 2 倍。
     private static let maxBytes = 512 * 1024
-    /// 上次轮转失败的时间。失败后 60 秒内不再尝试，避免「每写一行就重试一次」的自激循环
-    /// （主文件超限 → 写一行 → 又超限 → 再轮转 → 再失败）。
-    /// 只在 queue 上访问，不需要额外加锁。
-    private var rotateFailedAt: Date?
-    private static let rotateRetryInterval: TimeInterval = 60
 
     private init() {
         let manager = FileManager.default
@@ -79,10 +74,6 @@ final class IOSDiagnostics {
                 try? handle.close()
             }
             guard needsRotate else { return }
-            // 轮转失败后退避：主文件停在超限状态，每一行都会重新触发 rotate()。
-            // 60 秒内只试一次，否则失败原因（-1.log 是目录/删不掉）会变成无限重试。
-            if let failedAt = self.rotateFailedAt,
-               Date().timeIntervalSince(failedAt) < Self.rotateRetryInterval { return }
             self.rotate()
         }
     }
@@ -125,14 +116,9 @@ final class IOSDiagnostics {
         }
         // move 失败 = 旧备份清不掉/被占用：放弃本次轮转，主文件原样保留。
         guard (try? manager.moveItem(at: url, to: rotated)) != nil else {
-            // 绝不能在这里走 write()/log() 记一行：主文件仍然超过 maxBytes，那一行写完
-            // 又会让 needsRotate 成立 → 再次 rotate() → 再次失败，形成自激循环
-            // （串行队列永远有活、日志每圈长一行、read() 被饿死）。
-            // 失败状态只在内存里记时间戳，由 rotateFailedAt 控制重试频率。
-            rotateFailedAt = Date()
+            IOSDiagnostics.shared.log("diagnostics: 轮转失败，-1.log 无法替换，本次不轮转（主日志保留）")
             return
         }
-        rotateFailedAt = nil
         // move 已成功，主文件路径现在是空的：这里才允许创建新文件。
         guard manager.createFile(atPath: url.path, contents: nil),
               let data = marker.data(using: .utf8),

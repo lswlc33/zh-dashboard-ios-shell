@@ -299,6 +299,8 @@ final class IOSNativeAssetService: IOSBridgeCancellableService {
                 guard !j.busy, !j.reading, j.error.isEmpty, let package = j.package, let handle = j.handle else { throw IOSWallpaperError("asset_not_ready") }
                 let offset = try IOSWallpaperJSON.integer(object["offset"], max: package.size)
                 let length = try IOSWallpaperJSON.integer(object["length"], min: 1, max: 65536)
+                // offset 已到文件尾：length≥1 的要求无解，回明确错误而不是空 payload+eof 的边角语义。
+                guard offset < package.size else { throw IOSWallpaperError("invalid_offset") }
                 j.reading = true
                 worker.async { [weak self] in
                     guard let self = self else { return }
@@ -335,7 +337,10 @@ final class IOSNativeAssetService: IOSBridgeCancellableService {
     }
     private func fail(_ j: Job, _ error: Error) {
         guard current(j) else { return }
+        // 句柄先收：fail 后 job 未必马上 cancel，文件描述符别悬到那时才释放。
+        if let handle = j.handle { try? handle.close(); j.handle = nil }
         j.busy = false; j.error = code(error); j.package = nil; j.token.cancel()
+        // download.cancel 的完成回调负责清临时目录；这里只取消。
         let download = j.download; j.download = nil
         if let download = download { download.cancel() }
     }

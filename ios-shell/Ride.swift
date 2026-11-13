@@ -140,6 +140,11 @@ private enum IOSRideDisk {
     /// 全库用量缓存的有效期。checkpoint 每 15 秒一轮，每次都遍历最多 64 个 owner 目录
     /// × 100 个文件，会在串行落盘队列上堆出明显延迟；60 秒内的旧值足够当提前拒绝的依据。
     static let usageTTL: TimeInterval = 60
+    /// 所有写盘的唯一串行化点。checkpoint（实例 worker 队列）与 deinit 兜底（teardown
+    /// 队列）是两条独立队列，对同一文件 .atomic 替换是 last-writer-wins：deinit 的新快照
+    /// 先落、在途 checkpoint 的旧快照后落时会静默丢掉两次写入之间的样本。save 全体走
+    /// 这条队列后写入顺序=提交顺序，两条调用方队列不必再互相同步。
+    static let ioQueue = DispatchQueue(label: "io.github.lswlc33.dashboard.rides.disk", qos: .utility)
 
     struct Failure: Error {
         let code: String
@@ -218,6 +223,12 @@ private enum IOSRideDisk {
     }
 
     static func save(_ record: [String: Any], owner: String, id: UUID) throws -> Int {
+        // 串行化所有写盘（见 ioQueue 注释）。save 是同步 throws，调用方分布在 worker 与
+        // teardown 两条队列上，用 sync 收敛；队列上没有再调 save 的代码，无重入。
+        try ioQueue.sync { try saveLocked(record, owner: owner, id: id) }
+    }
+
+    private static func saveLocked(_ record: [String: Any], owner: String, id: UUID) throws -> Int {
         guard JSONSerialization.isValidJSONObject(record) else { throw Failure("invalid_record") }
         let data = try JSONSerialization.data(withJSONObject: record, options: [.sortedKeys])
         guard data.count <= maxFileBytes else { throw Failure("record_limit_reached") }
@@ -964,7 +975,9 @@ final class IOSRideService: NSObject, IOSBridgeService, IOSBridgeCancellableServ
     private func recordGPS(_ fix: IOSGPSFix) {
         guard let run = active, owns(run), !run.userPaused, run.gpsWanted, fix.fresh,
               fix.sequence > run.lastGPSSequence,
-              fix.at >= run.startedAt,
+              // 准入用单调时钟：墙钟回拨时 fix.at < startedAt 会把整段样本静默拒掉、连 gap
+              // 都不留（fresh 判 systemUptime 仍是 fresh）。单调性由落盘夹紧层负责（见下）。
+              fix.receivedUptime >= run.startedUptime,
               UIApplication.shared.applicationState == .active || gps.backgroundAllowed else { return }
         bluetooth.observeRecordingEvent(id: run.id, scope: run.scope)
         guard admit(run, bytes: 480) else { return }
@@ -1023,7 +1036,9 @@ final class IOSRideService: NSObject, IOSBridgeService, IOSBridgeCancellableServ
 
     private func recordBLE(_ sample: IOSBLETelemetrySample) {
         guard let run = active, owns(run), !run.userPaused, sample.scope == run.scope, bluetooth.connected,
-              sample.sequence > run.lastBLESequence, sample.at >= run.startedAt,
+              sample.sequence > run.lastBLESequence,
+              // 与 GPS 同理：准入只看单调时钟，墙钟回拨不能整段丢样本（receivedUptime 那条
+              // 原本就有，把 sample.at 的墙钟比较删掉，两条口径一致）。
               sample.receivedUptime >= run.startedUptime,
               UIApplication.shared.applicationState == .active || run.backgroundWanted else { return }
         bluetooth.observeRecordingEvent(id: run.id, scope: run.scope)
@@ -1395,26 +1410,24 @@ final class IOSRideService: NSObject, IOSBridgeService, IOSBridgeCancellableServ
         run.checkpointing = true
         run.checkpointDirty = false
         run.lastCheckpoint = now
-        // eviction 许可：进 worker 前取快照（主线程读 run），在 worker 内被 persist 扣减。
-        // 回收成功或失败都会把它置 false，回主线程后同步到 run.evictionAttempted。
-        let initialEvictionBudget = !run.evictionAttempted
+        // evictionAttempted 归主线程所有：在这里取快照，worker 里只读这个 Bool。
+        let allowEviction = !run.evictionAttempted
         let value = record(run, final: false)
         let owner = run.scope.ownerHash
         worker.async { [weak self, weak run] in
             guard let run = run else { return }
-            var budget = initialEvictionBudget
             let result: Result<Saved, Error>
-            do { result = .success(try Self.persist(value, owner: owner, id: run.id, evictionBudget: &budget)) }
+            do { result = .success(try Self.persist(value, owner: owner, id: run.id, allowEviction: allowEviction)) }
             catch { result = .failure(error) }
             DispatchQueue.main.async {
                 guard let self = self else { return }
                 run.checkpointing = false
-                // 回收成败都钉住：budget 一旦被扣就不允许这条 run 再删历史。
-                if !budget { run.evictionAttempted = true }
                 switch result {
                 case .success(let saved):
                     run.checkpointFailures = 0
                     run.checkpointRetryAt = 0
+                    // 已经回收过就钉住：同一趟不再删第二次历史（撞的是修不好的上限时尤其重要）。
+                    if saved.evicted > 0 { run.evictionAttempted = true }
                     self.observeSaved(run, saved)
                     if let kept = saved.keptSamples { self.applyTrim(run, kept: kept) }
                 case .failure(let error):
@@ -1504,13 +1517,10 @@ final class IOSRideService: NSObject, IOSBridgeService, IOSBridgeCancellableServ
     /// 之后所有 checkpoint 都被跳过，所以这里必须兜住，而不是把 record_limit_reached 抛出去。
     ///
     /// owner_storage_full 是「删掉本 owner 的旧记录就能腾出空间」的那一类（本 owner 字节/文件数、
-    /// 全库总字节）。`allowEviction` 用 inout 传：**回收前**就置成 false（表示「已经动过历史」），
-    /// 这样无论这次重试成不成功，同一条 run 都不会再删第二次。
-    /// 原来的写法只在成功时置位，「回收 8 条也不够」时（典型：别的 owner 目录占满 256MB 全局额度）
-    /// 每个 checkpoint / saveFinal / 用户 retry 都会再删 8 条真实记录，删到几十条而保存依旧失败。
+    /// 全库总字节）。允许回收一次；`allowEviction=false` 时直接抛出，防止同一条 run 反复删历史。
     /// 纯 recycle 的错误码（owner 数上限、别的目录塞满）仍然直接抛，删自己的记录修不好。
     private static func persist(_ record: [String: Any], owner: String, id: UUID,
-                                evictionBudget: inout Bool) throws -> Saved {
+                                allowEviction: Bool) throws -> Saved {
         let samples = Int(IOSRideJSON.integer(record["samples"]) ?? 0)
         do {
             return Saved(bytes: try IOSRideDisk.save(record, owner: owner, id: id),
@@ -1521,9 +1531,7 @@ final class IOSRideService: NSObject, IOSBridgeService, IOSBridgeCancellableServ
             let kept = Int(IOSRideJSON.integer(trimmed["samples"]) ?? 0)
             return Saved(bytes: bytes, samples: max(kept, 1), keptSamples: kept, evicted: 0)
         } catch let failure as IOSRideDisk.Failure where failure.code == "owner_storage_full" {
-            guard evictionBudget else { throw failure }
-            // 先扣预算再动手：即使下面重试失败，也不会在下一轮再删一次。
-            evictionBudget = false
+            guard allowEviction else { throw failure }
             let removed = IOSRideDisk.evictOldestFinished(owner: owner, protecting: id)
             guard removed > 0 else { throw failure }
             IOSDiagnostics.shared.log("ride: 本 owner 存储触顶，回收 \(removed) 条最旧已完成记录后重试")
@@ -1561,15 +1569,14 @@ final class IOSRideService: NSObject, IOSBridgeService, IOSBridgeCancellableServ
     private func saveFinal(_ run: Run) {
         guard !run.saveInFlight else { return }
         run.saveInFlight = true
-        // 同 checkpoint：eviction 许可在 worker 内被 persist 扣减，回主线程同步回 run。
-        let initialEvictionBudget = !run.evictionAttempted
+        // 同 checkpoint：evictionAttempted 归主线程，进 worker 前取快照。
+        let allowEviction = !run.evictionAttempted
         let value = record(run, final: true)
         let owner = run.scope.ownerHash
         worker.async { [weak self, weak run] in
             guard let run = run else { return }
-            var budget = initialEvictionBudget
             var result: Result<Saved, Error>
-            do { result = .success(try Self.persist(value, owner: owner, id: run.id, evictionBudget: &budget)) }
+            do { result = .success(try Self.persist(value, owner: owner, id: run.id, allowEviction: allowEviction)) }
             catch { result = .failure(error) }
             // iOS 侧原来没有 save_failed 的出口：网页从不发 ride.action{retry}，
             // 用户看到「保存失败」就再也回不到 completed。这里在同一个 worker 上
@@ -1586,18 +1593,17 @@ final class IOSRideService: NSObject, IOSBridgeService, IOSBridgeCancellableServ
                 }
                 if !alreadyRetried {
                     Thread.sleep(forTimeInterval: 0.3)
-                    // 第二次重试不再动历史（budget 已被扣成 false，这里复用同一个变量即可）。
-                    do { result = .success(try Self.persist(value, owner: owner, id: run.id, evictionBudget: &budget)) }
+                    // 第一次可能是回收腾地方失败后的重试，第二次不再删历史。
+                    do { result = .success(try Self.persist(value, owner: owner, id: run.id, allowEviction: false)) }
                     catch { result = .failure(error) }
                 }
             }
             DispatchQueue.main.async {
                 guard let self = self else { return }
                 run.saveInFlight = false
-                // 回收成败都钉住：budget 一旦被扣就不允许这条 run 再删历史。
-                if !budget { run.evictionAttempted = true }
                 switch result {
                 case .success(let saved):
+                    if saved.evicted > 0 { run.evictionAttempted = true }
                     self.observeSaved(run, saved)
                     if let kept = saved.keptSamples { self.applyTrim(run, kept: kept) }
                     run.saveFailed = false

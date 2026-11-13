@@ -801,6 +801,25 @@ final class PanelController: UIViewController, WKNavigationDelegate, WKUIDelegat
         bridge.requestMediaCapture(origin: origin, frame: frame, type: type, reply: decisionHandler)
     }
 
+    /// 孪生仪表的姿态倾斜需要网页拿 deviceorientation / devicemotion。
+    ///
+    /// 为什么必须实现这一个回调（只加 NSMotionUsageDescription 不够）：
+    /// WKWebView 里运动传感器的默认访问状态是 Prompt，而**未经这个 delegate 明确答复**时，
+    /// WebKit 会走 alertForPermission 弹系统框（WebKit UIDelegate.mm 的 alertForPermission 分支）；
+    /// WKWebView 在无窗口/被遮挡等情形下那个 alert 会静默失败，最终落成 denied，
+    /// 网页侧的表现就是"监听器挂上了但一个事件都不来"。
+    ///
+    /// 放行口径与媒体权限一致：只认本站 origin，第三方页面一律拒绝。
+    /// 传感器数据只用做观感（仪表倾斜），不参与任何业务判据，也不上传。
+    /// （本工程 deployment target 是 iOS 15.4，该回调 iOS 15.0 起可用。）
+    func webView(_ webView: WKWebView,
+                 requestDeviceOrientationAndMotionPermissionFor origin: WKSecurityOrigin,
+                 initiatedByFrame frame: WKFrameInfo,
+                 decisionHandler: @escaping (WKPermissionDecision) -> Void) {
+        guard webView === web, PanelNavigation.isPanel(origin.url) else { decisionHandler(.deny); return }
+        decisionHandler(.grant)
+    }
+
     func webView(_ webView: WKWebView, createWebViewWith configuration: WKWebViewConfiguration,
                  for navigationAction: WKNavigationAction, windowFeatures: WKWindowFeatures) -> WKWebView? {
         guard navigationAction.navigationType == .linkActivated,

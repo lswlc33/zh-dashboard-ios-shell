@@ -198,15 +198,31 @@ final class IOSVehicleNetworkService: IOSBridgeCancellableService {
     private var page: UInt64 = 0
     private var pending: [UUID: IOSVehicleCancellation] = [:]
     private var cancellations: [UUID: () -> Void] = [:]
-    private var configuredOwners: [String: String] = [:] // stable account/VIN ownerHash，不用登录 epoch 做长期归属。
+    /// SSID → 创建者 ownerHash。NEHotspotConfiguration 本身跨启动持久，归属记录若只留内存，
+    /// 重启后 wifi.leave 会永远 configuration_not_owned（配置删不掉，只能去系统设置手动删）。
+    /// 持久化到 UserDefaults，与配置的生命周期对齐；join 用「系统里已存在」的判断兜住一致性。
+    private var configuredOwners: [String: String]
     private var vehicleProfiles: [String: Set<String>] = [:]
     // apply 没有撤销 API；迟到回调清理完前不允许同 SSID 的下一次 apply 竞争。
     private var applyingSSID: String?
     private var liveSockets: [UUID: IOSVehicleSocket] = [:]
     private var allowedPorts: Set<UInt16>
 
+    private static let ownerStore = UserDefaults.standard
+    private static let ownerStoreKey = "zeeho.wifi.configuredOwners.v1"
+
     init(allowedPorts: Set<UInt16> = []) {
         self.allowedPorts = Set(allowedPorts.filter { $0 > 0 }.sorted().prefix(8))
+        // 只认字符串值的条目，脏数据直接丢弃而不是崩（dictionary(forKey:) 的 key 恒为 String）。
+        let stored = Self.ownerStore.dictionary(forKey: Self.ownerStoreKey) ?? [:]
+        self.configuredOwners = stored.reduce(into: [:]) { map, item in
+            if let hash = item.value as? String { map[item.key] = hash }
+        }
+    }
+
+    /// 归属映射落盘：内存与 UserDefaults 一起更新，调用点都在主线程（join/leave 的桥入口）。
+    private func persistOwners() {
+        Self.ownerStore.set(configuredOwners, forKey: Self.ownerStoreKey)
     }
 
     func setScopeProvider(_ provider: @escaping () -> IOSRideScope?) {
@@ -311,6 +327,7 @@ final class IOSVehicleNetworkService: IOSBridgeCancellableService {
                 }
                 NEHotspotConfigurationManager.shared.removeConfiguration(forSSID: profile.ssid)
                 configuredOwners.removeValue(forKey: profile.ssid)
+                persistOwners()
                 // removeConfiguration 没有断线回执；必须报告实际状态而不是把调用当已离开。
                 inspectJoined(profile: profile, scope: scope) { value, error in
                     var result = value as? [String: Any] ?? [:]
@@ -368,7 +385,10 @@ final class IOSVehicleNetworkService: IOSBridgeCancellableService {
                                 && error.code == NEHotspotConfigurationError.userDenied.rawValue ? "user_denied" : "wifi_apply_failed")))
                             return
                         }
-                        if !existed { self.configuredOwners[profile.ssid] = scope.ownerHash }
+                        if !existed {
+                            self.configuredOwners[profile.ssid] = scope.ownerHash
+                            self.persistOwners()
+                        }
                         self.vehicleProfiles[scope.ownerHash, default: []].insert(profile.ssid)
                         // 系统接受配置不等于已加入；先核对系统实际 SSID，再由 status 核验私网路径。
                         self.waitForRoute(profile: profile, scope: scope, token: token, completion: finish)
