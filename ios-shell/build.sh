@@ -195,11 +195,11 @@ done < "$build_dir/widget-frameworks.txt"
 # AppIntents API 从 iOS 16 开始；具体配置类型另有 iOS 17 availability，15.4 不能强加载它。
 widget_args+=(-Xlinker -weak_framework -Xlinker AppIntents)
 # AppIntents metadata 提取依赖 Swift 编译器产出的 const-values；
-# 没有 -emit-const-values 时 processor 会报 "No swift const values found" 并跳过输出。
-# 明确产出 const-values 列表文件，供下面的 appintentsmetadataprocessor 读取。
+# 没有该文件时 processor 会报 "No swift const values found" 并跳过输出。
+# -emit-const-values 显式启用，-emit-const-values-path 指定写入位置（只给路径不会写文件）。
 xcrun --sdk iphoneos swiftc -O -swift-version 5 -parse-as-library -application-extension \
     -target arm64-apple-ios15.4 -sdk "$sdk_path" -module-name DashboardWidgets \
-    -emit-const-values-path "$build_dir/widget-const-vals.json" \
+    -emit-const-values -emit-const-values-path "$build_dir/widget-const-vals.json" \
     "${widget_args[@]}" "${widget_sources[@]}" -o "$widget_dir/DashboardWidgets"
 
 # ReplayKit 的标准 upload extension 仍由 _NSExtensionMain 进入 NSObject 子类 SampleHandler。
