@@ -105,8 +105,7 @@ final class IOSStore {
     private func loadIfNeeded() {
         guard !loaded else { return }
         loaded = true
-        do {
-            let manager = FileManager.default
+        do {            let manager = FileManager.default
             let support = try manager.url(for: .applicationSupportDirectory, in: .userDomainMask,
                                           appropriateFor: nil, create: true)
             let directory = support.appendingPathComponent("ZeehoPrivate", isDirectory: true)
@@ -159,9 +158,18 @@ final class IOSStore {
                                        .posixPermissions: 0o600], ofItemAtPath: file.path)
             values = archive.values
             revision = archive.revision
+            // 本次真的读成功了：清掉上一次瞬时失败留下的错误码，
+            // 否则 commit 会一直以它为理由拒绝（`if let readError { throw }`）。
+            readError = nil
         } catch {
             values = [:]
             readError = (error as? Failure)?.code ?? "store_corrupt_or_locked"
+            // 允许下次重试：加载失败往往是**瞬时**的（锁屏期间 Keychain 返回
+            // errSecInteractionNotAllowed、目录还没就绪、Data Protection 抖动）。
+            // 原来 loaded 一次性置真，任何一次瞬时失败都会把 readError 冻结到进程结束，
+            // 整个会话的账号/偏好全部存不了，日志里也没有第二次尝试。
+            // 真正的持久损坏（store_corrupt）也允许重试：重试仍是失败，不会更糟。
+            loaded = false
         }
     }
 

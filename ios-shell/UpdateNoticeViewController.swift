@@ -40,15 +40,23 @@ final class UpdateNoticeViewController: UIViewController {
         stack.translatesAutoresizingMaskIntoConstraints = false
         scroll.addSubview(stack)
 
-        let icon = UIImageView(image: UIImage(systemName: "arrow.down.circle"))
-        icon.tintColor = .systemBlue
+        // 语义是「有新版本可用」，不是「点这里下载」——App 内不提供下载入口，
+        // 用 arrow.down.circle 会和文案（去外部自签安装）直接矛盾。
+        let icon = UIImageView(image: UIImage(systemName: "sparkles"))
+        // 跟随全局 tint（品牌色），不写死 systemBlue：主题/深色模式下也不该固定一种蓝。
+        icon.tintColor = .tintColor
         icon.contentMode = .scaleAspectFit
+        // 纯装饰，别让 VoiceOver 单独读一个图标名。
+        icon.isAccessibilityElement = false
         icon.translatesAutoresizingMaskIntoConstraints = false
         icon.heightAnchor.constraint(equalToConstant: 64).isActive = true
 
         let title = UILabel()
         title.text = IOSStrings.updateAppTitle
-        title.font = .preferredFont(forTextStyle: .title2)
+        // 与 RecoveryView 的整页标题同层级（28pt bold + 缩放），
+        // 原来用 .title2 regular，两个「整页说明」看起来完全不是一套。
+        title.font = UIFontMetrics(forTextStyle: .largeTitle)
+            .scaledFont(for: .systemFont(ofSize: 28, weight: .bold))
         title.adjustsFontForContentSizeCategory = true
         title.textAlignment = .center
         title.numberOfLines = 0
@@ -85,11 +93,22 @@ final class UpdateNoticeViewController: UIViewController {
         // 唯一动作：知道有新版即可。下载与覆盖安装都在 App 外部完成。
         var config = UIButton.Configuration.filled()
         config.title = IOSStrings.updateAcknowledge
-        config.cornerStyle = .large
+        config.cornerStyle = .fixed
+        // 与 RecoveryView 的 filled 按钮用同一套几何（圆角 22 / 高度 >= 52 / semibold headline），
+        // 原来 .large 圆角 + 写死 52 高度，和别的页面不是一套。
+        config.background.cornerRadius = 22
+        config.contentInsets = NSDirectionalEdgeInsets(top: 14, leading: 20, bottom: 14, trailing: 20)
+        config.titleTextAttributesTransformer = UIConfigurationTextAttributesTransformer { incoming in
+            var out = incoming
+            out.font = UIFontMetrics(forTextStyle: .headline)
+                .scaledFont(for: .systemFont(ofSize: 16, weight: .semibold))
+            return out
+        }
         let button = UIButton(configuration: config)
         button.addTarget(self, action: #selector(dismissSelf), for: .touchUpInside)
         button.translatesAutoresizingMaskIntoConstraints = false
-        button.heightAnchor.constraint(equalToConstant: 52).isActive = true
+        // >= 而不是 ==：超大字号下标题换行会被写死高度裁掉。
+        button.heightAnchor.constraint(greaterThanOrEqualToConstant: 52).isActive = true
 
         for item in [icon, title, message, notesCard, button] { stack.addArrangedSubview(item) }
         stack.setCustomSpacing(8, after: icon)

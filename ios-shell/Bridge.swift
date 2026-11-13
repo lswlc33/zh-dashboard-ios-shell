@@ -381,17 +381,24 @@ final class IOSBridge {
             replyHandler(IOSBridgePolicy.failure(method: method, code: "untrusted_document", requestID: requestID), nil)
             return
         }
-        // 前台判据不能只靠 didBecomeActive 通知：
+        // 前台判据不能只靠 didBecomeActive/didEnterBackground 通知：
         // 1) `foreground` 初值在 init 时取，viewDidLoad 阶段 App 往往还不是 active；
-        // 2) 若通知在观察者注册之前就发过（或系统只发 willResignActive 没发 didEnterBackground），
-        //    它就会永久停在 false，之后每个 RPC 都被 foreground_required 拒掉——
-        //    表现正是「偏好存不了 + 小组件永远没快照」。
-        // 实时校正一次：applicationState 是当下真值，比缓存的布尔可信。
-        if !foreground, UIApplication.shared.applicationState != .background { foregrounded() }
+        // 2) 若通知在观察者注册之前就发过，它会永久停在错误的一侧——
+        //    停在 false 时每个 RPC 都被 foreground_required 拒掉（表现正是
+        //    「偏好存不了 + 小组件永远没快照」）；停在 true 时后台操作会被误放行。
+        // 这里按 applicationState（当下真值）双向校正，但**只改布尔**：
+        // 绝不能调 foregrounded()/backgrounded()——它们会 generation += 1、广播 lifecycle、
+        // 拒绝在途请求；在消息处理函数里隐式推进世代会把网页的 generation 弄旧，
+        // 之后 sync.session 直接被 stale_generation 拒掉（桥永久无 session）。
+        let appState = UIApplication.shared.applicationState
+        if appState == .background {
+            if foreground { foreground = false }
+        } else if !foreground {
+            foreground = true
+        }
         guard foreground else {
             // 之前这里静默拒绝，排查时日志里什么都看不到；记一条（含真实 applicationState）。
-            logFailure(method: method, code: "foreground_required",
-                       detail: "state=\(Self.stateName(UIApplication.shared.applicationState))")
+            logFailure(method: method, code: "foreground_required", detail: "state=\(Self.stateName(appState))")
             replyHandler(IOSBridgePolicy.failure(method: method, code: "foreground_required", requestID: requestID), nil)
             return
         }

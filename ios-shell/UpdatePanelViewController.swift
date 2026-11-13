@@ -84,6 +84,9 @@ final class UpdatePanelViewController: UIViewController,
         checkTask?.cancel(); checkTask = nil
         panelCheckTask?.cancel(); panelCheckTask = nil
         checking = false; panelChecking = false
+        // App 切后台会走到这里；回前台时 viewWillAppear 不会再调用，
+        // 不刷新的话操作段会永远停在「正在检查…」，与真实状态（已取消）不符。
+        if isViewLoaded { table.reloadData() }
     }
 
     @objc private func cacheStateChanged() {
@@ -289,12 +292,18 @@ final class UpdatePanelViewController: UIViewController,
 
         switch section {
         case .versions where indexPath.row < 2:
-            cell.accessoryType = .disclosureIndicator
+            // 值列已经是详情，不该再挂 disclosureIndicator：那个箭头会让人以为
+            // 点进去是「版本详情页」，实际点下去是发起一次网络检查。
+            cell.accessoryType = .none
             cell.selectionStyle = .default
         case .line:
             let line = [IOSPanelLine.github, IOSPanelLine.cf][indexPath.row]
-            cell.accessoryType = line == IOSPanelLine.current ? .checkmark : .none
-            cell.selectionStyle = .default
+            let current = line == IOSPanelLine.current
+            cell.accessoryType = current ? .checkmark : .none
+            // 当前线路不能再点：selectLine 里 line != current 直接 return，
+            // 按钮亮着但点了完全没反应是最糟的交互。灰掉选择态并给出无障碍值。
+            cell.selectionStyle = current ? .none : .default
+            cell.accessibilityValue = current ? IOSStrings.updateCurrentLine : nil
         case .actions:
             cell.textLabel?.textColor = .tintColor
             cell.selectionStyle = .default
@@ -338,7 +347,9 @@ final class UpdatePanelViewController: UIViewController,
     private func selectLine(_ line: IOSPanelLine) {
         guard active, presentedViewController == nil, line != IOSPanelLine.current else { return }
         guard !initializing, !IOSPanelCache.shared.snapshot().busy else {
-            presentMessage(IOSStrings.updateLineChangedTitle, IOSStrings.busy)
+            // 标题不能用「切换更新线路」：正文说的是「先完成当前操作」，
+            // 标题却像已经问过用户要不要切，前后矛盾。
+            presentMessage(IOSStrings.updateBusyTitle, IOSStrings.updateBusyLineMessage)
             return
         }
         let alert = UIAlertController(
@@ -433,6 +444,8 @@ final class UpdatePanelViewController: UIViewController,
         // 裸 present 时看不到标题，也没有关闭按钮（唯一出口是那个名叫「重试」的按钮）。
         // 包一层导航容器，诊断页自己挂「完成」与标题。
         let controller = DiagnosticsViewController()
+        // 手动入口：App 此刻是正常的，别用「面板加载异常」吓人。
+        controller.manualEntry = true
         let nav = UINavigationController(rootViewController: controller)
         nav.modalPresentationStyle = .formSheet
         present(nav, animated: true)

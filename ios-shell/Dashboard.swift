@@ -479,6 +479,14 @@ final class PanelController: UIViewController, WKNavigationDelegate, WKUIDelegat
     }
 
     private func loadPanel() {
+        // 显式重载（诊断页「重试」、更新后重启）视为新一轮启动：
+        // 必须复位所有一次性闸门。否则重试后仍失败时 diagnosticsShown 已经是 true，
+        // 诊断页/横幅都不会再出现，用户只能看到永久静默白屏；
+        // localFallbackUsed 残留还会让离线用户再也用不到磁盘上完好的本地快照。
+        // 看门狗由 preparePanel 自己重置（它还会续上 documentFinished 的语义）。
+        diagnosticsShown = false
+        localFallbackUsed = false
+        documentFinished = false
         BootHealth.failed(reason: "unfinished")
         preparePanel(PanelNavigation.home)
     }
@@ -802,14 +810,34 @@ final class PanelController: UIViewController, WKNavigationDelegate, WKUIDelegat
         return nil
     }
 
+    // JS 弹窗的 presenter 闸门。
+    //
+    // 关键约束：completionHandler **必须被调用一次**，否则 WebKit 会挂住整段 JS——
+    // 页面从此点不动、桥也发不出请求，用户只能杀 App（「看起来能用、点一下死」）。
+    // 因此 present 之前先判「能不能展示」；不能展示就立刻用「取消」语义回调。
+    private var canPresentFromWebView: Bool {
+        guard webView === web, view.window != nil, presentedViewController == nil else { return false }
+        return true
+    }
+
     func webView(_ webView: WKWebView, runJavaScriptAlertPanelWithMessage message: String,
                  initiatedByFrame frame: WKFrameInfo, completionHandler: @escaping () -> Void) {
+        guard canPresentFromWebView else {
+            IOSDiagnostics.shared.log("js alert 无法展示（已有弹窗/窗口未就绪），按取消回调")
+            completionHandler()
+            return
+        }
         let alert = UIAlertController(title: IOSStrings.appTitle, message: message, preferredStyle: .alert)
-        alert.addAction(UIAlertAction(title: "好", style: .default) { _ in completionHandler() })
+        alert.addAction(UIAlertAction(title: IOSStrings.confirm, style: .default) { _ in completionHandler() })
         present(alert, animated: true)
     }
     func webView(_ webView: WKWebView, runJavaScriptConfirmPanelWithMessage message: String,
                  initiatedByFrame frame: WKFrameInfo, completionHandler: @escaping (Bool) -> Void) {
+        guard canPresentFromWebView else {
+            IOSDiagnostics.shared.log("js confirm 无法展示（已有弹窗/窗口未就绪），按取消回调")
+            completionHandler(false)
+            return
+        }
         let alert = UIAlertController(title: IOSStrings.appTitle, message: message, preferredStyle: .alert)
         alert.addAction(UIAlertAction(title: IOSStrings.cancel, style: .cancel) { _ in completionHandler(false) })
         alert.addAction(UIAlertAction(title: IOSStrings.confirm, style: .default) { _ in completionHandler(true) })
@@ -818,6 +846,11 @@ final class PanelController: UIViewController, WKNavigationDelegate, WKUIDelegat
     func webView(_ webView: WKWebView, runJavaScriptTextInputPanelWithPrompt prompt: String,
                  defaultText: String?, initiatedByFrame frame: WKFrameInfo,
                  completionHandler: @escaping (String?) -> Void) {
+        guard canPresentFromWebView else {
+            IOSDiagnostics.shared.log("js prompt 无法展示（已有弹窗/窗口未就绪），按取消回调")
+            completionHandler(nil)
+            return
+        }
         let alert = UIAlertController(title: IOSStrings.appTitle, message: prompt, preferredStyle: .alert)
         alert.addTextField { $0.text = defaultText }
         alert.addAction(UIAlertAction(title: IOSStrings.cancel, style: .cancel) { _ in completionHandler(nil) })

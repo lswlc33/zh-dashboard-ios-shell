@@ -14,6 +14,9 @@ final class RecoveryViewController: UIViewController {
     private var checkedCacheRefresh = false
     /// 两个生命周期回调都可能预检；只接受最新一轮，不能让旧 ready 盖住下载中的状态。
     private var cacheRefreshGeneration = 0
+    /// 重新初始化按钮当前是否已降级成 tonal（可进入时它不再占据主按钮位置）。
+    /// filled / tinted 是两种 Configuration，切换要整枚重建，用它在 render 里去重。
+    private var reinitIsTonal = false
 
     // toolbar
     private let versionButton = UIButton(type: .system)
@@ -282,7 +285,11 @@ final class RecoveryViewController: UIViewController {
         button.addTarget(self, action: action, for: .touchUpInside)
         // 52 是设计高度，同时兼作最小点击区（>= 44）。用 >= 而不是 ==：
         // 超大字号下标题换行时按钮需要能长高，写死等号会把文字裁掉。
-        button.heightAnchor.constraint(greaterThanOrEqualToConstant: Self.buttonHeight).isActive = true
+        // 只在还没加过时加一次：这个按钮会在 filled/tonal 之间重建配置，
+        // 每次都 addConstraint 会越积越多。
+        if !button.constraints.contains(where: { $0.firstAttribute == .height && $0.relation == .greaterThanOrEqual }) {
+            button.heightAnchor.constraint(greaterThanOrEqualToConstant: Self.buttonHeight).isActive = true
+        }
     }
 
     /// MD3 tonal 按钮：同尺寸但次要底色。
@@ -300,7 +307,12 @@ final class RecoveryViewController: UIViewController {
         }
         button.configuration = config
         button.addTarget(self, action: action, for: .touchUpInside)
-        button.heightAnchor.constraint(greaterThanOrEqualToConstant: Self.buttonHeight).isActive = true
+        // 52 是设计高度；用 >= 让超大字号下标题换行时按钮能长高，不裁字。
+        // 只在还没加过高约束时加一次——这个按钮会在 filled/tonal 之间来回重建配置，
+        // 每次都 addConstraint 会让约束越积越多。
+        if !button.constraints.contains(where: { $0.firstAttribute == .height && $0.relation == .greaterThanOrEqual }) {
+            button.heightAnchor.constraint(greaterThanOrEqualToConstant: Self.buttonHeight).isActive = true
+        }
     }
 
     /// 按字号 + 文本样式做 Dynamic Type 缩放。
@@ -330,10 +342,13 @@ final class RecoveryViewController: UIViewController {
         statusLabel.adjustsFontForContentSizeCategory = true
         statusLabel.setContentCompressionResistancePriority(UILayoutPriority(999), for: .vertical)
 
+        // 错误文案要给足行数：中文一行约 15-18 字，两行必然在「请检查…」之前截断，
+        // 最关键的下一步建议正好被省略号吃掉。改成不限行数 + 自动增高，
+        // 卡片整体由下面的滚动容器兜住（大字号也能看全）。
         errorLabel.font = Self.scaledFont(size: 16, weight: .regular, textStyle: .body)
         errorLabel.textColor = .systemRed
-        errorLabel.numberOfLines = 2
-        errorLabel.lineBreakMode = .byTruncatingTail
+        errorLabel.numberOfLines = 0
+        errorLabel.lineBreakMode = .byWordWrapping
         errorLabel.adjustsFontForContentSizeCategory = true
         errorLabel.setContentCompressionResistancePriority(UILayoutPriority(999), for: .vertical)
         errorLabel.translatesAutoresizingMaskIntoConstraints = false
@@ -431,9 +446,16 @@ final class RecoveryViewController: UIViewController {
         // 百分比一律走 state.progress（以「已完成文件数」为主），
         // 不再自己拿 done/total 算——Content-Length 在 CDN 压缩时不可信，
         // 真机上曾因此卡在 90% 不动。
+        //
+        // 失败但旧快照可用（canEnter 为真、phase 是 .error）必须单独一条文案：
+        // 原来它复用「已完成」+ 下面红色错误卡，同一个决策点同时说成功和失败，
+        // 用户根本不知道该不该点「进入面板」。
         if state.phase == .downloading {
             let percent = max(0, min(100, Int(state.progress * 100)))
             statusLabel.text = String(format: IOSStrings.recoveryStatusProgress, percent)
+        } else if state.phase == .error {
+            statusLabel.text = state.fallbackAvailable ? IOSStrings.recoveryStatusFallback
+                                                       : IOSStrings.recoveryStatusPending
         } else if usable {
             statusLabel.text = IOSStrings.recoveryStatusDone
         } else {
@@ -451,6 +473,9 @@ final class RecoveryViewController: UIViewController {
             }
             bytesLabel.text = String(format: IOSStrings.recoveryResourceProgress,
                                      state.completedFiles, max(1, state.resourceCount), detail)
+        } else if state.phase == .error, state.fallbackAvailable {
+            // 说明「为什么还能进」：用的是上次成功下载的那份，不是这次失败的。
+            bytesLabel.text = IOSStrings.recoveryFallbackHint
         } else {
             // ready 时把「缺了 N 个可选资源」说出来：State.skipped 的注释一直承诺这条提示，
             // 但之前没有任何界面读它，用户只看到「已就绪」，缺图标/清单时毫无线索。
@@ -465,8 +490,14 @@ final class RecoveryViewController: UIViewController {
         progressBar.isHidden = !busy
         progressBar.progress = busy ? Float(state.progress) : 0
 
-        let message = state.error.isEmpty ? reasonMessage() : initErrorMessage(state.error)
+        // 两种文案的语义完全不同，颜色也要跟着分：
+        // · state.error 是真正的失败原因 → 红色（需要用户注意）
+        // · reasonMessage() 是「上次为什么没正常收尾」的解释（如「可能是正常退出或系统回收，
+        //   并不一定是崩溃」）→ 次要色，它不是错误，用红色会让人以为出事了。
+        let isFailure = !state.error.isEmpty
+        let message = isFailure ? initErrorMessage(state.error) : reasonMessage()
         errorLabel.text = message
+        errorLabel.textColor = isFailure ? .systemRed : .secondaryLabel
         errorCard.isHidden = message.isEmpty
         // 原始错误码要留进诊断日志（界面只给翻译后的文案）。
         // 只在码变化时写一行：render 被进度推送高频调用，无脑写会把 512KB 的
@@ -483,16 +514,37 @@ final class RecoveryViewController: UIViewController {
         initializeButton.isHidden = cancellable
         cancelButton.isHidden = !cancellable
         initializeButton.isEnabled = !busy
-        var config = initializeButton.configuration
         // 「重新初始化」看的是磁盘上有没有快照（usable），而不是这次初始化成不成功：
         // 失败但有旧快照时，用户要做的正是「再初始化一次」。
-        config?.title = usable ? IOSStrings.recoveryReinitialize : IOSStrings.recoveryInitialize
-        initializeButton.configuration = config
+        //
+        // 可进入时「进入面板」才是主路径，把重新初始化降级成 tonal：
+        // 两个同权重 filled 按钮并排会让用户不知道该点哪个，而它还会覆盖
+        // 马上要用的资源。进入条件不成立时才让重试占据主按钮位置。
+        // filled / tinted 是两种 Configuration 类型，改颜色 token 不够，
+        // 必须整枚重建——所以只在档位真的变了才重建，避免每次 render 都重加 target。
+        if usable != reinitIsTonal {
+            reinitIsTonal = usable
+            initializeButton.removeTarget(self, action: #selector(initializeTapped), for: .touchUpInside)
+            if usable {
+                styleTonalButton(initializeButton, title: IOSStrings.recoveryReinitialize,
+                                 action: #selector(initializeTapped))
+            } else {
+                styleFilledButton(initializeButton, title: IOSStrings.recoveryInitialize,
+                                  action: #selector(initializeTapped))
+            }
+        } else {
+            var config = initializeButton.configuration
+            config?.title = usable ? IOSStrings.recoveryReinitialize : IOSStrings.recoveryInitialize
+            initializeButton.configuration = config
+        }
+        initializeButton.accessibilityHint = usable ? IOSStrings.recoveryReinitHint : nil
 
         // 按钮只认「能不能进」，不认「这次初始化是否成功」：
         // 初始化失败时磁盘上的旧快照往往完好、能离线打开，此时仍应允许进入；
         // 而 `state.ready` 被 UpdateService/更新面板用来判断强制更新成败，不能在这里放宽。
         enterButton.isEnabled = state.canEnter && !busy
+        // 灰着的时候说明原因，别让 VoiceOver 只读出「进入面板，变暗」。
+        enterButton.accessibilityHint = state.canEnter ? nil : IOSStrings.recoveryEnterDisabledHint
     }
 
     private func reasonMessage() -> String {
@@ -575,6 +627,9 @@ final class RecoveryViewController: UIViewController {
 
     /// 「版本与更新」：打开独立更新面板（版本信息 / 资源状态 / 线路 / 操作）。
     @objc private func showVersion() {
+        // 连点两次 toolbar 会在控制台报 already presenting 并把第二次静默丢掉；
+        // 已有弹层时直接忽略（用户看到的第一次点击已经生效）。
+        guard presentedViewController == nil, view.window != nil else { return }
         let panel = UpdatePanelViewController()
         panel.onChange = { [weak self] in self?.refreshCache() }
         let nav = UINavigationController(rootViewController: panel)
@@ -583,10 +638,12 @@ final class RecoveryViewController: UIViewController {
     }
 
     @objc private func showBackup() {
+        guard presentedViewController == nil, view.window != nil else { return }
         let alert = UIAlertController(title: IOSStrings.recoveryBackupTitle,
                                       message: IOSStrings.recoveryBackupUnavailable,
                                       preferredStyle: .alert)
-        alert.addAction(UIAlertAction(title: IOSStrings.confirm, style: .default))
+        // 纯信息说明用 .cancel：它不是「确认某个动作」，样式上也不该是默认强调。
+        alert.addAction(UIAlertAction(title: IOSStrings.confirm, style: .cancel))
         present(alert, animated: true)
     }
 }

@@ -23,6 +23,9 @@ final class DiagnosticsViewController: UIViewController {
     private let retryButton = UIButton(type: .system)
     /// 日志是否已经读完。正文先是占位文案，读完才替换；复制/分享要等它。
     private var logLoaded = false
+    /// 从更新面板「查看诊断日志」手动进来时为 true：只说「最近的运行日志」，
+    /// 不要声称「面板加载异常」——那时 App 是好的，文案与场景不符。
+    var manualEntry = false
 
     override func viewDidLoad() {
         super.viewDidLoad()
@@ -34,7 +37,7 @@ final class DiagnosticsViewController: UIViewController {
         navigationItem.rightBarButtonItem = UIBarButtonItem(
             title: IOSStrings.updateDone, style: .done, target: self, action: #selector(closeTapped))
 
-        header.text = IOSStrings.diagnosticsHeader
+        header.text = manualEntry ? IOSStrings.diagnosticsHeaderManual : IOSStrings.diagnosticsHeader
         header.font = .preferredFont(forTextStyle: .subheadline)
         header.textColor = .secondaryLabel
         header.numberOfLines = 0
@@ -42,7 +45,11 @@ final class DiagnosticsViewController: UIViewController {
         view.addSubview(header)
 
         textView.isEditable = false
-        textView.font = .monospacedSystemFont(ofSize: 11, weight: .regular)
+        // 11pt 低于可读下限，且 .monospacedSystemFont 配 adjustsFontForContentSizeCategory
+        // 是无效组合（那个属性只对 UIFontMetrics 缩放出的字体生效）——大字号用户看不了日志。
+        textView.font = UIFontMetrics(forTextStyle: .caption1)
+            .scaledFont(for: .monospacedSystemFont(ofSize: 12, weight: .regular))
+        textView.adjustsFontForContentSizeCategory = true
         textView.backgroundColor = .secondarySystemBackground
         textView.layer.cornerRadius = 12
         textView.textContainerInset = UIEdgeInsets(top: 12, left: 12, bottom: 12, right: 12)
@@ -70,6 +77,8 @@ final class DiagnosticsViewController: UIViewController {
                 self.showToast(IOSStrings.diagnosticsLoading)
                 return
             }
+            // 连点或在 toast 展示期间点：UIKit 会拒绝第二个 present 并静默丢掉分享。
+            guard self.presentedViewController == nil, self.view.window != nil else { return }
             let activity = UIActivityViewController(activityItems: [self.textView.text ?? ""],
                                                     applicationActivities: nil)
             if let popover = activity.popoverPresentationController {
@@ -98,19 +107,21 @@ final class DiagnosticsViewController: UIViewController {
         buttons.translatesAutoresizingMaskIntoConstraints = false
         view.addSubview(buttons)
 
+        // 水平方向也贴安全区：横屏刘海侧（47pt）和 iPad 圆角会切掉正文与按钮，
+        // 而同 App 的其它页（RecoveryView）本来就用安全区，这里不该例外。
         let guide = view.safeAreaLayoutGuide
         NSLayoutConstraint.activate([
             header.topAnchor.constraint(equalTo: guide.topAnchor, constant: 16),
-            header.leadingAnchor.constraint(equalTo: view.leadingAnchor, constant: 20),
-            header.trailingAnchor.constraint(equalTo: view.trailingAnchor, constant: -20),
+            header.leadingAnchor.constraint(equalTo: guide.leadingAnchor, constant: 20),
+            header.trailingAnchor.constraint(equalTo: guide.trailingAnchor, constant: -20),
 
             textView.topAnchor.constraint(equalTo: header.bottomAnchor, constant: 12),
-            textView.leadingAnchor.constraint(equalTo: view.leadingAnchor, constant: 20),
-            textView.trailingAnchor.constraint(equalTo: view.trailingAnchor, constant: -20),
+            textView.leadingAnchor.constraint(equalTo: guide.leadingAnchor, constant: 20),
+            textView.trailingAnchor.constraint(equalTo: guide.trailingAnchor, constant: -20),
             textView.bottomAnchor.constraint(equalTo: buttons.topAnchor, constant: -12),
 
-            buttons.leadingAnchor.constraint(equalTo: view.leadingAnchor, constant: 20),
-            buttons.trailingAnchor.constraint(equalTo: view.trailingAnchor, constant: -20),
+            buttons.leadingAnchor.constraint(equalTo: guide.leadingAnchor, constant: 20),
+            buttons.trailingAnchor.constraint(equalTo: guide.trailingAnchor, constant: -20),
             buttons.bottomAnchor.constraint(equalTo: guide.bottomAnchor, constant: -16)
         ])
     }
@@ -180,10 +191,18 @@ final class DiagnosticsViewController: UIViewController {
             toast.view.accessibilityLabel = text
             return
         }
+        // 分享面板/别的弹层正开着时不能抢 presentation（会被 UIKit 丢弃），只做播报。
+        guard presentedViewController == nil, view.window != nil else {
+            UIAccessibility.post(notification: .announcement, argument: text)
+            return
+        }
         let alert = UIAlertController(title: nil, message: text, preferredStyle: .alert)
         toast = alert
         present(alert, animated: true)
-        DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) { [weak self, weak alert] in
+        // 1.0 秒对「日志还在读取，请稍候再试。」这类句子太短，VoiceOver 也听不完。
+        // 2.5 秒 + 主动播报，普通用户和辅助功能用户都够。
+        UIAccessibility.post(notification: .announcement, argument: text)
+        DispatchQueue.main.asyncAfter(deadline: .now() + 2.5) { [weak self, weak alert] in
             guard let alert = alert else { return }
             alert.dismiss(animated: true) {
                 if self?.toast === alert { self?.toast = nil }

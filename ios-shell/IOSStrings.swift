@@ -85,6 +85,12 @@ enum IOSStrings {
     /// 这次初始化失败了，但磁盘上还有可用的旧快照：状态行不能只说「已完成」或「待完成」，
     /// 否则会和下面同时展示的错误卡自相矛盾。
     static let recoveryStatusFallback = "面板初始化（失败，可用旧快照进入）"
+    /// 状态行说是失败、但仍可进入时，资源行必须解释「凭什么能进」，
+    /// 否则用户会以为下面那条错误卡和「进入面板」按钮互相矛盾。
+    static let recoveryFallbackHint = "当前使用上次成功下载的面板资源，可以正常进入；联网后可重新初始化。"
+    /// 两个按钮的无障碍说明：没有它 VoiceOver 只会读「进入面板，变暗」，用户不知道为什么点不了。
+    static let recoveryReinitHint = "重新下载面板资源；会覆盖当前使用的快照"
+    static let recoveryEnterDisabledHint = "需要先完成面板初始化，或等下载结束"
     static let recoveryResourceProgress = "资源 %d/%d · %@"
     static let recoveryBytes = "已下载 %@ / %@"
     static let recoveryBytesUnknown = "已下载 %@；总量未知"
@@ -102,7 +108,9 @@ enum IOSStrings {
     static let recoveryBackupTitle = "备份与迁移"
     static let recoveryAppVersionLabel = "iOS App 版本"
     static let recoveryPanelVersionLabel = "面板版本"
-    static let recoveryWebviewLabel = "当前 WebView"
+    /// 原来叫「当前 WebView」但值其实是 UIDevice.systemVersion——WebKit 与系统版本
+    /// 并不绑定（Safari/WebKit 可独立更新），标成 WebView 版本是事实性误导。
+    static let recoveryWebviewLabel = "系统版本"
     static let recoveryMinimumLabel = "最低要求"
     static let recoverySoftwareLineLabel = "软件更新线路"
     static let recoveryUpdate = "检查软件更新"
@@ -145,12 +153,16 @@ enum IOSStrings {
     static let updateFilesCount = "%d 个"
     static let updateManifestCount = "%d 项"
     static let updateCurrentLine = "当前"
+    /// 忙碌时的通用提示标题。不能用「切换更新线路」：正文是「请先完成当前操作」，
+    /// 标题却像已经问过要不要切，前后矛盾。
+    static let updateBusyTitle = "暂时无法操作"
+    static let updateBusyLineMessage = "面板资源正在下载，完成后再切换线路。"
     static let updateChecking = "正在检查…"
     static let updateReinitializeRow = "重新初始化面板资源"
     static let updateShowDiagnostics = "查看诊断日志"
     static let updateValueNone = "—"
     static let updateAppVersionFormat = "%@（%@）"
-    static let updateWebviewFormat = "WKWebView · iOS %@"
+    static let updateWebviewFormat = "iOS %@"
     // 只告知，不给下载入口：新版由用户自行从外部获取并自签覆盖安装。
     static let updateNewVersionMessage = "当前：%@（%@）\n新版：%@（%@）\n\nApp 内不提供下载。请自行从外部获取新版本并自签安装。"
     static let updateLater = "稍后"
@@ -183,6 +195,8 @@ enum IOSStrings {
 
     static let diagnosticsTitle = "面板诊断"
     static let diagnosticsHeader = "面板加载异常。请把下面的日志分享给开发者。"
+    /// 从更新面板「查看诊断日志」手动进来时 App 是正常的，说「面板加载异常」会误导。
+    static let diagnosticsHeaderManual = "以下为最近的运行日志，可在反馈问题时分享给开发者。"
     static let diagnosticsCopy = "复制日志"
     static let diagnosticsShare = "分享日志"
     static let diagnosticsRetry = "重试"
