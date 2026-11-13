@@ -406,7 +406,12 @@ final class IOSSystemSurfacesService: NSObject, IOSBridgeService, IOSBridgeCance
                 status(job)
                 return
             }
-            guard UIApplication.shared.applicationState == .active else { throw SystemSnapshotError("foreground_required") }
+            // 判据用「不是 background」而不是「== .active」：`.inactive` 是短暂过渡态
+            // （下拉通知中心、切换 App 途中、来电横幅），此时页面还在前台跑，
+            // 按 .active 硬拒会把这一帧的前台采样和偏好写入白白丢掉。
+            guard UIApplication.shared.applicationState != .background else {
+                throw SystemSnapshotError("foreground_required")
+            }
             guard !revoking else { throw SystemSnapshotError("system_surfaces_busy") }
             let current = try checkedScope(options)
             let availability = runtimeAvailability()
@@ -1022,7 +1027,11 @@ final class IOSSystemSurfacesService: NSObject, IOSBridgeService, IOSBridgeCance
         scopeChanged()
         var pending: Job?
         do {
-            guard UIApplication.shared.applicationState == .active else { throw SystemSnapshotError("foreground_required") }
+            // 同样的「不是 background」判据：`.inactive` 过渡态也要放行，否则设置页
+            // 在切回 App 的瞬间读小组件配置会被拒（表现为「偏好未能保存」）。
+            guard UIApplication.shared.applicationState != .background else {
+                throw SystemSnapshotError("foreground_required")
+            }
             guard !revoking else { throw SystemSnapshotError("system_surfaces_busy") }
             let currentScope = try checkedScope([:])
             guard let selected = owner else { throw SystemSnapshotError("authorized_vehicle_required") }

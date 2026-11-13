@@ -423,8 +423,9 @@ final class RecoveryViewController: UIViewController {
     private func render(_ state: IOSPanelCache.State) {
         cacheState = state
         let busy = state.busy
+        let ready = state.ready
         // 文案/按钮的「可以用」语义统一走 canEnter（含「失败但旧快照可用」），
-        // 而 ready 只用于「这次初始化成功了」的判断——这里已经不需要它了。
+        // 而 ready 只用于「这次初始化成功了」相关的判断（如按钮文案「重新初始化」）。
         let usable = state.canEnter
 
         // 百分比一律走 state.progress（以「已完成文件数」为主），
@@ -433,10 +434,6 @@ final class RecoveryViewController: UIViewController {
         if state.phase == .downloading {
             let percent = max(0, min(100, Int(state.progress * 100)))
             statusLabel.text = String(format: IOSStrings.recoveryStatusProgress, percent)
-        } else if usable, state.phase == .error {
-            // 失败但旧快照可用：既不能说「已完成」（这次确实失败了），也不能说「未就绪」
-            // （旧快照能进），用独立的一句把两件事都讲清。
-            statusLabel.text = IOSStrings.recoveryStatusFallback
         } else if usable {
             statusLabel.text = IOSStrings.recoveryStatusDone
         } else {
@@ -569,8 +566,9 @@ final class RecoveryViewController: UIViewController {
     }
 
     @objc private func enterTapped() {
-        // 守卫必须与按钮同一个判据（canEnter），否则「初始化失败但旧快照可用」时
-        // 按钮是亮的、点下去却静默 return —— 比灰着更糟，用户会以为 App 卡死。
+        // 守卫必须与按钮的 isEnabled 同判据（state.canEnter）。
+        // 用 ready 会让「初始化失败但磁盘上有旧快照」时按钮亮着、点下去静默无效——
+        // 比灰着更糟，用户会以为 App 坏了。
         guard cacheState.canEnter else { return }
         onEnter?()
     }

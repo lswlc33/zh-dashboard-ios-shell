@@ -212,6 +212,13 @@ python3 -I "$support" prepare-extension --target broadcast --source "$script_dir
 # Widget 只用 StaticConfiguration，不再有 AppIntents 配置需要提取 metadata。
 xcrun nm -g "$broadcast_dir/ZeehoCastBroadcast" | grep 'SampleHandler'
 cp "$script_dir/bridge-bootstrap.js" "$app_dir/bridge-bootstrap.js"
+# 桌面显示名本地化：Info.plist 的 CFBundleDisplayName 基础值必须是纯 ASCII
+# （AltStore/SideStore 用它向 Apple 门户注册 App-ID，中文会被拒成 3009），
+# 中文名由 zh-Hans.lproj/InfoPlist.strings 提供，SpringBoard 按键本地化取到。
+[[ -f "$script_dir/zh-Hans.lproj/InfoPlist.strings" ]] || {
+    printf 'BLOCKED: missing zh-Hans.lproj/InfoPlist.strings（桌面中文名来源）\n' >&2; exit 2; }
+mkdir -p "$app_dir/zh-Hans.lproj"
+cp "$script_dir/zh-Hans.lproj/InfoPlist.strings" "$app_dir/zh-Hans.lproj/InfoPlist.strings"
 # iOS 自己会给 App 图标切圆角，源图必须是「满出血」的正方形：
 # 用普通 icon-512.png 会在四角留透明区（iOS 底下衬白/黑底 → 四角白边），
 # 而且图中自带的圆角会和系统圆角叠成双层。

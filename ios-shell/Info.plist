@@ -3,11 +3,16 @@
 <plist version="1.0"><dict>
     <key>CFBundleIdentifier</key><string>io.github.lswlc33.dashboard.ios</string>
     <key>CFBundleName</key><string>Dashboard</string>
-    <key>CFBundleDisplayName</key><string>几何面板</string>
+    <!-- 基础值必须是纯 ASCII：AltSign/SideSign 拿 CFBundleDisplayName 作为向 Apple
+         注册 App-ID 的 name 字段，非 ASCII（中文）会被 portal 拒成 AltStore/SideStore
+         3009（"The name ... contains invalid characters"）。桌面仍显示中文——由
+         zh-Hans.lproj/InfoPlist.strings 覆盖同名字段：SpringBoard 按键做本地化查找，
+         读到中文；AltStore 只读本文件的基础值。 -->
+    <key>CFBundleDisplayName</key><string>Jeeho Panel</string>
     <key>CFBundleExecutable</key><string>Dashboard</string>
     <key>CFBundlePackageType</key><string>APPL</string>
-    <key>CFBundleShortVersionString</key><string>1.1.5</string>
-    <key>CFBundleVersion</key><string>52</string>
+    <key>CFBundleShortVersionString</key><string>1.1.6</string>
+    <key>CFBundleVersion</key><string>53</string>
     <key>MinimumOSVersion</key><string>15.4</string>
     <key>LSRequiresIPhoneOS</key><true/>
     <key>UIDeviceFamily</key><array><integer>1</integer><integer>2</integer></array>

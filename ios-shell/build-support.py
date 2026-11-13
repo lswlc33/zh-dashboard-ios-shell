@@ -90,6 +90,10 @@ FIXED_INPUTS = {
     'test/ios-session-renewal-contract.mjs', 'test/ios-renewal-handoff-contract.mjs',
     'test/ios-renewal-driver-smoke.mjs',
     'ios-shell/Widgets/Info.plist',
+    # 桌面显示名本地化：Info.plist 的基础 CFBundleDisplayName 必须是纯 ASCII
+    # （AltStore/SideStore 拿它去 Apple 门户注册 App-ID，中文会被拒成 3009），
+    # 中文名放在这里，由 build.sh 拷进 app bundle。
+    'ios-shell/zh-Hans.lproj/InfoPlist.strings',
     'native-shared/build.gradle.kts', 'native-shared/settings.gradle.kts',
     'native-shared/gradlew', 'native-shared/gradle/wrapper/gradle-wrapper.jar',
     'native-shared/gradle/wrapper/gradle-wrapper.properties',

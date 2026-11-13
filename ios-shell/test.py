@@ -175,6 +175,19 @@ def main():
         assert entitlements.get('com.apple.security.application-groups') == [app_group], name
         assert entitlements == (helper.HOST_ENTITLEMENTS if name == 'App.entitlements' else helper.EXTENSION_ENTITLEMENTS)
     assert helper.BROADCAST_ID == bundle_id + '.broadcast'
+    # 桌面显示名必须「基础 ASCII + 中文本地化」：
+    # AltStore/SideStore 拿 Info.plist 的 CFBundleDisplayName 去 Apple 门户注册 App-ID，
+    # 非 ASCII 会被拒成 3009（AltSign 的 resultCode 35）。中文只能放 InfoPlist.strings，
+    # SpringBoard 按键本地化查找，桌面仍显示中文。少任一半都会让自签用户装不上或看到英文。
+    assert info['CFBundleDisplayName'].isascii() and info['CFBundleDisplayName'].strip(), \
+        'CFBundleDisplayName 必须是纯 ASCII，否则 AltStore/SideStore 报 3009'
+    lproj = root / 'zh-Hans.lproj/InfoPlist.strings'
+    assert lproj.is_file(), '缺少 zh-Hans.lproj/InfoPlist.strings：桌面会显示 ASCII 名而不是中文'
+    localized = lproj.read_text(encoding='utf-8')
+    assert '"CFBundleDisplayName"' in localized and '几何面板' in localized, \
+        'zh-Hans 本地化必须覆盖 CFBundleDisplayName 为中文'
+    assert '"CFBundleName"' in localized, '本地化 DisplayName 时必须同时本地化 CFBundleName'
+    assert 'zh-Hans.lproj/InfoPlist.strings' in build_sh, 'build.sh 必须把本地化文件拷进 app bundle'
     with (root / 'Broadcast/Info.plist').open('rb') as f:
         broadcast_info = plistlib.load(f)
     helper.validate_extension_info(broadcast_info, helper.EXTENSIONS['broadcast'], template=True)

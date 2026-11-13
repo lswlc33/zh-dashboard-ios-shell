@@ -381,7 +381,17 @@ final class IOSBridge {
             replyHandler(IOSBridgePolicy.failure(method: method, code: "untrusted_document", requestID: requestID), nil)
             return
         }
+        // 前台判据不能只靠 didBecomeActive 通知：
+        // 1) `foreground` 初值在 init 时取，viewDidLoad 阶段 App 往往还不是 active；
+        // 2) 若通知在观察者注册之前就发过（或系统只发 willResignActive 没发 didEnterBackground），
+        //    它就会永久停在 false，之后每个 RPC 都被 foreground_required 拒掉——
+        //    表现正是「偏好存不了 + 小组件永远没快照」。
+        // 实时校正一次：applicationState 是当下真值，比缓存的布尔可信。
+        if !foreground, UIApplication.shared.applicationState != .background { foregrounded() }
         guard foreground else {
+            // 之前这里静默拒绝，排查时日志里什么都看不到；记一条（含真实 applicationState）。
+            logFailure(method: method, code: "foreground_required",
+                       detail: "state=\(Self.stateName(UIApplication.shared.applicationState))")
             replyHandler(IOSBridgePolicy.failure(method: method, code: "foreground_required", requestID: requestID), nil)
             return
         }
@@ -653,6 +663,16 @@ final class IOSBridge {
         loggedFailures += 1
         let safeMethod = IOSBridgePolicy.methodName(method) ? method : "invalid"
         IOSDiagnostics.shared.log("bridge: 拒绝 method=\(safeMethod) code=\(code) generation=\(generation) \(detail)")
+    }
+
+    /// 只给日志用的可读状态名；不参与任何业务判定。
+    private static func stateName(_ state: UIApplication.State) -> String {
+        switch state {
+        case .active: return "active"
+        case .inactive: return "inactive"
+        case .background: return "background"
+        @unknown default: return "unknown"
+        }
     }
 
     private func reject(_ reply: Pending, _ code: String) {
