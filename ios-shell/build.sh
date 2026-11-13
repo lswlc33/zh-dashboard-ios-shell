@@ -188,6 +188,8 @@ widget_args=(-I "$build_dir" "$build_dir/ZeehoSystemShared.o" "${activity_args[@
     -Xlinker -rpath -Xlinker '@executable_path/Frameworks' -Xlinker -rpath -Xlinker /usr/lib/swift)
 while IFS= read -r module; do
     [[ -d "$sdk_path/System/Library/Frameworks/$module.framework" ]] || { printf 'BLOCKED: imported Widget SDK framework missing: %s\n' "$module" >&2; exit 2; }
+    # WidgetKit 提供 Widget / WidgetConfiguration 协议，必须真实链接；
+    # AppIntents 从 iOS 16 才有，按 deployment target 弱链接（下面单独加）。
     [[ "$module" == ActivityKit || "$module" == AppIntents ]] || widget_args+=(-framework "$module")
 done < "$build_dir/widget-frameworks.txt"
 # AppIntents API 从 iOS 16 开始；具体配置类型另有 iOS 17 availability，15.4 不能强加载它。
