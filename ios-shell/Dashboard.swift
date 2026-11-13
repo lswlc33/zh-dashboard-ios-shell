@@ -815,8 +815,11 @@ final class PanelController: UIViewController, WKNavigationDelegate, WKUIDelegat
     // 关键约束：completionHandler **必须被调用一次**，否则 WebKit 会挂住整段 JS——
     // 页面从此点不动、桥也发不出请求，用户只能杀 App（「看起来能用、点一下死」）。
     // 因此 present 之前先判「能不能展示」；不能展示就立刻用「取消」语义回调。
+    //
+    // 显式写 `self.view`：本类同时是 WKUIDelegate，三个 JS 弹窗回调的参数都叫 webView，
+    // 裸写 `webView` 会让编译器无法确定指代（CI 实测 "type of expression is ambiguous"）。
     private var canPresentFromWebView: Bool {
-        guard webView === web, view.window != nil, presentedViewController == nil else { return false }
+        guard self.view.window != nil, presentedViewController == nil else { return false }
         return true
     }
 
