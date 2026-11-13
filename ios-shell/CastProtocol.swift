@@ -570,13 +570,26 @@ final class IOSCastMailbox {
         let fd = path.withCString { Darwin.open($0, O_CREAT | O_RDWR | O_NOFOLLOW | O_CLOEXEC, mode_t(0o600)) }
         guard fd >= 0 else { throw IOSCastError.reason("cast_grant_lock_unavailable") }
         defer { _ = Darwin.close(fd) }
+        // Darwin 的 C 函数 flock() 与 struct flock 同名，Swift 里 Darwin.flock(...)
+        // 会被解析成结构体默认初始化（argument passed to call that takes no arguments）。
+        // 改用 fcntl + F_SETLK 表达同一把跨进程排它锁，语义与阻塞/非阻塞行为保持一致。
+        func setLock(_ type: Int32) -> Bool {
+            var entry = Darwin.flock()
+            entry.l_type = Int16(type)
+            entry.l_whence = Int16(SEEK_SET)
+            entry.l_start = 0
+            entry.l_len = 0
+            return fcntl(fd, F_SETLK, &entry) == 0
+        }
         let deadline = ProcessInfo.processInfo.systemUptime + 0.1
-        while Darwin.flock(fd, LOCK_EX | LOCK_NB) != 0 {
-            guard errno == EWOULDBLOCK || errno == EINTR else { throw IOSCastError.reason("cast_grant_lock_failed") }
+        while !setLock(F_WRLCK) {
+            guard errno == EWOULDBLOCK || errno == EACCES || errno == EINTR else {
+                throw IOSCastError.reason("cast_grant_lock_failed")
+            }
             guard ProcessInfo.processInfo.systemUptime < deadline else { throw IOSCastError.reason("cast_grant_lock_timeout") }
             usleep(1000)
         }
-        defer { _ = Darwin.flock(fd, LOCK_UN) }
+        defer { _ = setLock(F_UNLCK) }
         return try action()
     }
     private func notifyGrantChanged() {
