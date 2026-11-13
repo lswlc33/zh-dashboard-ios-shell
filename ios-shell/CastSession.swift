@@ -366,15 +366,15 @@ final class IOSCastService: IOSBridgeCancellableService {
         let tier: String = heartbeat?.tier ?? preferredSettings.tier
         let retries: Int = heartbeat?.retries ?? 0
         let probeAccepted: Bool = heartbeat?.probeAccepted ?? false
-        let listeners: [String] = heartbeat?.listenersReady ?? []
-        let ports: [String] = heartbeat?.connectedPorts ?? []
+        let listeners: [UInt16] = heartbeat?.listenersReady ?? []
+        let ports: [UInt16] = heartbeat?.connectedPorts ?? []
         let encoderReady: Bool = heartbeat?.encoderReady == true
-        let environment: String = environmentError()
-        let sentFrames: Int = heartbeat?.sentFrames ?? 0
-        let sentBytes: Int = heartbeat?.sentBytes ?? 0
-        let keyframes: Int = heartbeat?.keyframes ?? 0
-        let emptyPulls: Int = heartbeat?.emptyPulls ?? 0
-        let droppedFrames: Int = heartbeat?.droppedFrames ?? 0
+        let environment: Any = environmentError()
+        let sentFrames: UInt64 = heartbeat?.sentFrames ?? 0
+        let sentBytes: UInt64 = heartbeat?.sentBytes ?? 0
+        let keyframes: UInt64 = heartbeat?.keyframes ?? 0
+        let emptyPulls: UInt64 = heartbeat?.emptyPulls ?? 0
+        let droppedFrames: UInt64 = heartbeat?.droppedFrames ?? 0
         let width: Int = heartbeat?.width ?? 0
         let height: Int = heartbeat?.height ?? 0
         let fps: Int = heartbeat?.fps ?? 0
