@@ -150,6 +150,10 @@ def main():
     # 公告位用可换行的 message（全能签读），不写 nsfw 冒充公告。
     assert helper.SOURCE_MESSAGE.count('\n') == 3
     assert helper.SOURCE_MESSAGE.startswith('本软件完全免费，请勿购买和付费。')
+    # 全能签源级身份：identifier 是源标识、sourceURL 是源地址、sourceicon 是源图标。
+    assert helper.SOURCE_IDENTIFIER == 'io.github.lswlc33.dashboard.ios.source'
+    assert helper.SOURCE_URL.endswith('/app/version2.json') and helper.SOURCE_URL.startswith('https://')
+    assert helper.SOURCE_ICON_URL.endswith('/app/icon-ios-1024.png')
     assert 'ios-shell/publish-artifacts.py' in helper.FIXED_INPUTS, '移交闸门必须进指纹白名单'
     assert 'dashboard-trollstore.ipa' not in build_sh
 

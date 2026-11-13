@@ -27,6 +27,9 @@ IPA_URL = 'https://zhb.xn--fiqz59cpva341l.top/app/zeehowebnext.ipa'
 RELEASE_NOTES = '解决了一些已知问题。\n\n目前软件处于快速更新迭代中，请及时更新并反馈问题'
 SOURCE_ICON_NAME = 'icon-ios-1024.png'
 SOURCE_ICON_URL = 'https://zhb.xn--fiqz59cpva341l.top/app/icon-ios-1024.png'
+# 全能签源清单的源级身份与回链：identifier 在签名工具里是源标识，sourceURL 是源地址。
+SOURCE_URL = 'https://zhb.xn--fiqz59cpva341l.top/app/version2.json'
+SOURCE_IDENTIFIER = 'io.github.lswlc33.dashboard.ios.source'
 # 源简介只保留一句事实描述；仓库地址与 ad-hoc 说明不进客户端介绍（详情见产物仓库 README）。
 SOURCE_DESCRIPTION = ('几何面板是独立的极核电动车数据面板，提供车况、电量、骑行记录和已适配车辆设置。'
                       'iOS 客户端使用 WKWebView 与原生桥，支持账号管理、面板资源更新和 iOS App 更新')
@@ -996,18 +999,26 @@ def source_json(path, report, release_date):
     name = info.get('CFBundleDisplayName')
     require(isinstance(name, str) and name.strip(), 'App display name must come from host Info.plist')
     download = IPA_URL + '?sha256=' + metadata['sha256']
+    # 全能签 versionDate 带时区，AltStore date 是 UTC Z；同一时刻两种写法，不是两套时间。
+    stamp = datetime.datetime.strptime(validate_release_date(release_date), '%Y-%m-%dT%H:%M:%SZ')
     version = {'version': metadata['version'], 'buildVersion': metadata['build'],
                'date': validate_release_date(release_date), 'localizedDescription': RELEASE_NOTES,
                'downloadURL': download, 'size': metadata['size'],
                'minOSVersion': info['MinimumOSVersion']}
     return {'name': '几何面板 iOS 官方源', 'subtitle': '几何面板 iOS 客户端与最新版本更新',
-            'description': SOURCE_DESCRIPTION, 'message': SOURCE_MESSAGE, 'iconURL': SOURCE_ICON_URL,
+            'description': SOURCE_DESCRIPTION, 'message': SOURCE_MESSAGE,
+            'identifier': SOURCE_IDENTIFIER, 'sourceURL': SOURCE_URL,
+            'sourceicon': SOURCE_ICON_URL, 'iconURL': SOURCE_ICON_URL,
             'website': 'https://github.com/lswlc33/zeeho-3d-models',
-            'apps': [{'name': name, 'bundleIdentifier': info['CFBundleIdentifier'], 'developerName': 'lswlc33',
+            'apps': [{'name': name, 'type': '1', 'bundleIdentifier': info['CFBundleIdentifier'],
+                      'developerName': 'lswlc33',
                       'subtitle': '极核电动车车况与骑行数据面板', 'localizedDescription': SOURCE_DESCRIPTION,
                       'iconURL': SOURCE_ICON_URL, 'category': 'utilities',
                       # 全能签扁平字段：与 versions[0] 同值，缺一个就识别不到可装版本。
+                      # lock=0 表示不锁定，isLanZouCloud=0 表示不走蓝奏云直链。
                       'version': version['version'], 'downloadURL': download, 'size': version['size'],
+                      'versionDate': stamp.strftime('%Y-%m-%dT%H:%M:%S+00:00'),
+                      'versionDescription': RELEASE_NOTES, 'lock': '0', 'isLanZouCloud': '0',
                       'versions': [version],
                       'appPermissions': {'entitlements': sorted(entitlement_keys), 'privacy': privacy}}], 'news': []}
 
@@ -1047,6 +1058,17 @@ def from_source(value):
         require({key: app.get(key) for key in flat}
                 == {'version': version, 'downloadURL': download, 'size': latest['size']},
                 'Flat universal-signer fields must equal the latest version')
+        # versionDate/versionDescription 是全能签的版本时间与说明位，必须与 AltStore 那份同义，
+        # 否则同一个版本在两种工具里显示不同的更新说明与时间。
+        require(app.get('versionDescription') == latest['localizedDescription'],
+                'Universal-signer versionDescription must equal localizedDescription')
+        require(isinstance(app.get('versionDate'), str)
+                and re.fullmatch(r'\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\+00:00', app['versionDate'])
+                and datetime.datetime.strptime(app['versionDate'][:19], '%Y-%m-%dT%H:%M:%S').replace(
+                    tzinfo=datetime.timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ') == latest['date'],
+                'Universal-signer versionDate must be the same instant as the AltStore date')
+        for key, value in {'type': '1', 'lock': '0', 'isLanZouCloud': '0'}.items():
+            require(app.get(key) == value, 'Universal-signer field mismatch: ' + key)
     return {'version': version, 'build': build, 'bundleIdentifier': app['bundleIdentifier'],
             'minimumIOS': latest['minOSVersion'], 'architecture': 'arm64', 'installer': 'TrollStore',
             'file': IPA_NAME, 'size': latest['size'], 'sha256': digest,
