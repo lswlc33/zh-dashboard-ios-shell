@@ -356,33 +356,45 @@ final class IOSCastService: IOSBridgeCancellableService {
             return grant.revoked
         } ?? false
         let streaming = !revoked && heartbeat?.streaming == true
-        // 拆成显式字典再分组写入：整块嵌套字面量让 Swift 类型检查器超时（真实 CI 报出）。
-        var value: [String: Any] = [
-            "ok": true, "version": 1, "sessionId": sessionID ?? "", "ticket": sessionID ?? "",
-            "attemptId": activeCall?.attemptID ?? "",
-            "phase": revoked ? localPhase : (streaming ? "casting" : localPhase),
-            "reason": localReason, "streaming": streaming,
-            "broadcastActive": heartbeat?.broadcastActive == true,
-            "projectionReady": !revoked && heartbeat?.broadcastActive == true,
+        // 全部先落到显式类型变量，再一次性写入字典。
+        // 直接写带可选链的大型字面量会让 Swift 类型检查器超时（真实 CI 两次报出）。
+        let session: String = sessionID ?? ""
+        let attempt: String = activeCall?.attemptID ?? ""
+        let phase: String = revoked ? localPhase : (streaming ? "casting" : localPhase)
+        let broadcastActive: Bool = heartbeat?.broadcastActive == true
+        let projectionReady: Bool = !revoked && broadcastActive
+        let tier: String = heartbeat?.tier ?? preferredSettings.tier
+        let retries: Int = heartbeat?.retries ?? 0
+        let probeAccepted: Bool = heartbeat?.probeAccepted ?? false
+        let listeners: [String] = heartbeat?.listenersReady ?? []
+        let ports: [String] = heartbeat?.connectedPorts ?? []
+        let encoderReady: Bool = heartbeat?.encoderReady == true
+        let environment: String = environmentError()
+        let sentFrames: Int = heartbeat?.sentFrames ?? 0
+        let sentBytes: Int = heartbeat?.sentBytes ?? 0
+        let keyframes: Int = heartbeat?.keyframes ?? 0
+        let emptyPulls: Int = heartbeat?.emptyPulls ?? 0
+        let droppedFrames: Int = heartbeat?.droppedFrames ?? 0
+        let width: Int = heartbeat?.width ?? 0
+        let height: Int = heartbeat?.height ?? 0
+        let fps: Int = heartbeat?.fps ?? 0
+        let bitrate: Int = heartbeat?.bitrate ?? 0
+        let stats: [String: Any] = ["sentFrames": sentFrames, "sentBytes": sentBytes,
+                                    "keyframes": keyframes, "emptyPulls": emptyPulls,
+                                    "droppedFrames": droppedFrames]
+        let encoder: [String: Any] = ["width": width, "height": height, "fps": fps,
+                                      "bitrate": bitrate, "codec": "H264", "hardware": encoderReady]
+        let value: [String: Any] = [
+            "ok": true, "version": 1, "sessionId": session, "ticket": session, "attemptId": attempt,
+            "phase": phase, "reason": localReason, "streaming": streaming,
+            "broadcastActive": broadcastActive, "projectionReady": projectionReady,
             "projectionPending": selectionIsPending, "wifiConnected": wifiConnected,
-            "captureSource": "screen", "audio": false,
-            "compatibilityTier": heartbeat?.tier ?? preferredSettings.tier,
-            "retries": heartbeat?.retries ?? 0,
-            "probeAccepted": heartbeat?.probeAccepted ?? false,
-            "listenersReady": heartbeat?.listenersReady ?? [],
-            "connectedPorts": heartbeat?.connectedPorts ?? [],
-            "encoderReady": heartbeat?.encoderReady ?? false,
-            "savedProfile": NSNull(), "environmentError": environmentError(), "experimental": true
-        ]
-        value["stats"] = [
-            "sentFrames": heartbeat?.sentFrames ?? 0, "sentBytes": heartbeat?.sentBytes ?? 0,
-            "keyframes": heartbeat?.keyframes ?? 0, "emptyPulls": heartbeat?.emptyPulls ?? 0,
-            "droppedFrames": heartbeat?.droppedFrames ?? 0
-        ]
-        value["encoder"] = [
-            "width": heartbeat?.width ?? 0, "height": heartbeat?.height ?? 0,
-            "fps": heartbeat?.fps ?? 0, "bitrate": heartbeat?.bitrate ?? 0,
-            "codec": "H264", "hardware": heartbeat?.encoderReady == true
+            "captureSource": "screen", "audio": false, "compatibilityTier": tier,
+            "retries": retries, "probeAccepted": probeAccepted,
+            "listenersReady": listeners, "connectedPorts": ports,
+            "encoderReady": encoderReady, "savedProfile": NSNull(),
+            "environmentError": environment, "experimental": true,
+            "stats": stats, "encoder": encoder
         ]
         return value
     }
