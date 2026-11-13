@@ -142,8 +142,9 @@ final class IOSCastEncoder {
         let options: CFDictionary? = forceKeyframe ? [kVTEncodeFrameOptionKey_ForceKeyFrame: true] as CFDictionary : nil
         forceKeyframe = false; lastPTS = pts; inFlight += 1
         var flags = VTEncodeInfoFlags()
-        let status = VTCompressionSessionEncodeFrameWithOutputHandler(session, pixel, pts,
-            CMTime(value: 1, timescale: Int32(plan.fps)), options, &flags) { [weak self] status, flags, sample in
+        let status = VTCompressionSessionEncodeFrame(session, imageBuffer: pixel, presentationTimeStamp: pts,
+            duration: CMTime(value: 1, timescale: Int32(plan.fps)), frameProperties: options,
+            infoFlagsOut: &flags) { [weak self] status, flags, sample in
                 guard let self = self else { return }
                 self.queue.async { [weak self] in
                     guard let self = self, self.generation == epoch, self.running else { return }
