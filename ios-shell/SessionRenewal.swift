@@ -94,7 +94,15 @@ final class IOSSessionRenewalService: IOSBridgeCancellableService {
         }
     }
     init(secrets: IOSSecretHandleService) { self.secrets = secrets }
-    deinit { run?.fetch?.cancel(); run?.prepareTimeout?.cancel(); run?.operationTimeout?.cancel() }
+    deinit {
+        // run/timeout 属性是主线程专属状态（全文件 precondition(Thread.isMainThread)），
+        // Swift 不保证 deinit 落在主线程——跨线程读它们是数据竞争。DispatchWorkItem.cancel()
+        // 本身线程安全，把读取与取消挪回主队列（参照 Bridge.deinit 的收尾写法）。
+        let fetch = run?.fetch, prepare = run?.prepareTimeout, operation = run?.operationTimeout
+        DispatchQueue.main.async {
+            fetch?.cancel(); prepare?.cancel(); operation?.cancel()
+        }
+    }
     func configureScopeProvider(_ provider: @escaping () -> IOSRideScope?) { precondition(Thread.isMainThread); scopeProvider = provider }
     func configureSessionMetadataProvider(_ provider: @escaping () -> [String: Any]?) { precondition(Thread.isMainThread); metadataProvider = provider }
     func configureRecordingProvider(_ provider: @escaping () -> IOSSessionRenewalLease?) { precondition(Thread.isMainThread); recordingProvider = provider }

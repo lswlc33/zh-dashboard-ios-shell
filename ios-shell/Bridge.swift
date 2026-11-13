@@ -748,7 +748,11 @@ final class IOSBridge {
         mediaReply = reply
         let timer = DispatchWorkItem { [weak self, weak service] in
             guard let self = self, self.mediaID == id else { return }
-            service?.navigationChanged()
+            // 只撤本次媒体授权请求：navigationChanged 会 invalidate 整个 SystemService 的
+            // 全部在途 job（notifications.status 等无关任务被连坐）。kind 按 System 侧
+            // mediaKind 的同款映射构造，cancel 的指纹匹配才命中。
+            let kind = type == .cameraAndMicrophone ? "cameraAndAudio" : type == .camera ? "camera" : "audio"
+            (service as? IOSBridgeCancellableService)?.cancel(method: "media.capture", args: [["kind": kind]])
             self.finishMedia(.deny, id: id)
         }
         mediaTimer = timer
