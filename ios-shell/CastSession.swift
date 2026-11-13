@@ -356,22 +356,35 @@ final class IOSCastService: IOSBridgeCancellableService {
             return grant.revoked
         } ?? false
         let streaming = !revoked && heartbeat?.streaming == true
-        return ["ok": true, "version": 1, "sessionId": sessionID ?? "", "ticket": sessionID ?? "",
-                "attemptId": activeCall?.attemptID ?? "", "phase": revoked ? localPhase : (streaming ? "casting" : localPhase),
-                "reason": localReason, "streaming": streaming, "broadcastActive": heartbeat?.broadcastActive == true,
-                "projectionReady": !revoked && heartbeat?.broadcastActive == true,
-                "projectionPending": selectionIsPending, "wifiConnected": wifiConnected,
-                "captureSource": "screen", "audio": false, "compatibilityTier": heartbeat?.tier ?? preferredSettings.tier,
-                "retries": heartbeat?.retries ?? 0, "probeAccepted": heartbeat?.probeAccepted ?? false,
-                "listenersReady": heartbeat?.listenersReady ?? [], "connectedPorts": heartbeat?.connectedPorts ?? [],
-                "encoderReady": heartbeat?.encoderReady ?? false, "savedProfile": NSNull(),
-                "environmentError": environmentError(),
-                "stats": ["sentFrames": heartbeat?.sentFrames ?? 0, "sentBytes": heartbeat?.sentBytes ?? 0,
-                          "keyframes": heartbeat?.keyframes ?? 0, "emptyPulls": heartbeat?.emptyPulls ?? 0,
-                          "droppedFrames": heartbeat?.droppedFrames ?? 0],
-                "encoder": ["width": heartbeat?.width ?? 0, "height": heartbeat?.height ?? 0,
-                            "fps": heartbeat?.fps ?? 0, "bitrate": heartbeat?.bitrate ?? 0, "codec": "H264", "hardware": heartbeat?.encoderReady == true],
-                "experimental": true]
+        // 拆成显式字典再分组写入：整块嵌套字面量让 Swift 类型检查器超时（真实 CI 报出）。
+        var value: [String: Any] = [
+            "ok": true, "version": 1, "sessionId": sessionID ?? "", "ticket": sessionID ?? "",
+            "attemptId": activeCall?.attemptID ?? "",
+            "phase": revoked ? localPhase : (streaming ? "casting" : localPhase),
+            "reason": localReason, "streaming": streaming,
+            "broadcastActive": heartbeat?.broadcastActive == true,
+            "projectionReady": !revoked && heartbeat?.broadcastActive == true,
+            "projectionPending": selectionIsPending, "wifiConnected": wifiConnected,
+            "captureSource": "screen", "audio": false,
+            "compatibilityTier": heartbeat?.tier ?? preferredSettings.tier,
+            "retries": heartbeat?.retries ?? 0,
+            "probeAccepted": heartbeat?.probeAccepted ?? false,
+            "listenersReady": heartbeat?.listenersReady ?? [],
+            "connectedPorts": heartbeat?.connectedPorts ?? [],
+            "encoderReady": heartbeat?.encoderReady ?? false,
+            "savedProfile": NSNull(), "environmentError": environmentError(), "experimental": true
+        ]
+        value["stats"] = [
+            "sentFrames": heartbeat?.sentFrames ?? 0, "sentBytes": heartbeat?.sentBytes ?? 0,
+            "keyframes": heartbeat?.keyframes ?? 0, "emptyPulls": heartbeat?.emptyPulls ?? 0,
+            "droppedFrames": heartbeat?.droppedFrames ?? 0
+        ]
+        value["encoder"] = [
+            "width": heartbeat?.width ?? 0, "height": heartbeat?.height ?? 0,
+            "fps": heartbeat?.fps ?? 0, "bitrate": heartbeat?.bitrate ?? 0,
+            "codec": "H264", "hardware": heartbeat?.encoderReady == true
+        ]
+        return value
     }
     private func record(_ code: String) {
         guard code != lastDiagnostic else { return }
