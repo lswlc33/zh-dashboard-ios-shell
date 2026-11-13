@@ -194,12 +194,36 @@ while IFS= read -r module; do
 done < "$build_dir/widget-frameworks.txt"
 # AppIntents API 从 iOS 16 开始；具体配置类型另有 iOS 17 availability，15.4 不能强加载它。
 widget_args+=(-Xlinker -weak_framework -Xlinker AppIntents)
-# AppIntents metadata 提取依赖 Swift 编译器产出的 const-values；
-# 没有该文件时 processor 会报 "No swift const values found" 并跳过输出。
-# -emit-const-values 显式启用，-emit-const-values-path 指定写入位置（只给路径不会写文件）。
+# AppIntents metadata 提取依赖 Swift 编译器产出的 const-values 文件。
+# 关键点：const-values 只在**编译**（-c）阶段产出；我们最终产物是「编译 + 链接」
+# 一次调用，driver 不会为这种整体任务写 const-values（前面两轮 CI 都印证了文件缺失）。
+# 因此单独跑一次「只编译」的 pass 专门拿 const-values，再照常编译链接最终可执行文件。
+widget_const_values="$build_dir/widget-const-vals.json"
+emit_widget_const_values() {
+    xcrun --sdk iphoneos swiftc -O -swift-version 5 -parse-as-library -application-extension \
+        -target arm64-apple-ios15.4 -sdk "$sdk_path" -module-name DashboardWidgets \
+        -I "$build_dir" -c -whole-module-optimization \
+        "$@" "${widget_sources[@]}" -o "$build_dir/widget-const-values.o" >/dev/null 2>&1
+}
+const_values_ready=false
+for variant in \
+    "-emit-const-values-path $widget_const_values" \
+    "-Xfrontend -emit-const-values-path -Xfrontend $widget_const_values" \
+    "-Xfrontend -emit-const-values-path=$widget_const_values"; do
+    rm -f "$widget_const_values"
+    # shellcheck disable=SC2086 # 三种写法需要按空格拆成独立参数
+    if emit_widget_const_values $variant && [[ -s "$widget_const_values" ]]; then
+        const_values_ready=true
+        printf 'Widget const-values emitted via: %s\n' "$variant"
+        break
+    fi
+done
+[[ "$const_values_ready" == true ]] || {
+    printf '%s\n' 'BLOCKED: swiftc produced no const-values under any known flag form; AppIntents metadata cannot be extracted.' >&2
+    exit 2
+}
 xcrun --sdk iphoneos swiftc -O -swift-version 5 -parse-as-library -application-extension \
     -target arm64-apple-ios15.4 -sdk "$sdk_path" -module-name DashboardWidgets \
-    -emit-const-values -emit-const-values-path "$build_dir/widget-const-vals.json" \
     "${widget_args[@]}" "${widget_sources[@]}" -o "$widget_dir/DashboardWidgets"
 
 # ReplayKit 的标准 upload extension 仍由 _NSExtensionMain 进入 NSObject 子类 SampleHandler。
@@ -227,22 +251,19 @@ python3 -I "$support" prepare-extension --target broadcast --source "$script_dir
     --host-info "$app_dir/Info.plist" --destination "$broadcast_dir/Info.plist"
 # 在签名之前从真实 Widget executable/源码提取系统配置 metadata，不造目录/伪造 actionsdata。
 # Xcode 16.4 只接受列表文件：--source-file-list / --swift-const-vals-list。
-# Widget 没有编译器生成的 supplementary const-values 时传空列表（= 没有额外常量），
-# 这与伪造 actionsdata 不同：产物里出现的 metadata 仍必须由真实源码提取。
 swiftc_path="$(xcrun --sdk iphoneos --find swiftc)"
 toolchain_dir="$(CDPATH= cd -- "$(dirname -- "$swiftc_path")/../.." && pwd -P)"
 xcode_version="$(xcodebuild -version | awk 'NR==1{print $2}')"
 printf '%s\n' "${widget_sources[@]}" > "$build_dir/widget-sources-list.txt"
 # --swift-const-vals-list 要的是「每行一个 const-values 文件路径」的列表，
-# 不是编译器产出的 JSON 本身；没有该文件时 processor 提取不到任何 AppIntents 符号。
-printf '%s\n' "$build_dir/widget-const-vals.json" > "$build_dir/widget-const-vals-list.txt"
+# 不是编译器产出的 JSON 本身；文件已由上面的独立编译 pass 保证存在且非空。
+printf '%s\n' "$widget_const_values" > "$build_dir/widget-const-vals-list.txt"
 xcrun --sdk iphoneos appintentsmetadataprocessor \
     --output "$widget_dir" --target-triple arm64-apple-ios15.4 --module-name DashboardWidgets \
     --toolchain-dir "$toolchain_dir" --sdk-root "$sdk_path" \
     --platform-family iphoneos --deployment-target 15.4 --xcode-version "$xcode_version" \
     --source-file-list "$build_dir/widget-sources-list.txt" \
     --swift-const-vals-list "$build_dir/widget-const-vals-list.txt"
-[[ -s "$build_dir/widget-const-vals.json" ]] || { printf '%s\n' 'BLOCKED: Widget compilation produced no const-values; AppIntents metadata cannot be extracted.' >&2; exit 2; }
 [[ -s "$widget_dir/Metadata.appintents/extract.actionsdata" ]] || { printf '%s\n' 'BLOCKED: real Widget AppIntents metadata extraction produced no actionsdata; no IPA generated.' >&2; exit 2; }
 xcrun nm -g "$broadcast_dir/ZeehoCastBroadcast" | grep 'SampleHandler'
 cp "$script_dir/bridge-bootstrap.js" "$app_dir/bridge-bootstrap.js"
