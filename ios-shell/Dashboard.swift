@@ -812,11 +812,17 @@ final class PanelController: UIViewController, WKNavigationDelegate, WKUIDelegat
     /// 放行口径与媒体权限一致：只认本站 origin，第三方页面一律拒绝。
     /// 传感器数据只用做观感（仪表倾斜），不参与任何业务判据，也不上传。
     /// （本工程 deployment target 是 iOS 15.4，该回调 iOS 15.0 起可用。）
+    ///
+    /// 判定复用 `isTrustedOrigin(scheme:host:port:)`：WKSecurityOrigin 没有 url 属性
+    /// （CI 编译报过 "value of type 'WKSecurityOrigin' has no member 'url'"），
+    /// 而那个方法正好收这三个属性，还已经处理了默认端口、本地 scheme 与 punycode 两种域名形态。
     func webView(_ webView: WKWebView,
                  requestDeviceOrientationAndMotionPermissionFor origin: WKSecurityOrigin,
                  initiatedByFrame frame: WKFrameInfo,
                  decisionHandler: @escaping (WKPermissionDecision) -> Void) {
-        guard webView === web, PanelNavigation.isPanel(origin.url) else { decisionHandler(.deny); return }
+        guard webView === web,
+              PanelNavigation.isTrustedOrigin(scheme: origin.protocol, host: origin.host, port: origin.port)
+        else { decisionHandler(.deny); return }
         decisionHandler(.grant)
     }
 
