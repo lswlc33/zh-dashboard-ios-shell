@@ -92,8 +92,15 @@ enum PanelNavigation {
         return parts.url
     }
 
+    /// 可以交给系统打开的外链 scheme 白名单。
+    ///
+    /// 这里是**唯一**的外链闸门：`decidePolicyFor` 与 `createWebViewWith` 都先问它。
+    /// 地图类 scheme 必须逐个列出——网页的「选择导航地图」提供高德/百度/腾讯/Google
+    /// 四个入口，只认 iosamap 会让另外三个静默失败（壳 cancel 掉、网页看起来"点了没反应"）。
+    /// tel/mailto 是面板里的联系方式入口。
     static func isExternal(_ url: URL) -> Bool {
-        ["https", "http", "iosamap", "tel", "mailto"].contains(url.scheme?.lowercased() ?? "")
+        ["https", "http", "iosamap", "baidumap", "qqmap", "comgooglemaps", "tel", "mailto"]
+            .contains(url.scheme?.lowercased() ?? "")
     }
 
     /// 判断某个 (scheme, host, port) 三元组是否属于当前面板 origin。

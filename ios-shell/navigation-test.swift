@@ -26,6 +26,11 @@ enum NavigationTest {
             "javascript:alert(1)"
         ] { assert(!PanelNavigation.isPanel(URL(string: value)!), value) }
         assert(PanelNavigation.isExternal(URL(string: "iosamap://path")!))
+        // 「选择导航地图」提供四个入口，全部必须放行；只认 iosamap 会让百度/腾讯/Google
+        // 静默失败（壳 cancel、网页看起来"点了没反应"）。
+        assert(PanelNavigation.isExternal(URL(string: "baidumap://map/direction?mode=driving")!))
+        assert(PanelNavigation.isExternal(URL(string: "qqmap://map/routeplan?type=drive")!))
+        assert(PanelNavigation.isExternal(URL(string: "comgooglemaps://?daddr=1,2&directionsmode=driving")!))
         assert(PanelNavigation.isExternal(URL(string: "https://example.com")!))
         assert(!PanelNavigation.isExternal(URL(string: "javascript:alert(1)")!))
         assert(!PanelNavigation.isExternal(URL(string: "file:///etc/passwd")!))

@@ -35,5 +35,12 @@
          白屏时用户需要把日志发给开发者，不连电脑也能做到。 -->
     <key>UIFileSharingEnabled</key><true/>
     <key>LSSupportsOpeningDocumentsInPlace</key><true/>
-    <key>LSApplicationQueriesSchemes</key><array><string>iosamap</string></array>
+    <key>LSApplicationQueriesSchemes</key>
+    <array>
+        <!-- 面板「选择导航地图」的四个入口 + 系统设置/电话/邮件。 -->
+        <string>iosamap</string>
+        <string>baidumap</string>
+        <string>qqmap</string>
+        <string>comgooglemaps</string>
+    </array>
 </dict></plist>
