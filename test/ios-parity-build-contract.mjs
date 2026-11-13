@@ -21,19 +21,20 @@ assert.ok(!input.broadcastSwiftImports.some(n => ['ZeehoShared', 'ZeehoSystemSha
 assert.deepEqual(set(input.swiftImports), set([...input.hostModuleImports, ...input.sharedSwiftImports]));
 assert.ok(input.systemLibraries.includes('z'));
 assert.ok(!input.systemFrameworks.includes('CommonCrypto'));
-assert.ok(input.widgetSystemFrameworks.includes('AppIntents'));
+// Widget 统一 StaticConfiguration，不再引入 AppIntents 或 AppIntents 意图源文件。
+assert.ok(!input.widgetSystemFrameworks.includes('AppIntents'));
 const records = set(input.files.map(r => r.path));
-for (const name of ['Broadcast/Info.plist', 'Entitlements/Broadcast.entitlements', 'CastProtocol.swift', 'CastEncoder.swift', 'Widgets/WidgetVehicleIntent.swift']) {
+for (const name of ['Broadcast/Info.plist', 'Entitlements/Broadcast.entitlements', 'CastProtocol.swift', 'CastEncoder.swift']) {
   assert.ok(records.has('ios-shell/' + name), name);
 }
+assert.ok(![...records].some(n => n.endsWith('Widgets/WidgetVehicleIntent.swift')), 'AppIntents 意图文件应已移除');
 assert.ok(![...records].some(n => /Inductive(?:Cloud|Session)\.swift$/.test(n)));
 const build = readFileSync(path.join(shell, 'build.sh'), 'utf8');
 for (const token of ['-module-name ZeehoCastBroadcast', '-Xlinker -e -Xlinker _NSExtensionMain',
   '--scan-executable "$broadcast_dir/ZeehoCastBroadcast"', '--scan-folder "$broadcast_dir/Frameworks"',
-  'appintentsmetadataprocessor', '--source-file-list "$build_dir/widget-sources-list.txt"',
-  '--swift-const-vals-list "$build_dir/widget-const-vals-list.txt"',
-  'Metadata.appintents/extract.actionsdata', '-weak_framework -Xlinker AppIntents']) assert.ok(build.includes(token), token);
-assert.ok(build.indexOf('appintentsmetadataprocessor \\') < build.indexOf('codesign --force'), 'Metadata must precede signing');
+  'xcrun --sdk iphoneos swiftc']) assert.ok(build.includes(token), token);
+assert.ok(!build.includes('appintentsmetadataprocessor') && !build.includes('Metadata.appintents'),
+  'StaticConfiguration 不需要 AppIntents metadata');
 assert.ok(build.indexOf('Entitlements/Broadcast.entitlements') < build.indexOf('Entitlements/Widgets.entitlements'));
 assert.ok(build.indexOf('Entitlements/Widgets.entitlements') < build.indexOf('Entitlements/App.entitlements'));
 

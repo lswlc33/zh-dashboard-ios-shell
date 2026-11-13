@@ -68,7 +68,7 @@ done
 [[ -f "$script_dir/bridge-bootstrap.js" ]] || missing+=('ios-shell/bridge-bootstrap.js')
 if [[ "$(uname -s)" == Darwin ]] && command -v xcrun >/dev/null 2>&1; then
     xcrun --sdk iphoneos --show-sdk-path >/dev/null 2>&1 || missing+=('iPhoneOS SDK (full Xcode, not only Command Line Tools)')
-    for tool in swiftc swift-stdlib-tool lipo otool nm appintentsmetadataprocessor; do
+    for tool in swiftc swift-stdlib-tool lipo otool nm; do
         xcrun --sdk iphoneos --find "$tool" >/dev/null 2>&1 || missing+=("Xcode $tool")
     done
     xcodebuild -version >/dev/null 2>&1 || missing+=('usable Xcode license/first-launch setup; prepare it manually')
@@ -85,18 +85,6 @@ if [[ ! "$java_version" =~ version\ \"21[.\"] ]]; then
     printf '%s\n' 'BLOCKED: JDK 21 is required. Set JAVA_HOME to your existing JDK; this script does not install it.' >&2
     exit 2
 fi
-# AppIntents 不能只链接 framework 就声称配置可发现；先核本机工具实际支持的参数。
-# Xcode 16.4 的真实契约是「列表文件」而不是裸 --source-files/--binary-file；
-# 缺任一项 processor 会 Unable to parse options 直接失败，所以按可用参数逐项校验。
-intents_help="$(xcrun --sdk iphoneos appintentsmetadataprocessor --help 2>&1 || true)"
-intents_required=(--output --target-triple --module-name --toolchain-dir --sdk-root
-                  --source-file-list --swift-const-vals-list --platform-family --deployment-target --xcode-version)
-for flag in "${intents_required[@]}"; do
-    if ! printf '%s\n' "$intents_help" | grep -q -- "$flag"; then
-        printf 'BLOCKED: appintentsmetadataprocessor lacks required flag: %s\n' "$flag" >&2
-        exit 2
-    fi
-done
 input_args=(--root "$repo_dir")
 if [[ -n "$source_manifest" ]]; then input_args+=(--source-manifest "$source_manifest"); fi
 # 只读检查源码、框架契约与传入的上传快照，不创建 build/dist，也不调用 Gradle。
@@ -188,40 +176,12 @@ widget_args=(-I "$build_dir" "$build_dir/ZeehoSystemShared.o" "${activity_args[@
     -Xlinker -rpath -Xlinker '@executable_path/Frameworks' -Xlinker -rpath -Xlinker /usr/lib/swift)
 while IFS= read -r module; do
     [[ -d "$sdk_path/System/Library/Frameworks/$module.framework" ]] || { printf 'BLOCKED: imported Widget SDK framework missing: %s\n' "$module" >&2; exit 2; }
-    # WidgetKit 提供 Widget / WidgetConfiguration 协议，必须真实链接；
-    # AppIntents 从 iOS 16 才有，按 deployment target 弱链接（下面单独加）。
+    # WidgetKit 提供 Widget / WidgetConfiguration 协议，必须真实链接。
     [[ "$module" == ActivityKit || "$module" == AppIntents ]] || widget_args+=(-framework "$module")
 done < "$build_dir/widget-frameworks.txt"
-# AppIntents API 从 iOS 16 开始；具体配置类型另有 iOS 17 availability，15.4 不能强加载它。
-widget_args+=(-Xlinker -weak_framework -Xlinker AppIntents)
-# AppIntents metadata 提取依赖 Swift 编译器产出的 const-values 文件。
-# 关键点：const-values 只在**编译**（-c）阶段产出；我们最终产物是「编译 + 链接」
-# 一次调用，driver 不会为这种整体任务写 const-values（前面两轮 CI 都印证了文件缺失）。
-# 因此单独跑一次「只编译」的 pass 专门拿 const-values，再照常编译链接最终可执行文件。
-widget_const_values="$build_dir/widget-const-vals.json"
-emit_widget_const_values() {
-    xcrun --sdk iphoneos swiftc -O -swift-version 5 -parse-as-library -application-extension \
-        -target arm64-apple-ios15.4 -sdk "$sdk_path" -module-name DashboardWidgets \
-        -I "$build_dir" -c -whole-module-optimization \
-        "$@" "${widget_sources[@]}" -o "$build_dir/widget-const-values.o" >/dev/null 2>&1
-}
-const_values_ready=false
-for variant in \
-    "-emit-const-values-path $widget_const_values" \
-    "-Xfrontend -emit-const-values-path -Xfrontend $widget_const_values" \
-    "-Xfrontend -emit-const-values-path=$widget_const_values"; do
-    rm -f "$widget_const_values"
-    # shellcheck disable=SC2086 # 三种写法需要按空格拆成独立参数
-    if emit_widget_const_values $variant && [[ -s "$widget_const_values" ]]; then
-        const_values_ready=true
-        printf 'Widget const-values emitted via: %s\n' "$variant"
-        break
-    fi
-done
-[[ "$const_values_ready" == true ]] || {
-    printf '%s\n' 'BLOCKED: swiftc produced no const-values under any known flag form; AppIntents metadata cannot be extracted.' >&2
-    exit 2
-}
+# 目标系统已是 iOS 27，Widget 统一使用 StaticConfiguration，不再有 AppIntentConfiguration。
+# 因此不再需要 AppIntents metadata（const-values 提取在手写 swiftc 流程下无法产出），
+# 也不再把 AppIntents 作为弱链接依赖引入。
 xcrun --sdk iphoneos swiftc -O -swift-version 5 -parse-as-library -application-extension \
     -target arm64-apple-ios15.4 -sdk "$sdk_path" -module-name DashboardWidgets \
     "${widget_args[@]}" "${widget_sources[@]}" -o "$widget_dir/DashboardWidgets"
@@ -249,22 +209,7 @@ python3 -I "$support" prepare-widget --source "$script_dir/Widgets/Info.plist" \
     --host-info "$app_dir/Info.plist" --destination "$widget_dir/Info.plist"
 python3 -I "$support" prepare-extension --target broadcast --source "$script_dir/Broadcast/Info.plist" \
     --host-info "$app_dir/Info.plist" --destination "$broadcast_dir/Info.plist"
-# 在签名之前从真实 Widget executable/源码提取系统配置 metadata，不造目录/伪造 actionsdata。
-# Xcode 16.4 只接受列表文件：--source-file-list / --swift-const-vals-list。
-swiftc_path="$(xcrun --sdk iphoneos --find swiftc)"
-toolchain_dir="$(CDPATH= cd -- "$(dirname -- "$swiftc_path")/../.." && pwd -P)"
-xcode_version="$(xcodebuild -version | awk 'NR==1{print $2}')"
-printf '%s\n' "${widget_sources[@]}" > "$build_dir/widget-sources-list.txt"
-# --swift-const-vals-list 要的是「每行一个 const-values 文件路径」的列表，
-# 不是编译器产出的 JSON 本身；文件已由上面的独立编译 pass 保证存在且非空。
-printf '%s\n' "$widget_const_values" > "$build_dir/widget-const-vals-list.txt"
-xcrun --sdk iphoneos appintentsmetadataprocessor \
-    --output "$widget_dir" --target-triple arm64-apple-ios15.4 --module-name DashboardWidgets \
-    --toolchain-dir "$toolchain_dir" --sdk-root "$sdk_path" \
-    --platform-family iphoneos --deployment-target 15.4 --xcode-version "$xcode_version" \
-    --source-file-list "$build_dir/widget-sources-list.txt" \
-    --swift-const-vals-list "$build_dir/widget-const-vals-list.txt"
-[[ -s "$widget_dir/Metadata.appintents/extract.actionsdata" ]] || { printf '%s\n' 'BLOCKED: real Widget AppIntents metadata extraction produced no actionsdata; no IPA generated.' >&2; exit 2; }
+# Widget 只用 StaticConfiguration，不再有 AppIntents 配置需要提取 metadata。
 xcrun nm -g "$broadcast_dir/ZeehoCastBroadcast" | grep 'SampleHandler'
 cp "$script_dir/bridge-bootstrap.js" "$app_dir/bridge-bootstrap.js"
 # iOS 自己会给 App 图标切圆角，源图必须是「满出血」的正方形：

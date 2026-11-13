@@ -489,19 +489,16 @@ final class IOSSystemSurfacesService: NSObject, IOSBridgeService, IOSBridgeCance
             liveSupported = supported && declaredLive
             authorization = liveSupported && ActivityAuthorizationInfo().areActivitiesEnabled
         }
-        let metadata = plugin.appendingPathComponent("Metadata.appintents", isDirectory: true)
-        let intentMetadata = (try? metadata.resourceValues(forKeys: [.isDirectoryKey]).isDirectory) == true
-            && ((try? FileManager.default.contentsOfDirectory(atPath: metadata.path).isEmpty) == false)
-        var configurable = false
-        if #available(iOS 17.0, *) { configurable = supported && intentMetadata }
+        // 当前只用 StaticConfiguration：不再暴露「每实例选车」能力，避免声称一个没有注册的配置。
+        let configurable = false
         let reason: String? = !group ? "app_group_unavailable" : (!embedded ? "widget_extension_missing" : nil)
         let liveReason = reason ?? (!declaredLive ? "live_activities_not_declared" : (!liveSupported ? "ios_16_1_required" : (!authorization ? "live_activities_disabled" : "available")))
         return ["supported": supported, "embedded": embedded, "appGroupAvailable": group,
                 "liveActivitiesSupported": liveSupported, "authorizationEnabled": authorization,
                 "reason": reason as Any? ?? NSNull(), "liveActivitiesReason": liveReason,
                 "verification": "runtime_bundle_check", "minimumLiveActivitiesIOS": "16.1",
-                "perInstanceVehicleMinimumIOS": "17.0", "perInstanceVehicleSelection": configurable,
-                "intentMetadataAvailable": intentMetadata, "backgroundPolling": false, "refreshBudget": "os_managed"]
+                "perInstanceVehicleMinimumIOS": NSNull(), "perInstanceVehicleSelection": configurable,
+                "backgroundPolling": false, "refreshBudget": "os_managed"]
     }
 
     private func status(_ job: Job) {
@@ -538,7 +535,7 @@ final class IOSSystemSurfacesService: NSObject, IOSBridgeService, IOSBridgeCance
             "liveActivities": live, "widgets": ["supported": supported, "enabled": supported && approved && persistedSnapshot != nil,
                 "appGroupAvailable": availability["appGroupAvailable"] ?? false, "embedded": availability["embedded"] ?? false,
                 "kind": Self.widgetKind, "placement": "os_managed", "reason": availability["reason"] ?? NSNull(),
-                "perInstanceVehicleSelection": configurable, "perInstanceMinimumIOS": "17.0",
+                "perInstanceVehicleSelection": configurable, "perInstanceMinimumIOS": NSNull(),
                 "supportedFamilies": ["systemSmall", "systemMedium", "systemLarge"], "refreshBudget": "os_managed", "displayed": false],
             "snapshot": stored, "scope": owner.map(ownerJSON) as Any? ?? NSNull(),
             "reason": lastError as Any? ?? availability["reason"] ?? NSNull(), "backgroundPolling": false,
@@ -927,10 +924,6 @@ final class IOSSystemSurfacesService: NSObject, IOSBridgeService, IOSBridgeCance
         let now = ProcessInfo.processInfo.systemUptime
         guard force || edge != lastWidgetEdge || now - lastWidgetReload >= 300 else { return false }
         WidgetCenter.shared.reloadTimelines(ofKind: Self.widgetKind)
-        // iOS 17 的每实例选车版本使用独立 kind，刷新时一并请求。
-        if #available(iOS 17.0, *) {
-            WidgetCenter.shared.reloadTimelines(ofKind: "ZeehoVehicleWidgetConfigured")
-        }
         lastWidgetEdge = edge; lastWidgetReload = now
         return true
     }
@@ -1076,7 +1069,7 @@ final class IOSSystemSurfacesService: NSObject, IOSBridgeService, IOSBridgeCance
                         case .success(var value):
                             if operation != "settings" { value["reloadRequested"] = self.reloadWidgets(force: true, snapshot: self.latest) }
                             value["perInstanceVehicleSelection"] = self.runtimeAvailability()["perInstanceVehicleSelection"] as? Bool == true
-                            value["perInstanceMinimumIOS"] = "17.0"
+                            value["perInstanceMinimumIOS"] = NSNull()
                             WidgetCenter.shared.getCurrentConfigurations { result in
                                 DispatchQueue.main.async { [weak self] in
                                     guard let self = self, self.current(job) else { return }

@@ -76,7 +76,7 @@ FIXED_INPUTS = {
     'ios-shell/Entitlements/Broadcast.entitlements', 'ios-shell/Broadcast/Info.plist',
     CAST_SHARED_SOURCE, CAST_ENCODER_SOURCE, 'ios-shell/CastSession.swift',
     'ios-shell/Broadcast/SampleHandler.swift', 'ios-shell/VehicleNetwork.swift',
-    'ios-shell/WallpaperPackage.swift', 'ios-shell/Widgets/WidgetVehicleIntent.swift',
+    'ios-shell/WallpaperPackage.swift',
     # 后台续期：通用 secret 句柄 + 有界签名核验 + 蓝牙握手执行器都在公开构建输入内，
     # 但它们只含通用算法/状态机，vendor 字段与配方仍由私有网页下发。
     'ios-shell/SecretHandles.swift', 'ios-shell/SessionRenewal.swift', 'ios-shell/BLERecipe.swift',
@@ -292,7 +292,7 @@ def inventory(root, expected=None):
     require('ZeehoShared' not in target_modules['shared'] | target_modules['widgets'] | target_modules['broadcast'],
             'Shared/Widgets/Broadcast must not import KMP')
     require('ZeehoSystemShared' not in target_modules['broadcast'], 'Broadcast must not depend on the Widget shared module')
-    require({'SwiftUI', 'WidgetKit', 'AppIntents', 'ZeehoSystemShared'} <= target_modules['widgets'], 'Widget target/module contract is missing')
+    require({'SwiftUI', 'WidgetKit', 'ZeehoSystemShared'} <= target_modules['widgets'], 'Widget target/module contract is missing')
     require({'CoreBluetooth', 'Network', 'NetworkExtension', 'ReplayKit'} <= modules,
             'Host must link real generic BLE/Network/Hotspot/ReplayKit system APIs')
     require({'ReplayKit', 'Network', 'VideoToolbox', 'CoreMedia', 'CoreVideo'} <= target_modules['broadcast'],
@@ -886,9 +886,11 @@ def validate_ipa(path, expected_info=None):
             require({'@executable_path/Frameworks', '@executable_path/../../Frameworks', '/usr/lib/swift'} <= set(code['rpaths']),
                     'Extension runtime search paths are incomplete: ' + key)
             if key == 'widgets':
-                for dependency in ('ActivityKit', 'AppIntents'):
-                    imports = [i for i in code['imports'] if '/' + dependency + '.framework/' in i['path']]
-                    require(imports and all(i['weak'] for i in imports), 'iOS 15.4 Widget must weak-link ' + dependency)
+                # Widget 只用 StaticConfiguration，不再依赖 AppIntents；ActivityKit 仍需弱链接。
+                imports = [i for i in code['imports'] if '/ActivityKit.framework/' in i['path']]
+                require(imports and all(i['weak'] for i in imports), 'iOS 15.4 Widget must weak-link ActivityKit')
+                require(not any('/AppIntents.framework/' in i['path'] for i in code['imports']),
+                        'Widget no longer uses AppIntents; it must not link it')
             if key == 'broadcast':
                 require(any('/ReplayKit.framework/' in i['path'] for i in code['imports'])
                         and any('/VideoToolbox.framework/' in i['path'] for i in code['imports']),
@@ -915,12 +917,12 @@ def validate_ipa(path, expected_info=None):
                 reports[name] = macho(data, 6)
             elif data.startswith((b'\xcf\xfa\xed\xfe', b'\xfe\xed\xfa\xcf', b'\xca\xfe\xba\xbe', b'!<arch>\n')):
                 raise ValueError('Unexpected executable/archive in IPA: ' + name)
+        # Widget 已统一用 StaticConfiguration，不再声明 AppIntents 配置，因此包内不应出现
+        # Metadata.appintents；如果出现了，说明构建还在用旧的 AppIntentConfiguration。
         metadata_prefix = extension_prefixes['widgets'] + 'Metadata.appintents/'
-        metadata_files = sorted(n for n in names if n.startswith(metadata_prefix) and not n.endswith('/'))
-        require(metadata_prefix + 'extract.actionsdata' in metadata_files
-                and bool(archive.read(metadata_prefix + 'extract.actionsdata')), 'Widget AppIntents metadata is missing/empty')
-        widget_metadata = [{'path': n[len(app_prefix):], 'size': len(archive.read(n)),
-                            'sha256': hashlib.sha256(archive.read(n)).hexdigest()} for n in metadata_files]
+        require(not any(n.startswith(metadata_prefix) for n in names),
+                'Widget must not embed AppIntents metadata: StaticConfiguration only')
+        widget_metadata = []
         dynamic = app_prefix + 'Frameworks/ZeehoShared.framework/ZeehoShared'
         linkage = 'static'
         if dynamic in reports:
@@ -1106,7 +1108,6 @@ def write_release(ipa, inputs_path, framework, app):
         'swift': subprocess.check_output(['xcrun', '--sdk', 'iphoneos', 'swiftc', '--version'], text=True, encoding='utf-8').strip(),
         'iphoneosSDK': subprocess.check_output(['xcrun', '--sdk', 'iphoneos', '--show-sdk-path'], text=True, encoding='utf-8').strip(),
         'swiftStdlibTool': subprocess.check_output(['xcrun', '--find', 'swift-stdlib-tool'], text=True, encoding='utf-8').strip(),
-        'appIntentsMetadataProcessor': subprocess.check_output(['xcrun', '--find', 'appintentsmetadataprocessor'], text=True, encoding='utf-8').strip(),
         'java': subprocess.check_output(['java', '-version'], stderr=subprocess.STDOUT, text=True, encoding='utf-8').strip(),
         'python': sys.version.split()[0],
     }

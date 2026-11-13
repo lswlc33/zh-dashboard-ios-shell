@@ -211,14 +211,12 @@ struct ZeehoVehicleWidget: Widget {
 
 @main
 struct ZeehoWidgets: WidgetBundle {
-    // WidgetBundleBuilder 不支持 if/else 控制流，只支持无 else 的可用性条件；
-    // 因此 iOS 17 配置版用独立 kind 条件注册，旧版 StaticConfiguration 保持原 kind，
-    // 已添加到桌面的旧组件不会因升级而丢失。
+    // 目标系统已是 iOS 27，不再保留 iOS 17 的 AppIntentConfiguration 分支：
+    // 那套需要 AppIntents metadata 提取，而手写 swiftc 流程产不出 const-values。
+    // 统一用 StaticConfiguration，组件按 SystemWidgetSettings 的默认车辆显示；
+    // Live Activity 仍从 iOS 16.1 起条件注册。
     var body: some Widget {
         ZeehoVehicleWidget()
-        if #available(iOS 17.0, *) {
-            ZeehoConfiguredVehicleWidget()
-        }
         if #available(iOS 16.1, *) {
             ZeehoLiveActivityWidget()
         }

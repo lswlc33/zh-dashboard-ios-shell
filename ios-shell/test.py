@@ -170,11 +170,15 @@ def main():
     for token in ('--broadcast-list', '--broadcast-framework-list', '--host-module-imports-list',
                   '-module-name ZeehoCastBroadcast', 'prepare-extension --target broadcast',
                   '--scan-executable "$broadcast_dir/ZeehoCastBroadcast"',
-                  '--scan-folder "$broadcast_dir/Frameworks"', 'Entitlements/Broadcast.entitlements',
-                  'appintentsmetadataprocessor', '--source-file-list "$build_dir/widget-sources-list.txt"',
-                  '--swift-const-vals-list "$build_dir/widget-const-vals-list.txt"',
-                  'Metadata.appintents/extract.actionsdata', '-weak_framework -Xlinker AppIntents'):
+                  '--scan-folder "$broadcast_dir/Frameworks"', 'Entitlements/Broadcast.entitlements'):
         assert token in build_sh, token
+    # Widget 统一 StaticConfiguration：bundle 只注册 StaticConfiguration 控件与 Live Activity，
+    # 不再有条件注册的 AppIntentConfiguration，也不调用 metadata 处理器。
+    widget_bundle = (root / 'Widgets/ZeehoWidgets.swift').read_text(encoding='utf-8')
+    assert 'ZeehoVehicleWidget()' in widget_bundle, 'Widget bundle 必须注册 StaticConfiguration 控件'
+    assert 'AppIntentConfiguration(' not in widget_bundle, 'StaticConfiguration 之外不应再有 AppIntent 控件'
+    assert 'appintentsmetadataprocessor' not in build_sh and 'Metadata.appintents' not in build_sh, \
+        'StaticConfiguration 不需要 AppIntents metadata，构建脚本不应再依赖它'
     assert build_sh.index('--entitlements "$script_dir/Entitlements/Broadcast.entitlements"') < \
         build_sh.index('--entitlements "$script_dir/Entitlements/Widgets.entitlements"') < \
         build_sh.index('--entitlements "$script_dir/Entitlements/App.entitlements"'), '签名必须 Broadcast/Widget/App 由内到外'
