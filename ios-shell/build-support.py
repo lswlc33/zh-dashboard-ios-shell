@@ -42,14 +42,46 @@ FRAMEWORK_RELATIVE = 'native-shared/build/bin/iosArm64/releaseFramework/ZeehoSha
 WIDGET_ID = BUNDLE_ID + '.widgets'
 WIDGET_DIRECTORY = 'PlugIns/DashboardWidgets.appex/'
 APP_GROUP = 'group.io.github.lswlc33.dashboard.ios'
+BROADCAST_PRODUCT = 'ZeehoCastBroadcast'
+BROADCAST_ID = BUNDLE_ID + '.broadcast'
+BROADCAST_DIRECTORY = 'PlugIns/ZeehoCastBroadcast.appex/'
+CAST_SHARED_SOURCE = 'ios-shell/CastProtocol.swift'
+CAST_ENCODER_SOURCE = 'ios-shell/CastEncoder.swift'
+# 文件名由各原生代理拥有；目标归属显式声明，不能把 Encoder 或 Bridge 顺手塞进 extension。
+EXTENSIONS = {
+    'widgets': {'product': 'DashboardWidgets', 'bundleID': WIDGET_ID,
+                'directory': WIDGET_DIRECTORY, 'point': 'com.apple.widgetkit-extension',
+                'plist': 'ios-shell/Widgets/Info.plist', 'entitlements': 'ios-shell/Entitlements/Widgets.entitlements'},
+    'broadcast': {'product': BROADCAST_PRODUCT, 'bundleID': BROADCAST_ID,
+                  'directory': BROADCAST_DIRECTORY, 'point': 'com.apple.broadcast-services-upload',
+                  'plist': 'ios-shell/Broadcast/Info.plist', 'entitlements': 'ios-shell/Entitlements/Broadcast.entitlements'},
+}
+HOST_ENTITLEMENTS = {'com.apple.security.application-groups': [APP_GROUP],
+                     'com.apple.developer.networking.HotspotConfiguration': True,
+                     'com.apple.developer.networking.wifi-info': True}
+EXTENSION_ENTITLEMENTS = {'com.apple.security.application-groups': [APP_GROUP]}
+PRIVATE_SOURCE_NAMES = {'InductiveCloud.swift', 'InductiveSession.swift'}
+# 仅匹配本轮新增的私有协议标记；基线已公开 UUID/KMP codec 不在本轮追溯删除范围。
+PRIVATE_SWIFT_RE = re.compile(r'\b(?:IOSWallpaperWire|IOSInductiveCloud|IOSInductiveSession)\b|'
+                              r'0x(?:7000001[01]|1000004[3-6]|8000004[35])\b|'
+                              r'\b(?:statusPort|dataPort|mediaPort|controlPort)\s*:\s*UInt16\s*=\s*109[0-9]{2}\b', re.I)
 # iOS 图标源：必须满出血（radius=0）、1024×1024。build.sh 指向它。
 IOS_ICON = 'public/icons/icon-ios-1024.png'
 # 归档进 zip 时必须是 LF 的脚本：CRLF 会让 Mac/Linux 的 bash 把 `\` 续行吃掉。
 SHELL_SCRIPTS = ('ios-shell/build.sh', 'native-shared/gradlew')
 FIXED_INPUTS = {
     'ios-shell/Info.plist', 'ios-shell/build.sh', 'ios-shell/build-support.py',
-    'ios-shell/test.py', 'ios-shell/bridge-bootstrap.js',
+    'ios-shell/test.py', 'ios-shell/bridge-bootstrap.js', 'test/ios-parity-build-contract.mjs',
     'ios-shell/Entitlements/App.entitlements', 'ios-shell/Entitlements/Widgets.entitlements',
+    'ios-shell/Entitlements/Broadcast.entitlements', 'ios-shell/Broadcast/Info.plist',
+    CAST_SHARED_SOURCE, CAST_ENCODER_SOURCE, 'ios-shell/CastSession.swift',
+    'ios-shell/Broadcast/SampleHandler.swift', 'ios-shell/VehicleNetwork.swift',
+    'ios-shell/WallpaperPackage.swift', 'ios-shell/Widgets/WidgetVehicleIntent.swift',
+    # 后台续期：通用 secret 句柄 + 有界签名核验 + 蓝牙握手执行器都在公开构建输入内，
+    # 但它们只含通用算法/状态机，vendor 字段与配方仍由私有网页下发。
+    'ios-shell/SecretHandles.swift', 'ios-shell/SessionRenewal.swift', 'ios-shell/BLERecipe.swift',
+    'test/ios-session-renewal-contract.mjs', 'test/ios-renewal-handoff-contract.mjs',
+    'test/ios-renewal-driver-smoke.mjs',
     'ios-shell/Widgets/Info.plist',
     'native-shared/build.gradle.kts', 'native-shared/settings.gradle.kts',
     'native-shared/gradlew', 'native-shared/gradle/wrapper/gradle-wrapper.jar',
@@ -154,13 +186,15 @@ def safe_relative(name):
 
 def public_input(name):
     parts = safe_relative(name)
+    if parts[-1] in PRIVATE_SOURCE_NAMES:
+        return False
     if name in FIXED_INPUTS or name in OPTIONAL_INPUTS:
         return True
     if any(p.startswith('.') or p in {'private', 'config', 'node_modules', 'build', 'dist'} for p in parts):
         return False
     if parts[0] == 'ios-shell' and name.endswith('.swift') and not name.endswith('-test.swift'):
         return (len(parts) == 2) or (
-            len(parts) == 3 and parts[1] in {'Shared', 'Widgets'})
+            len(parts) == 3 and parts[1] in {'Shared', 'Widgets', 'Broadcast'})
     return (len(parts) >= 5 and parts[:2] == ('native-shared', 'src')
             and parts[2] in SOURCE_SETS and parts[3] == 'kotlin' and name.endswith('.kt')
             and all(not p.startswith('.') and p not in {'private', 'config', 'node_modules'} for p in parts))
@@ -207,10 +241,10 @@ def inventory(root, expected=None):
     require(not missing, 'Missing build inputs (no replacement is generated):\n  ' + '\n  '.join(missing))
     names = set(FIXED_INPUTS)
     names.update(name for name in OPTIONAL_INPUTS if root.joinpath(*name.split('/')).is_file())
-    for directory in ('', 'Shared', 'Widgets'):
+    for directory in ('', 'Shared', 'Widgets', 'Broadcast'):
         for path in (root / 'ios-shell' / directory).glob('*.swift'):
             name = path.relative_to(root).as_posix()
-            if path.name.endswith('-test.swift'):
+            if path.name.endswith('-test.swift') or path.name in PRIVATE_SOURCE_NAMES:
                 continue
             require(public_input(name), 'Swift source outside public build paths: ' + name)
             names.add(name)
@@ -232,30 +266,48 @@ def inventory(root, expected=None):
     require(header.startswith(b'\x89PNG\r\n\x1a\n') and struct.unpack_from('>II', header, 16) == (1024, 1024),
             IOS_ICON + ' must be a 1024x1024 PNG (full-bleed, radius=0)')
     swift = sorted(n for n in names if n.startswith('ios-shell/') and n.endswith('.swift')
-                   and len(n.split('/')) == 2)
+                   and len(n.split('/')) == 2 and n != CAST_ENCODER_SOURCE)
     shared = sorted(n for n in names if n.startswith('ios-shell/Shared/') and n.endswith('.swift'))
     widgets = sorted(n for n in names if n.startswith('ios-shell/Widgets/') and n.endswith('.swift'))
-    require(swift and len(shared) >= 3 and widgets, 'Host/Shared/Widgets sources missing; no replacement extension is generated')
+    broadcast = sorted({CAST_SHARED_SOURCE, CAST_ENCODER_SOURCE} |
+                       {n for n in names if n.startswith('ios-shell/Broadcast/') and n.endswith('.swift')})
+    require(swift and len(shared) >= 3 and widgets and len(broadcast) >= 3,
+            'Host/Shared/Widgets/Broadcast sources missing; no replacement extension is generated')
+    require(set(swift) & set(broadcast) == {CAST_SHARED_SOURCE}, 'Only CastProtocol.swift may be shared by Host/Broadcast')
     target_modules = {}
-    for target, source_names in (('host', swift), ('shared', shared), ('widgets', widgets)):
+    for target, source_names in (('host', swift), ('shared', shared), ('widgets', widgets), ('broadcast', broadcast)):
         modules = set()
         for name in source_names:
             source = regular_source(root, name).read_text(encoding='utf-8')
-            require(not re.search(r'canImport\s*\(\s*(?:ZeehoShared|ActivityKit|WidgetKit)\s*\)', source), 'Conditional framework fallback is forbidden: ' + name)
+            require(not re.search(r'canImport\s*\(', source), 'Conditional framework fallback is forbidden: ' + name)
+            require(not PRIVATE_SWIFT_RE.search(source), 'Private protocol Swift must stay outside build/upload inputs: ' + name)
+            if target == 'broadcast':
+                require(not re.search(r'\b(?:IOSBridge\w*|IOSStore|IOSRideScope|IOSVehicleNetworkService)\b', source),
+                        'Broadcast must not depend on Host Bridge/business services: ' + name)
             modules.update(IMPORT_RE.findall(source))
         target_modules[target] = modules
-    modules = target_modules['host']
-    require('ZeehoShared' in modules, 'Business Swift must import the real ZeehoShared framework; no fallback build')
-    require('ZeehoShared' not in target_modules['shared'] | target_modules['widgets'], 'Shared/Widgets must not import KMP')
-    require({'SwiftUI', 'WidgetKit', 'ZeehoSystemShared'} <= target_modules['widgets'], 'Widget target/module contract is missing')
-    for template in ('App.entitlements', 'Widgets.entitlements'):
-        with regular_source(root, 'ios-shell/Entitlements/' + template).open('rb') as stream:
+    # Shared 的 object 真正链接进 Host；把 imports 合并，不能遗漏其系统框架。
+    modules = target_modules['host'] | target_modules['shared']
+    require('ZeehoShared' in target_modules['host'], 'Business Swift must import the real ZeehoShared framework; no fallback build')
+    require('ZeehoShared' not in target_modules['shared'] | target_modules['widgets'] | target_modules['broadcast'],
+            'Shared/Widgets/Broadcast must not import KMP')
+    require('ZeehoSystemShared' not in target_modules['broadcast'], 'Broadcast must not depend on the Widget shared module')
+    require({'SwiftUI', 'WidgetKit', 'AppIntents', 'ZeehoSystemShared'} <= target_modules['widgets'], 'Widget target/module contract is missing')
+    require({'CoreBluetooth', 'Network', 'NetworkExtension', 'ReplayKit'} <= modules,
+            'Host must link real generic BLE/Network/Hotspot/ReplayKit system APIs')
+    require({'ReplayKit', 'Network', 'VideoToolbox', 'CoreMedia', 'CoreVideo'} <= target_modules['broadcast'],
+            'Broadcast must compile its real ReplayKit/network/encoder sources')
+    for name, contract in EXTENSIONS.items():
+        with regular_source(root, contract['entitlements']).open('rb') as stream:
             entitlements = plistlib.load(stream)
-        require(entitlements == {'com.apple.security.application-groups': [APP_GROUP]}, 'Only the public App Group template may enter source archives')
-    with regular_source(root, 'ios-shell/Widgets/Info.plist').open('rb') as stream:
-        widget_info = plistlib.load(stream)
-    require(widget_info.get('NSExtension', {}).get('NSExtensionPointIdentifier') == 'com.apple.widgetkit-extension'
-            and 'EXAppExtensionAttributes' not in widget_info, 'Expected a real WidgetKit NSExtension, not ExtensionKit')
+        require(entitlements == EXTENSION_ENTITLEMENTS, 'Extension must contain only the public App Group template: ' + name)
+        with regular_source(root, contract['plist']).open('rb') as stream:
+            extension_info = plistlib.load(stream)
+        validate_extension_info(extension_info, contract, template=True)
+    with regular_source(root, 'ios-shell/Entitlements/App.entitlements').open('rb') as stream:
+        host_entitlements = plistlib.load(stream)
+    require(host_entitlements == HOST_ENTITLEMENTS,
+            'Host template must contain exactly App Group, HotspotConfiguration and wifi-info; this is not provisioning approval')
     for name in ('native-shared/build.gradle.kts', 'native-shared/settings.gradle.kts'):
         text = regular_source(root, name).read_text(encoding='utf-8')
         require(not re.search(r'org\.jetbrains\.compose|androidx\.compose|compose\.multiplatform', text), 'Compose/CMP is not part of the UIKit shared-core architecture')
@@ -283,12 +335,17 @@ def inventory(root, expected=None):
         'sharedTask': ':linkReleaseFrameworkIosArm64', 'jvmTestTask': ':jvmTest',
         'version': info['CFBundleShortVersionString'], 'sourceBuild': info['CFBundleVersion'],
         'swiftSources': swift, 'sharedSwiftSources': shared, 'widgetSwiftSources': widgets,
+        'broadcastSwiftSources': broadcast, 'hostModuleImports': sorted(target_modules['host']),
         'swiftImports': sorted(modules), 'sharedSwiftImports': sorted(target_modules['shared']),
         'widgetSwiftImports': sorted(target_modules['widgets']),
+        'broadcastSwiftImports': sorted(target_modules['broadcast']),
         'systemFrameworks': sorted(modules - BUILTIN_MODULES - set(SYSTEM_LIBRARIES) - {'ZeehoShared', 'ZeehoSystemShared'}),
         'sharedSystemFrameworks': sorted(target_modules['shared'] - BUILTIN_MODULES),
-        'widgetSystemFrameworks': sorted(target_modules['widgets'] - BUILTIN_MODULES - {'ZeehoSystemShared'}),
-        'systemLibraries': sorted(SYSTEM_LIBRARIES[m] for m in modules if m in SYSTEM_LIBRARIES),
+        'widgetSystemFrameworks': sorted((target_modules['widgets'] | target_modules['shared']) - BUILTIN_MODULES - {'ZeehoSystemShared'}),
+        'broadcastSystemFrameworks': sorted(target_modules['broadcast'] - BUILTIN_MODULES - set(SYSTEM_LIBRARIES)),
+        'systemLibraries': sorted({SYSTEM_LIBRARIES[m] for m in modules if m in SYSTEM_LIBRARIES}),
+        'broadcastSystemLibraries': sorted({SYSTEM_LIBRARIES[m] for m in target_modules['broadcast'] if m in SYSTEM_LIBRARIES}),
+        'extensions': EXTENSIONS,
         'files': records,
     }
 
@@ -349,9 +406,40 @@ def validate_info(info, executable='Dashboard', bundle_id=BUNDLE_ID):
     require(info.get('NSSupportsLiveActivities') is True, 'Host must declare NSSupportsLiveActivities')
     require(info.get('MinimumOSVersion') == MINIMUM_IOS, 'Deployment must be iOS 15.4')
     require('NSAppTransportSecurity' not in info, 'Do not package an ATS bypass')
+    require(isinstance(info.get('NSLocalNetworkUsageDescription'), str)
+            and bool(info['NSLocalNetworkUsageDescription'].strip()), 'Local TCP networking requires a user-facing purpose string')
+    require('NSBonjourServices' not in info, 'Pure TCP networking must not declare Bonjour discovery')
+    require(isinstance(info.get('NSBluetoothAlwaysUsageDescription'), str)
+            and bool(info['NSBluetoothAlwaysUsageDescription'].strip()), 'Native BLE requires a user-facing purpose string')
     require(re.fullmatch(r'\d{1,4}\.\d{1,4}(?:\.\d{1,4})?', info.get('CFBundleShortVersionString', '')), 'Invalid release version')
     require(re.fullmatch(r'[1-9][0-9]*', info.get('CFBundleVersion', ''))
             and int(info['CFBundleVersion']) <= 2**53 - 1, 'Invalid/unsafe build number')
+
+
+def validate_extension_info(info, contract, host=None, template=False):
+    """按 extension point 精确验证，不能为了第二个 appex 放开所有嵌套 executable。"""
+    extension = info.get('NSExtension', {})
+    require(isinstance(extension, dict) and extension.get('NSExtensionPointIdentifier') == contract['point']
+            and 'EXAppExtensionAttributes' not in info, 'Invalid extension point/type: ' + contract['product'])
+    if contract['point'] == 'com.apple.broadcast-services-upload':
+        principals = ({'$(PRODUCT_MODULE_NAME).SampleHandler', contract['product'] + '.SampleHandler'}
+                      if template else {contract['product'] + '.SampleHandler'})
+        require(extension.get('NSExtensionPrincipalClass') in principals
+                and extension.get('RPBroadcastProcessMode') == 'RPBroadcastProcessModeSampleBuffer'
+                and 'RPBroadcastProcessMode' not in extension.get('NSExtensionAttributes', {})
+                and 'NSExtensionMainStoryboard' not in extension, 'Broadcast principal class/sample-buffer contract missing')
+    else:
+        require('NSExtensionPrincipalClass' not in extension and 'NSExtensionMainStoryboard' not in extension,
+                'WidgetKit must retain its WidgetBundle entry contract')
+    if not template:
+        require(info.get('CFBundlePackageType') == 'XPC!' and info.get('CFBundleExecutable') == contract['product']
+                and info.get('CFBundleIdentifier') == contract['bundleID']
+                and info.get('MinimumOSVersion') == MINIMUM_IOS
+                and info.get('CFBundleSupportedPlatforms') == ['iPhoneOS'], 'Invalid appex identity/deployment')
+        if host is not None:
+            require(info.get('CFBundleVersion') == host['CFBundleVersion']
+                    and info.get('CFBundleShortVersionString') == host['CFBundleShortVersionString'], 'Host/appex version mismatch')
+    require('NSAppTransportSecurity' not in info and 'NSBonjourServices' not in info, 'Extension must not bypass ATS/add Bonjour')
 
 
 def archive_sources(root, output, manifest_path):
@@ -563,7 +651,7 @@ def macho(data, expected_type, signed=True, expected_minimum=0x000F0400):
                 require(isinstance(entitlements, dict), 'Invalid signature entitlements')
                 signature_metadata['entitlements'] = entitlements
         require(directories, 'Code signature has no CodeDirectory')
-    shared_symbols, widget_symbols, main_symbols = [], [], []
+    shared_symbols, widget_symbols, main_symbols, objc_classes = [], [], [], []
     extension_entry_address = None
     if symtab:
         symbol_offset, count, string_offset, string_size = symtab
@@ -581,6 +669,8 @@ def macho(data, expected_type, signed=True, expected_minimum=0x000F0400):
             # 避免逐符号复制整个 string table；只统计真正定义的 KMP 类，非未解析 imports。
             symbol_type = data[symbol_offset + index * 16 + 4]
             name = symbol_name(index)
+            if symbol_type & 0x0E == 0x0E and name.startswith(b'_OBJC_CLASS_$_'):
+                objc_classes.append(name.decode('utf-8'))
             if symbol_type & 0x0E == 0x0E and name.startswith(b'_OBJC_CLASS_$_ZeehoShared'):
                 shared_symbols.append(name.decode('utf-8'))
             if name == b'_NSExtensionMain':
@@ -614,8 +704,30 @@ def macho(data, expected_type, signed=True, expected_minimum=0x000F0400):
             'imports': imports, 'rpaths': rpaths, 'codeSignaturePresent': signature is not None,
             'signature': signature_metadata, 'entrypointPresent': entrypoint, 'mainSymbols': main_symbols,
             'extensionEntrypointSymbols': widget_symbols, 'entryAddress': lc_main_address,
-            'extensionEntryAddress': extension_entry_address,
+            'extensionEntryAddress': extension_entry_address, 'definedObjCClasses': sorted(objc_classes),
             'sharedClassSymbolCount': len(shared_symbols), 'sharedClassSymbols': shared_symbols[:8]}
+
+
+def objc_runtime_class(symbol):
+    """解码符号表中的 ObjC runtime 名，不凭预计 module/class 长度构造证据。"""
+    prefix = '_OBJC_CLASS_$_'
+    if not symbol.startswith(prefix):
+        return None
+    name = symbol[len(prefix):]
+    if not name.startswith('_TtC'):
+        return name  # 显式 @objc 名称原样交由 Info 的 principal 精确匹配。
+    tail, components = name[4:], []
+    while tail:
+        match = re.match(r'([1-9][0-9]*)', tail)
+        if not match:
+            return None
+        length = int(match.group(1))
+        tail = tail[match.end():]
+        if length > len(tail):
+            return None
+        components.append(tail[:length])
+        tail = tail[length:]
+    return '.'.join(components) if len(components) == 2 else None
 
 
 def framework_kind(path):
@@ -658,11 +770,22 @@ def resolve_imports(reports, names, app_prefix=APP_PREFIX):
         return posixpath.normpath(candidate) in names
 
     for name, report in reports.items():
-        require(all(path in ('@executable_path/Frameworks', '@executable_path/../../Frameworks', '/usr/lib/swift')
-                    or path.startswith('@loader_path') for path in report['rpaths']), 'Unexpected build-machine rpath in ' + name)
+        allowed_rpaths = {'@executable_path/Frameworks', '@executable_path/../../Frameworks', '/usr/lib/swift',
+                          '@loader_path/Frameworks', '@loader_path', '@loader_path/..', '@loader_path/../..'}
+        require(set(report['rpaths']) <= allowed_rpaths, 'Unexpected build-machine rpath in ' + name)
         executable_dir = posixpath.dirname(name)
+        inherited = []
         if '.framework/' in name or name.endswith('.dylib'):
             executable_dir = app_prefix.rstrip('/')
+            for contract in EXTENSIONS.values():
+                prefix = app_prefix + contract['directory']
+                if name.startswith(prefix):
+                    executable_dir = prefix.rstrip('/')
+                    break
+            executable_name = next((n for n in reports if posixpath.dirname(n) == executable_dir
+                                    and reports[n]['fileType'] == 'executable'), None)
+            if executable_name:
+                inherited = reports[executable_name]['rpaths']
         for item in report['imports']:
             dependency = item['path']
             require('/../' not in dependency and '\\' not in dependency, 'Unsafe dylib import')
@@ -670,10 +793,15 @@ def resolve_imports(reports, names, app_prefix=APP_PREFIX):
                 continue
             if dependency.startswith('@rpath/'):
                 suffix = dependency[len('@rpath/'):]
-                if bundled(app_prefix + 'Frameworks/' + suffix) or bundled(executable_dir + '/Frameworks/' + suffix):
-                    continue
-                if suffix in IOS154_SWIFT_LIBRARIES and '/usr/lib/swift' in report['rpaths']:
-                    continue
+                for rpath in set(report['rpaths'] + inherited):
+                    candidate = rpath.replace('@executable_path', executable_dir).replace('@loader_path', posixpath.dirname(name))
+                    if bundled(candidate + '/' + suffix):
+                        break
+                    if suffix in IOS154_SWIFT_LIBRARIES and candidate == '/usr/lib/swift':
+                        break
+                else:
+                    raise ValueError('Unresolved/non-iOS dylib import in ' + name + ': ' + dependency)
+                continue
             elif dependency.startswith('@executable_path/'):
                 if bundled(executable_dir + '/' + dependency[len('@executable_path/'):]):
                     continue
@@ -729,45 +857,70 @@ def validate_ipa(path, expected_info=None):
         require({'_main'}.intersection(main['mainSymbols']), 'Host executable main/module entrypoint symbol missing')
         signature_id = main['signature'].get('identifier')
         require(signature_id == actual_id, 'CodeDirectory identifier must match actual Info.plist bundle ID')
-        widget_prefix = app_prefix + WIDGET_DIRECTORY
-        widget_binary = widget_prefix + 'DashboardWidgets'
-        require(widget_binary in names, 'Expected real PlugIns/DashboardWidgets.appex executable is missing')
-        require(all('.appex' not in n or n.startswith(widget_prefix) for n in names), 'Unexpected extension bundle')
-        widget_info = plistlib.loads(archive.read(widget_prefix + 'Info.plist'))
-        require(widget_info.get('CFBundlePackageType') == 'XPC!' and widget_info.get('CFBundleExecutable') == 'DashboardWidgets'
-                and widget_info.get('CFBundleIdentifier') == actual_id + '.widgets'
-                and widget_info.get('NSExtension', {}).get('NSExtensionPointIdentifier') == 'com.apple.widgetkit-extension'
-                and 'EXAppExtensionAttributes' not in widget_info, 'Invalid WidgetKit appex identity/extension point')
-        require(widget_info.get('CFBundleVersion') == info['CFBundleVersion']
-                and widget_info.get('CFBundleShortVersionString') == info['CFBundleShortVersionString']
-                and widget_info.get('MinimumOSVersion') == MINIMUM_IOS, 'Host/appex version/build/minimum OS mismatch')
-        require(widget_prefix + '_CodeSignature/CodeResources' in names, 'Widget resource signature missing')
-        reports[widget_binary] = macho(archive.read(widget_binary), 2)
-        widget = reports[widget_binary]
-        # 只「导入」_NSExtensionMain 不算数（旧实现在任何 Objective-C 依赖都会带上这个 undef），
-        # 必须同时满足：符号真的是入口目标，且 LC_MAIN 正好落在它的定义地址或它的 stub 上。
-        require(widget['extensionEntrypointSymbols']
-                and widget['extensionEntryAddress'] is not None
-                and widget['entryAddress'] == widget['extensionEntryAddress']
-                and widget['signature'].get('identifier') == widget_info['CFBundleIdentifier'],
-                'Widget _NSExtensionMain must be the real LC_MAIN entrypoint and match the signature identity')
-        require(widget['sharedClassSymbolCount'] == 0 and not any('ZeehoShared.framework' in i['path'] for i in widget['imports']), 'KMP must not be linked into Widgets')
-        for code in (main, widget):
+        extension_prefixes = {key: app_prefix + contract['directory'] for key, contract in EXTENSIONS.items()}
+        for name in names:
+            extension_parts = [p for p in safe_relative(name) if p.endswith('.appex')]
+            require(not extension_parts or (len(extension_parts) == 1 and
+                    any(name.startswith(prefix) or name.rstrip('/') == prefix.rstrip('/')
+                        for prefix in extension_prefixes.values())), 'Unexpected/nested extension bundle: ' + name)
+        require(main['signature'].get('entitlements') == HOST_ENTITLEMENTS,
+                'Host signature must match the scoped public networking/App Group template; not proof of provisioning approval')
+        for key, contract in EXTENSIONS.items():
+            prefix = extension_prefixes[key]
+            binary = prefix + contract['product']
+            require(binary in names and prefix + 'Info.plist' in names, 'Expected real appex executable/Info is missing: ' + key)
+            extension_info = plistlib.loads(archive.read(prefix + 'Info.plist'))
+            validate_extension_info(extension_info, contract, host=info)
+            resources = prefix + '_CodeSignature/CodeResources'
+            require(resources in names and isinstance(plistlib.loads(archive.read(resources)), dict), 'Extension resource signature missing/invalid: ' + key)
+            code = reports[binary] = macho(archive.read(binary), 2)
+            # 导入符号本身不够；LC_MAIN 必须落在真正 _NSExtensionMain 定义或 stub 上。
+            require(code['extensionEntrypointSymbols'] and code['extensionEntryAddress'] is not None
+                    and code['entryAddress'] == code['extensionEntryAddress']
+                    and code['signature'].get('identifier') == contract['bundleID'],
+                    'Extension _NSExtensionMain must be the real LC_MAIN entrypoint and match the signature identity: ' + key)
+            require(code['sharedClassSymbolCount'] == 0 and not any('ZeehoShared.framework' in i['path'] for i in code['imports']),
+                    'KMP must not be linked into extensions: ' + key)
+            require(code['signature'].get('entitlements') == EXTENSION_ENTITLEMENTS,
+                    'Extension signature must contain only the matching App Group template; not proof of provisioning approval: ' + key)
+            require({'@executable_path/Frameworks', '@executable_path/../../Frameworks', '/usr/lib/swift'} <= set(code['rpaths']),
+                    'Extension runtime search paths are incomplete: ' + key)
+            if key == 'widgets':
+                for dependency in ('ActivityKit', 'AppIntents'):
+                    imports = [i for i in code['imports'] if '/' + dependency + '.framework/' in i['path']]
+                    require(imports and all(i['weak'] for i in imports), 'iOS 15.4 Widget must weak-link ' + dependency)
+            if key == 'broadcast':
+                require(any('/ReplayKit.framework/' in i['path'] for i in code['imports'])
+                        and any('/VideoToolbox.framework/' in i['path'] for i in code['imports']),
+                        'Broadcast must link real ReplayKit/VideoToolbox')
+                require(extension_info['NSExtension']['NSExtensionPrincipalClass'] in
+                        {objc_runtime_class(symbol) for symbol in code['definedObjCClasses']},
+                        'Broadcast principal class is not defined in the real executable')
+        # 上游侧载边界适用于全部 executable，新增 Broadcast 不得漏验或冒充正式 Apple 签名。
+        for code in reports.values():
             require(code['signature'].get('adHoc') is True and not code['signature'].get('teamID'),
-                    'Expected team-free ad-hoc host/Widget signature, not Apple distribution signing')
-            groups = code['signature'].get('entitlements', {}).get('com.apple.security.application-groups')
-            require(groups == [APP_GROUP], 'App/Widget signature is missing the matching App Group template; this is not proof of provisioning approval')
+                    'Expected team-free ad-hoc Host/Widget/Broadcast signature, not Apple distribution signing')
         for name in sorted(names):
             if name.endswith('/') or name in reports:
                 continue
             data = archive.read(name)
             is_framework = '.framework/' in name and name.rsplit('/', 1)[-1] == name.split('.framework/', 1)[0].rsplit('/', 1)[-1]
             if name.endswith('.dylib') or is_framework:
-                require(name.startswith(app_prefix + 'Frameworks/') or name.startswith(widget_prefix + 'Frameworks/'), 'Embedded code must be under expected Frameworks')
-                require('ZeehoSystemShared' not in name and not (name.startswith(widget_prefix) and 'ZeehoShared' in name), 'Swift shared sources are not an embedded binary/KMP extension dependency')
+                require(name.startswith(app_prefix + 'Frameworks/') or
+                        any(name.startswith(prefix + 'Frameworks/') for prefix in extension_prefixes.values()),
+                        'Embedded code must be under expected Frameworks')
+                require('ZeehoSystemShared' not in name and not
+                        (any(name.startswith(prefix) for prefix in extension_prefixes.values()) and 'ZeehoShared' in name),
+                        'Swift shared sources are not an embedded binary/KMP extension dependency')
                 reports[name] = macho(data, 6)
             elif data.startswith((b'\xcf\xfa\xed\xfe', b'\xfe\xed\xfa\xcf', b'\xca\xfe\xba\xbe', b'!<arch>\n')):
                 raise ValueError('Unexpected executable/archive in IPA: ' + name)
+        metadata_prefix = extension_prefixes['widgets'] + 'Metadata.appintents/'
+        metadata_files = sorted(n for n in names if n.startswith(metadata_prefix) and not n.endswith('/'))
+        require(metadata_prefix + 'extract.actionsdata' in metadata_files
+                and bool(archive.read(metadata_prefix + 'extract.actionsdata')), 'Widget AppIntents metadata is missing/empty')
+        widget_metadata = [{'path': n[len(app_prefix):], 'size': len(archive.read(n)),
+                            'sha256': hashlib.sha256(archive.read(n)).hexdigest()} for n in metadata_files]
         dynamic = app_prefix + 'Frameworks/ZeehoShared.framework/ZeehoShared'
         linkage = 'static'
         if dynamic in reports:
@@ -778,8 +931,20 @@ def validate_ipa(path, expected_info=None):
             require(main['sharedClassSymbolCount'] > 0, 'KMP_FRAMEWORK_MISSING: no real ZeehoShared classes linked into app')
         resolve_imports(reports, names, app_prefix)
         return {'info': info, 'linkage': linkage, 'machO': reports, 'artifactKind': 'full-app',
+                'widgetAppIntentsMetadata': widget_metadata,
                 'bridgeSha256': hashlib.sha256(bridge).hexdigest(),
                 'executableSha256': hashlib.sha256(archive.read(binary_name)).hexdigest()}
+
+
+def validate_target_frameworks(reports, inputs):
+    targets = [(APP_PREFIX + 'Dashboard', 'systemFrameworks')]
+    targets.extend((APP_PREFIX + c['directory'] + c['product'],
+                    {'widgets': 'widgetSystemFrameworks', 'broadcast': 'broadcastSystemFrameworks'}[key])
+                   for key, c in EXTENSIONS.items())
+    for binary, key in targets:
+        linked = '\n'.join(item['path'] for item in reports[binary]['imports'])
+        for name in inputs[key]:
+            require('/' + name + '.framework/' in linked, 'Imported system framework not linked into ' + binary + ': ' + name)
 
 
 def release_metadata(path, info):
@@ -879,12 +1044,31 @@ def verify_artifacts(path, expected_info=None, source_manifest=None):
     require(sums == digest + '  ' + IPA_NAME + '\n', 'SHA256SUMS mismatch')
     require(manifest.get('schemaVersion') == 1 and manifest.get('ipaSha256') == digest and manifest.get('ipaSize') == path.stat().st_size, 'Build manifest IPA hash/size mismatch')
     require(manifest.get('sourceCommit') == source_commit and manifest.get('sharedLinkage') == report['linkage'], 'Build manifest source/linkage mismatch')
+    # AltStore source 不携带内部构建指纹/授权结论；这些仍在 CI manifest 与批准快照精确复核。
     require(isinstance(manifest.get('sourceDirty'), bool), 'Source dirty state is missing')
+    require(manifest.get('extensions') == EXTENSIONS, 'Build manifest extension topology mismatch')
+    require(all(manifest.get(key) is False for key in ('appGroupProvisioningVerified', 'networkingProvisioningVerified')),
+            'Ad-hoc templates cannot claim Apple capability authorization')
+    validate_target_frameworks(report['machO'], manifest)
     require(re.fullmatch(r'[0-9a-f]{64}', manifest.get('sharedFrameworkSha256', '')), 'Shared framework checksum missing')
+    require(manifest.get('widgetAppIntentsMetadata') == report['widgetAppIntentsMetadata'], 'Widget AppIntents metadata checksum mismatch')
     require(manifest.get('machO') == report['machO'] and manifest.get('bridgeSha256') == report['bridgeSha256'], 'Build manifest Mach-O/resource mismatch')
     require(manifest.get('buildHostPlatform') == 'Darwin' and manifest.get('codeSigningVerifiedOnMac') is True, 'Missing actual macOS code-sign verification record')
     records = manifest.get('inputs', [])
-    require(records and all(public_input(r['path']) for r in records) and tree_digest(records) == manifest.get('sourceTreeSha256'), 'Invalid build input manifest')
+    require(records and len({r['path'] for r in records}) == len(records)
+            and all(public_input(r['path']) for r in records)
+            and FIXED_INPUTS <= {r['path'] for r in records}
+            and tree_digest(records) == manifest.get('sourceTreeSha256'), 'Invalid/incomplete build input manifest')
+    record_names = {r['path'] for r in records}
+    host_sources = set(manifest.get('swiftSources', []))
+    broadcast_sources = set(manifest.get('broadcastSwiftSources', []))
+    require(host_sources & broadcast_sources == {CAST_SHARED_SOURCE}
+            and {CAST_ENCODER_SOURCE, 'ios-shell/Broadcast/SampleHandler.swift', CAST_SHARED_SOURCE} <= broadcast_sources
+            and all(not n.startswith('ios-shell/Broadcast/') and n != CAST_ENCODER_SOURCE for n in host_sources),
+            'Invalid Host/Broadcast source ownership in build manifest')
+    require({n for n in record_names if n.endswith('.swift')} ==
+            host_sources | broadcast_sources | set(manifest.get('sharedSwiftSources', [])) | set(manifest.get('widgetSwiftSources', [])),
+            'Build manifest omitted or invented Swift compilation inputs')
     require(metadata == release_metadata(path, info), 'Release source/package report mismatch')
     bridge_record = next((r for r in records if r['path'] == 'ios-shell/bridge-bootstrap.js'), None)
     require(bridge_record and bridge_record['sha256'] == report['bridgeSha256'], 'Packaged bridge differs from build sources')
@@ -899,20 +1083,21 @@ def write_release(ipa, inputs_path, framework, app):
     require(sys.platform == 'darwin', 'Release metadata can only be created after a real macOS build')
     ipa, app = pathlib.Path(ipa).resolve(), pathlib.Path(app).resolve()
     inputs = load_json(inputs_path)
+    # 从内到外逐个验签；--deep 最终验 host，但不能取代逐个 extension/framework 检查。
+    for directory in [app / 'Frameworks', *(app / c['directory'] / 'Frameworks' for c in EXTENSIONS.values())]:
+        for path in sorted(directory.rglob('*'), key=lambda p: len(p.parts), reverse=True):
+            if (path.is_dir() and path.name.endswith('.framework')) or (path.is_file() and path.name.endswith('.dylib')):
+                subprocess.run(['codesign', '--verify', '--strict', str(path)], check=True)
+    for contract in EXTENSIONS.values():
+        subprocess.run(['codesign', '--verify', '--strict', str(app / contract['directory'])], check=True)
     subprocess.run(['codesign', '--verify', '--deep', '--strict', str(app)], check=True)
-    for path in sorted((app / 'Frameworks').rglob('*')):
-        if (path.is_dir() and path.name.endswith('.framework')) or (path.is_file() and path.name.endswith('.dylib')):
-            subprocess.run(['codesign', '--verify', '--strict', str(path)], check=True)
-    subprocess.run(['codesign', '--verify', '--strict', str(app / 'PlugIns/DashboardWidgets.appex')], check=True)
     report = validate_ipa(ipa)
     require(report['linkage'] == framework_kind(framework), 'Linked/shared framework kind differs')
     require(report['info']['CFBundleShortVersionString'] == inputs['version']
             and report['info']['CFBundleVersion'] == inputs['sourceBuild'], 'Source version/build changed or was overridden during build')
     bridge_record = next(r for r in inputs['files'] if r['path'] == 'ios-shell/bridge-bootstrap.js')
     require(bridge_record['sha256'] == report['bridgeSha256'], 'Bridge changed during packaging')
-    linked = '\n'.join(item['path'] for item in report['machO'][APP_PREFIX + 'Dashboard']['imports'])
-    for name in inputs['systemFrameworks']:
-        require('/' + name + '.framework/' in linked, 'Imported system framework not linked: ' + name)
+    validate_target_frameworks(report['machO'], inputs)
     digest, info = sha256_file(ipa), report['info']
     tool_paths = {name: shutil.which(name) for name in ('xcrun', 'xcodebuild', 'codesign', 'java', 'python3', 'zip', 'sips')}
     tools = {
@@ -921,14 +1106,23 @@ def write_release(ipa, inputs_path, framework, app):
         'swift': subprocess.check_output(['xcrun', '--sdk', 'iphoneos', 'swiftc', '--version'], text=True, encoding='utf-8').strip(),
         'iphoneosSDK': subprocess.check_output(['xcrun', '--sdk', 'iphoneos', '--show-sdk-path'], text=True, encoding='utf-8').strip(),
         'swiftStdlibTool': subprocess.check_output(['xcrun', '--find', 'swift-stdlib-tool'], text=True, encoding='utf-8').strip(),
+        'appIntentsMetadataProcessor': subprocess.check_output(['xcrun', '--find', 'appintentsmetadataprocessor'], text=True, encoding='utf-8').strip(),
         'java': subprocess.check_output(['java', '-version'], stderr=subprocess.STDOUT, text=True, encoding='utf-8').strip(),
         'python': sys.version.split()[0],
     }
     manifest = {'schemaVersion': 1, 'buildHostPlatform': 'Darwin', 'codeSigningVerifiedOnMac': True,
                 'releaseDate': datetime.datetime.now(datetime.timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ'),
-                'signing': 'ad-hoc; App Group template only; Apple provisioning and TrollStore compatibility unverified',
-                'appGroupProvisioningVerified': False, 'trollStoreCompatibility': 'unverified',
+                'signing': 'ad-hoc; scoped entitlement templates only; Apple provisioning and TrollStore compatibility unverified',
+                'appGroupProvisioningVerified': False, 'networkingProvisioningVerified': False,
+                'trollStoreCompatibility': 'unverified', 'extensions': EXTENSIONS,
                 'widgetSwiftSources': inputs['widgetSwiftSources'], 'sharedSwiftSources': inputs['sharedSwiftSources'],
+                'broadcastSwiftSources': inputs['broadcastSwiftSources'],
+                'broadcastSwiftImports': inputs['broadcastSwiftImports'],
+                'broadcastSystemFrameworks': inputs['broadcastSystemFrameworks'],
+                'broadcastSystemLibraries': inputs['broadcastSystemLibraries'],
+                'hostModuleImports': inputs['hostModuleImports'],
+                'widgetSystemFrameworks': inputs['widgetSystemFrameworks'],
+                'sharedSwiftImports': inputs['sharedSwiftImports'], 'widgetSwiftImports': inputs['widgetSwiftImports'],
                 'sourceCommit': inputs['sourceCommit'], 'sourceDirty': inputs['sourceDirty'],
                 'sourceTreeSha256': inputs['sourceTreeSha256'], 'inputs': inputs['files'],
                 'swiftSources': inputs['swiftSources'], 'swiftImports': inputs['swiftImports'],
@@ -937,6 +1131,7 @@ def write_release(ipa, inputs_path, framework, app):
                 'sharedLinkage': report['linkage'], 'sharedFrameworkSha256': sha256_file(pathlib.Path(framework) / 'ZeehoShared'),
                 'ipaSha256': digest, 'ipaSize': ipa.stat().st_size, 'bridgeSha256': report['bridgeSha256'],
                 'executableSha256': report['executableSha256'],
+                'widgetAppIntentsMetadata': report['widgetAppIntentsMetadata'],
                 'machO': report['machO'], 'tools': tools}
     metadata = release_metadata(ipa, info)
     write_json(ipa.parent / VERSION_NAME, source_json(ipa, report, manifest['releaseDate']))
@@ -947,21 +1142,26 @@ def write_release(ipa, inputs_path, framework, app):
     return metadata
 
 
-def prepare_widget_info(source, destination, host):
-    """由 host Info.plist 派生 Widget appex 的 Info.plist。
-
-    版本/build 号必须与 host 完全一致：内置更新器按 CFBundleVersion 比新旧，
-    appex 与 host 不一致时 widget 侧会停留在旧版本数据上。
-    """
+def prepare_extension_info(source, destination, host, target):
+    """版本与 host 一致；Broadcast 的 PRODUCT_MODULE_NAME 展开为真正 swiftc module。"""
+    contract = EXTENSIONS[target]
     with pathlib.Path(source).open('rb') as stream:
         info = plistlib.load(stream)
-    info.update({'CFBundleName': 'DashboardWidgets', 'CFBundleExecutable': 'DashboardWidgets',
-                 'CFBundleIdentifier': host['CFBundleIdentifier'] + '.widgets', 'CFBundlePackageType': 'XPC!',
+    validate_extension_info(info, contract, template=True)
+    info.update({'CFBundleName': contract['product'], 'CFBundleExecutable': contract['product'],
+                 'CFBundleIdentifier': contract['bundleID'], 'CFBundlePackageType': 'XPC!',
                  'CFBundleShortVersionString': host['CFBundleShortVersionString'], 'CFBundleVersion': host['CFBundleVersion'],
-                 'MinimumOSVersion': '15.4', 'CFBundleSupportedPlatforms': ['iPhoneOS']})
-    require(info.get('NSExtension', {}).get('NSExtensionPointIdentifier') == 'com.apple.widgetkit-extension', 'Widget Info.plist must be supplied by its source owner')
+                 'MinimumOSVersion': MINIMUM_IOS, 'CFBundleSupportedPlatforms': ['iPhoneOS']})
+    if target == 'broadcast':
+        info['NSExtension']['NSExtensionPrincipalClass'] = contract['product'] + '.SampleHandler'
+    validate_extension_info(info, contract, host=host)
     with pathlib.Path(destination).open('wb') as stream:
         plistlib.dump(info, stream)
+
+
+def prepare_widget_info(source, destination, host):
+    # 保持旧命令/函数入口兼容，内部使用同一精确 appex map。
+    prepare_extension_info(source, destination, host, 'widgets')
 
 
 def main():
@@ -981,6 +1181,10 @@ def main():
     p.add_argument('--swift-list')
     p.add_argument('--shared-list')
     p.add_argument('--widget-list')
+    p.add_argument('--broadcast-list')
+    p.add_argument('--host-module-imports-list')
+    p.add_argument('--broadcast-framework-list')
+    p.add_argument('--broadcast-library-list')
     p.add_argument('--shared-framework-list')
     p.add_argument('--widget-framework-list')
     p.add_argument('--framework-list')
@@ -1006,6 +1210,11 @@ def main():
     p.add_argument('--source', required=True)
     p.add_argument('--destination', required=True)
     p.add_argument('--host-info', required=True)
+    p = commands.add_parser('prepare-extension')
+    p.add_argument('--target', choices=tuple(EXTENSIONS), required=True)
+    p.add_argument('--source', required=True)
+    p.add_argument('--destination', required=True)
+    p.add_argument('--host-info', required=True)
     p = commands.add_parser('write-release')
     p.add_argument('--ipa', required=True)
     p.add_argument('--inputs', required=True)
@@ -1024,7 +1233,11 @@ def main():
         if args.manifest:
             write_json(args.manifest, value)
         for target, key in ((args.swift_list, 'swiftSources'), (args.shared_list, 'sharedSwiftSources'),
-                            (args.widget_list, 'widgetSwiftSources'), (args.shared_framework_list, 'sharedSystemFrameworks'),
+                            (args.widget_list, 'widgetSwiftSources'), (args.broadcast_list, 'broadcastSwiftSources'),
+                            (args.host_module_imports_list, 'hostModuleImports'),
+                            (args.broadcast_framework_list, 'broadcastSystemFrameworks'),
+                            (args.broadcast_library_list, 'broadcastSystemLibraries'),
+                            (args.shared_framework_list, 'sharedSystemFrameworks'),
                             (args.widget_framework_list, 'widgetSystemFrameworks'), (args.framework_list, 'systemFrameworks'),
                             (args.library_list, 'systemLibraries')):
             if target:
@@ -1052,10 +1265,11 @@ def main():
         validate_info(info)
         with pathlib.Path(args.destination).open('wb') as stream:
             plistlib.dump(info, stream)
-    elif args.command == 'prepare-widget':
+    elif args.command in ('prepare-widget', 'prepare-extension'):
         with pathlib.Path(args.host_info).open('rb') as stream:
             host = plistlib.load(stream)
-        prepare_widget_info(args.source, args.destination, host)
+        prepare_extension_info(args.source, args.destination, host,
+                               'widgets' if args.command == 'prepare-widget' else args.target)
     elif args.command == 'write-release':
         value = write_release(args.ipa, args.inputs, args.framework, args.app)
         print(f"Verified real arm64 TrollStore IPA: {value['file']} ({value['sha256']})")

@@ -1,6 +1,7 @@
 import Foundation
 import UIKit
 import CoreLocation
+import UserNotifications
 import CryptoKit
 import CoreFoundation
 import Darwin
@@ -61,6 +62,36 @@ enum IOSRideJSON {
             if let value = number(source[key]), range.contains(value) { result[key] = value }
         }
         return result
+    }
+
+    // 这是公共读数投影，不解析认证/订阅状态机；档位只解释用户确认的低四位。
+    // 每个字段独立用原生接收时刻过期，FD 电量包绝不能给 F3 旧速度续命。
+    static func visibleTelemetry(_ source: [String: Any], times: [String: Int64],
+                                 uptimes: [String: TimeInterval], now: TimeInterval) -> [String: Any] {
+        var values: [String: Any] = [:]
+        var stamps: [String: Int64] = [:]
+        for (key, value) in telemetry(source) {
+            guard let at = times[key], at > 0, let uptime = uptimes[key],
+                  now >= uptime, now - uptime < 10 else { continue }
+            values[key] = value; stamps[key] = at
+        }
+        if let mode = integer(values["modeRaw"], maximum: 4294967295), let at = stamps["modeRaw"] {
+            let gear = mode & 0x0f
+            values["gearCode"] = gear <= 3 ? gear as Any : NSNull()
+            stamps["gearCode"] = at
+        }
+        return ["telemetry": values, "telemetryTimes": stamps]
+    }
+
+    static func publicRecordState(_ state: String) -> String {
+        switch state {
+        case "saving": return "ending"
+        case "paused", "stale", "unavailable", "gap": return "gap"
+        case "permission_required", "waiting", "disabled": return "waiting"
+        case "not_recorded": return "completed"
+        case "recording", "ending", "completed", "interrupted", "save_failed", "error": return state
+        default: return "error"
+        }
     }
 
     static func fields(_ source: [String: Any]) -> [String: Any] {
@@ -356,6 +387,9 @@ private enum IOSRideDisk {
             result["reason"] = "unfinished_record"
             result["incomplete"] = true
         } else { result["incomplete"] = false }
+        result["recordingId"] = record["id"] ?? NSNull()
+        result["recordedSamples"] = record["samples"] ?? NSNull()
+        result["countIsPartial"] = result["incomplete"] as? Bool == true
         return result
     }
 
@@ -446,6 +480,32 @@ final class IOSRideService: NSObject, IOSBridgeService, IOSBridgeCancellableServ
     private var scannedScope: String?
     /// 已销毁的 0 采样记录（只用于让 end/poll 幂等回终态）。带 owner，避免提示泄漏给别的账号。
     private var emptyFinals: [(id: UUID, owner: String, at: Int64)] = []
+    // 只保存非敏感显示偏好，按原生 owner 隔离；不是网页认证或后台授权。
+    private let preferences = UserDefaults.standard
+    private var notificationPermissionGranted: Bool?
+    private var notificationReadInFlight = false
+    private var permissionBusy = false
+
+    private func gpsAutoKey(_ scope: IOSRideScope) -> String {
+        "dashboard.ride.gps-over-50." + scope.ownerHash
+    }
+
+    private func readNotificationPermission() {
+        guard !notificationReadInFlight else { return }
+        notificationReadInFlight = true
+        UNUserNotificationCenter.current().getNotificationSettings { [weak self] settings in
+            let granted: Bool?
+            switch settings.authorizationStatus {
+            case .authorized, .provisional, .ephemeral: granted = true
+            case .denied, .notDetermined: granted = false
+            @unknown default: granted = nil
+            }
+            DispatchQueue.main.async {
+                self?.notificationReadInFlight = false
+                self?.notificationPermissionGranted = granted
+            }
+        }
+    }
 
     private final class Consent {
         let page: UInt64
@@ -465,7 +525,16 @@ final class IOSRideService: NSObject, IOSBridgeService, IOSBridgeCancellableServ
         let startedAt = Int64(Date().timeIntervalSince1970 * 1000)
         let startedUptime = ProcessInfo.processInfo.systemUptime
         var gpsWanted: Bool
+        var gpsOver50 = false
         var backgroundWanted: Bool
+        // 文件保留完整历史；实时读数独立缓存，截断文件不能让仪表倒退回旧样本。
+        var latestBLE: [String: Any] = [:]
+        var latestBLETimes: [String: Int64] = [:]
+        var latestBLEUptimes: [String: TimeInterval] = [:]
+        var latestBLEFields: [String: Any] = [:]
+        var latestBLEGeneration: UUID?
+        var gaugeSource: SystemGaugeSource?
+        var gaugeAt: Int64?
         var state = "waiting"
         var recordState = "waiting"
         var reason = "waiting_fix"
@@ -528,10 +597,14 @@ final class IOSRideService: NSObject, IOSBridgeService, IOSBridgeCancellableServ
 
     override init() {
         super.init()
+        bluetooth.configureRecordingProvider { [weak self] in self?.currentNativeRecording() }
+        readNotificationPermission()
         foregroundObserver = NotificationCenter.default.addObserver(
             forName: UIApplication.didBecomeActiveNotification, object: nil, queue: .main
         ) { [weak self] _ in
-            guard let self = self, let run = self.active, !run.ending, !run.userPaused else { return }
+            guard let self = self else { return }
+            self.readNotificationPermission()
+            guard let run = self.active, !run.ending, !run.userPaused else { return }
             self.checkScope()
             guard self.active === run else { return }
             if run.gpsWanted { _ = self.gps.resumeRecording(id: run.id, requestPermission: false) }
@@ -666,6 +739,7 @@ final class IOSRideService: NSObject, IOSBridgeService, IOSBridgeCancellableServ
         precondition(Thread.isMainThread)
         if confirmation?.method == method { cancelConsent("operation_cancelled") }
         if method == "ride.share" { cancelShare("operation_cancelled") }
+        if method == "ride.action", permissionBusy { gps.cancel(method: "gps.begin", args: []) }
         // 已受理 stop/save 要继续安全落盘；取消的只是旧页面回执，不能再把 ending 复活为 recording。
     }
 
@@ -687,16 +761,10 @@ final class IOSRideService: NSObject, IOSBridgeService, IOSBridgeCancellableServ
                 } else if let empty = emptyFinals.first(where: { $0.id == id && $0.owner == scope.ownerHash }) {
                     // 网页轮询会一直跟到 saved===true；0 采样的终态也必须能被 poll 到，
                     // 否则它只会在 end 的回执里出现一次，刷新面板后又变成「等待数据」。
-                    reply(["ok": true, "accepted": false, "id": id.uuidString.lowercased(),
-                           "ticket": id.uuidString.lowercased(), "recordingId": id.uuidString.lowercased(),
-                           "state": "not_recorded", "recordState": "not_recorded", "reason": "no_samples",
-                           "summary": IOSRideText.notRecorded, "saved": true, "samples": 0,
-                           "elapsedMs": 0, "durationMs": 0, "endedAt": empty.at,
-                           "retryAvailable": false, "gps": gps.snapshot()], nil)
+                    reply(emptySnapshot(id: id, at: empty.at, scope: scope), nil)
                 } else { reply(failure("stale_ticket"), nil) }
             } else if let run = active, run.scope == scope { reply(snapshot(run), nil) }
-            else { reply(["ok": true, "state": "idle", "samples": 0, "gps": gps.snapshot(),
-                          "orphans": orphanSummary()], nil) }
+            else { reply(idleSnapshot(scope: scope), nil) }
         case "ride.end": end(scope: scope, options: options, reply: reply)
         case "ride.action": action(scope: scope, options: options, reply: reply)
         case "ride.list": list(scope: scope, reply: reply)
@@ -714,7 +782,7 @@ final class IOSRideService: NSObject, IOSBridgeService, IOSBridgeCancellableServ
                 // 正在保存的旧 run 不是「当前会话」：把它当幂等结果返回会让网页以为
                 // 还有一条可继续记录的会话，并且拿到的快照缺 accepted。明确回 busy + 状态。
                 reply(["ok": false, "reason": "recording_busy", "state": "saving",
-                       "recordState": "saving", "accepted": false], nil); return
+                       "recordState": "ending", "nativeRecordState": "saving", "busy": true, "accepted": false], nil); return
             }
             guard run.scope == scope else { reply(failure("recording_busy"), nil); return }
             // 同一 run 的幂等 begin：网页重放（重连/重开面板）拿到的那条也要带 accepted，
@@ -737,6 +805,7 @@ final class IOSRideService: NSObject, IOSBridgeService, IOSBridgeCancellableServ
             }
             guard self.pendingSaveCapacity else { self.finish(consent, self.failure("pending_save_limit")); return }
             let run = Run(scope: scope, gps: wantedGPS, background: background)
+            run.gpsOver50 = self.preferences.bool(forKey: self.gpsAutoKey(scope))
             run.systemBLEConnected = self.bluetooth.connected
             self.active = run
             Self.leaseOwner = self
@@ -793,11 +862,18 @@ final class IOSRideService: NSObject, IOSBridgeService, IOSBridgeCancellableServ
         active === run && !run.ending && !run.completed && scopeProvider?() == run.scope
     }
 
+    func currentNativeRecording() -> IOSNativeRecording? {
+        precondition(Thread.isMainThread)
+        guard let run = active, owns(run), !run.userPaused else { return nil }
+        return IOSNativeRecording(id: run.id, scope: run.scope, startedUptime: run.startedUptime, background: run.backgroundWanted)
+    }
+
     private func recordGPS(_ fix: IOSGPSFix) {
         guard let run = active, owns(run), !run.userPaused, run.gpsWanted, fix.fresh,
               fix.sequence > run.lastGPSSequence,
               fix.at >= run.startedAt,
               UIApplication.shared.applicationState == .active || gps.backgroundAllowed else { return }
+        bluetooth.observeRecordingEvent(id: run.id, scope: run.scope)
         guard admit(run, bytes: 480) else { return }
         run.lastGPSSequence = fix.sequence
         var point = fix.json(includeCoordinates: true)
@@ -810,6 +886,7 @@ final class IOSRideService: NSObject, IOSBridgeService, IOSBridgeCancellableServ
         accumulateDistance(run, fix)
         run.lastRoute = fix
         sampleAccepted(run)
+        if fix.speedKph != nil { publishGaugeSample(run) }
     }
 
     /// 距离只累加"可信段"。
@@ -851,9 +928,23 @@ final class IOSRideService: NSObject, IOSBridgeService, IOSBridgeCancellableServ
               sample.sequence > run.lastBLESequence, sample.at >= run.startedAt,
               sample.receivedUptime >= run.startedUptime,
               UIApplication.shared.applicationState == .active || run.backgroundWanted else { return }
+        bluetooth.observeRecordingEvent(id: run.id, scope: run.scope)
+        guard bluetooth.canObserveTelemetry(recordingId: run.id, scope: run.scope, connectionGeneration: sample.connectionGeneration) else {
+            clearBLEDisplay(run); markGap(run, source: "ble", reason: "authorization_expired"); return
+        }
         let clean = IOSRideJSON.telemetry(sample.values)
         guard !clean.isEmpty, admit(run, bytes: 1000) else { return }
         run.lastBLESequence = sample.sequence
+        if run.latestBLEGeneration != sample.connectionGeneration {
+            clearBLEDisplay(run)
+            run.latestBLEGeneration = sample.connectionGeneration
+        }
+        for (key, value) in clean {
+            run.latestBLE[key] = value
+            run.latestBLETimes[key] = sample.at
+            run.latestBLEUptimes[key] = sample.receivedUptime
+        }
+        run.latestBLEFields = IOSRideJSON.fields(sample.fields)
         let times = Dictionary(uniqueKeysWithValues: clean.keys.map { ($0, sample.at) })
         run.telemetry.append(["at": sample.at, "seq": sample.sequence,
             "elapsedMs": Int64(max(0, sample.receivedUptime - run.startedUptime) * 1000),
@@ -863,6 +954,53 @@ final class IOSRideService: NSObject, IOSBridgeService, IOSBridgeCancellableServ
         run.lastBLEUptime = sample.receivedUptime
         run.gapReasons.removeValue(forKey: "ble")
         sampleAccepted(run)
+        if clean["speedKph"] != nil { publishGaugeSample(run) }
+    }
+
+    private func clearBLEDisplay(_ run: Run) {
+        run.latestBLE.removeAll(); run.latestBLETimes.removeAll(); run.latestBLEUptimes.removeAll()
+        run.latestBLEFields.removeAll(); run.latestBLEGeneration = nil
+        invalidateGauge(run, source: .ble)
+    }
+
+    private func visibleBLE(_ run: Run) -> [String: Any] {
+        guard active === run, !run.ending, !run.userPaused, bluetooth.connected, bluetooth.canObserveTelemetry else {
+            return ["telemetry": [:], "telemetryTimes": [:]]
+        }
+        return IOSRideJSON.visibleTelemetry(run.latestBLE, times: run.latestBLETimes,
+            uptimes: run.latestBLEUptimes, now: ProcessInfo.processInfo.systemUptime)
+    }
+
+    // 文案仍写高于 50，实际公共仪表按 BLE >45 切换；这里只选读数，不启动定位或私有认证。
+    private func selectedGauge(_ run: Run) -> SystemGaugeSnapshot? {
+        guard owns(run), !run.userPaused else { return nil }
+        let ble = visibleBLE(run)
+        let values = ble["telemetry"] as? [String: Any] ?? [:]
+        let times = ble["telemetryTimes"] as? [String: Int64] ?? [:]
+        let speed = IOSRideJSON.number(values["speedKph"])
+        if run.gpsWanted, gpsFresh(run), !run.gpsOver50 || (speed.map { $0 > 45 } ?? false),
+           let gpsSpeed = IOSRideJSON.number(run.rawGPS.last?["speedKph"]),
+           let at = IOSRideJSON.integer(run.rawGPS.last?["at"], minimum: 1) {
+            return SystemGaugeSnapshot(source: .gps, speedKph: gpsSpeed, updatedAt: at)
+        }
+        if let speed = speed, let at = times["speedKph"] {
+            return SystemGaugeSnapshot(source: .ble, speedKph: speed, updatedAt: at)
+        }
+        return nil
+    }
+
+    private func publishGaugeSample(_ run: Run) {
+        guard let publisher = optionalSystemSurfacePublisher, let value = selectedGauge(run),
+              run.gaugeSource != value.source || run.gaugeAt != value.updatedAt else { return }
+        run.gaugeSource = value.source; run.gaugeAt = value.updatedAt
+        // publisher 只更新用户已经开启的显示；原生样本不自动新建实时活动。
+        publisher.publishGauge(value, scope: run.scope)
+    }
+
+    private func invalidateGauge(_ run: Run, source: SystemGaugeSource? = nil) {
+        guard run.gaugeSource != nil, source == nil || run.gaugeSource == source else { return }
+        run.gaugeSource = nil; run.gaugeAt = nil
+        optionalSystemSurfacePublisher?.systemGaugeDisconnected(scope: run.scope)
     }
 
     /// 接收闸门。字节估算优先用「上次真实序列化大小 / 样本数」× 1.1：
@@ -913,6 +1051,7 @@ final class IOSRideService: NSObject, IOSBridgeService, IOSBridgeCancellableServ
         if ["permission_required", "interrupted", "unavailable", "error", "stale"].contains(state) {
             markGap(run, source: "gps", reason: value["reason"] as? String ?? "gps_unavailable")
             run.lastRoute = nil
+            invalidateGauge(run, source: .gps)
             if !bleFresh(run) {
                 pauseDuration(run)
                 run.state = state
@@ -924,6 +1063,12 @@ final class IOSRideService: NSObject, IOSBridgeService, IOSBridgeCancellableServ
 
     private func bleState(_ value: [String: Any]) {
         guard let run = active, owns(run) else { return }
+        if value["canObserveTelemetry"] as? Bool != true {
+            clearBLEDisplay(run)
+            if run.bleSamples > 0 || bluetooth.currentRecordingLease() != nil {
+                markGap(run, source: "ble", reason: value["renewReason"] as? String ?? "native_authorization_required")
+            }
+        }
         if value["connected"] as? Bool != true, run.bleSamples > 0 {
             markGap(run, source: "ble", reason: value["reason"] as? String ?? "connection_lost")
         }
@@ -931,6 +1076,7 @@ final class IOSRideService: NSObject, IOSBridgeService, IOSBridgeCancellableServ
         let connected = value["connected"] as? Bool == true
         let disconnected = run.systemBLEConnected && !connected
         run.systemBLEConnected = connected
+        if !connected { clearBLEDisplay(run) }
         // GPS-only 的 false 状态不是断连；真实 BLE 断连也不能结束独立获准的 GPS 活动。
         if disconnected && !run.gpsWanted {
             optionalSystemSurfacePublisher?.systemSurfacesDisconnected(scope: run.scope)
@@ -952,6 +1098,13 @@ final class IOSRideService: NSObject, IOSBridgeService, IOSBridgeCancellableServ
             run.recordState = run.saveFailed ? "save_failed" : "gap"
             if !run.saveFailed { run.reason = "sample_gap" }
         }
+        if let source = run.gaugeSource {
+            if let current = selectedGauge(run) {
+                // GPS 过期但 BLE 仍新鲜时只切来源，不能结束用户已开启且不能自动重开的活动。
+                // 重用已接受样本的原始 at，tick 不把切换时刻伪装成一次新采样。
+                if current.source != source || current.updatedAt != run.gaugeAt { publishGaugeSample(run) }
+            } else { invalidateGauge(run) }
+        }
         checkpoint(run, force: false)
         // tick 只撤销过期速度；最后更新时间和时长仍保留真实接受事件，不能用轮询伪造新观测。
         publishSystemSurface(run)
@@ -964,7 +1117,7 @@ final class IOSRideService: NSObject, IOSBridgeService, IOSBridgeCancellableServ
     }
 
     private func bleFresh(_ run: Run) -> Bool {
-        guard bluetooth.connected, let last = run.lastBLEUptime else { return false }
+        guard bluetooth.connected, bluetooth.canObserveTelemetry, let last = run.lastBLEUptime else { return false }
         let age = ProcessInfo.processInfo.systemUptime - last
         return age >= 0 && age < 10
     }
@@ -989,7 +1142,8 @@ final class IOSRideService: NSObject, IOSBridgeService, IOSBridgeCancellableServ
             "stale_session", "record_limit_reached", "user_pause", "gps_disabled", "navigation_changed",
             "subscription_failed", "notification_failed", "services_invalidated", "powered_off", "not_authorised",
             "bluetooth_resetting", "write_timeout", "read_timeout", "discovery_timeout", "location_failed", "no_fix",
-            "trimmed_for_size"]
+            "trimmed_for_size", "authorization_expired", "native_authorization_required", "material_changed",
+            "initial_authorization", "native_authentication_failed", "lease_renewal_rejected", "stale_renewal"]
         return codes.contains(value) ? value : "source_unavailable"
     }
 
@@ -1025,27 +1179,83 @@ final class IOSRideService: NSObject, IOSBridgeService, IOSBridgeCancellableServ
         publisher.publishRide(value, scope: run.scope)
     }
 
+    private func permissionProjection(_ gpsValue: [String: Any], _ ble: [String: Any]) -> [String: Any] {
+        let authorization = ble["authorization"] as? String ?? "unknown"
+        let granted: Any = authorization == "unknown" ? NSNull() : (authorization == "allowed") as Any
+        let power = ble["power"] as? String ?? "unknown"
+        let enabled: Any = power == "unknown" || power == "resetting" ? NSNull() : (power == "powered_on") as Any
+        return ["permissionGranted": granted, "bluetoothEnabled": enabled,
+            "locationPermissionGranted": gpsValue["permissionGranted"] ?? NSNull(),
+            "notificationPermissionGranted": notificationPermissionGranted as Any? ?? NSNull(),
+            "permissionBusy": permissionBusy, "permissionReason": permissionBusy ? "permission_required" : "",
+            "openRequested": false, "paired": false, "systemBondState": "unknown_os_managed",
+            "authenticated": ble["nativeAuthenticated"] ?? false,
+            "authenticationState": ble["nativeAuthenticated"] as? Bool == true ? "native_recipe_verified" : "native_authorization_required",
+            "authorizationFresh": ble["authorizationFresh"] ?? false,
+            "automaticUnlock": false, "renewing": ble["renewing"] ?? false, "renewReason": ble["renewReason"] ?? "",
+            "nativeRenewAvailable": ble["backgroundAuthRenewalSupported"] ?? false,
+            "backgroundAuthRenewalSupported": ble["backgroundAuthRenewalSupported"] ?? false, "privateDriverRequired": true,
+            "records": [], "recordsReady": false, "recordsError": "", "vehicleName": ""]
+    }
+
+    private func idleSnapshot(scope: IOSRideScope) -> [String: Any] {
+        let gpsValue = gps.snapshot(), ble = bluetooth.snapshot()
+        var value = permissionProjection(gpsValue, ble)
+        value.merge(["ok": true, "accepted": false, "state": "idle", "recordState": "waiting",
+            "nativeRecordState": "idle", "id": "", "ticket": "", "recordingId": "",
+            "reason": "", "samples": 0, "recordedSamples": 0, "elapsedMs": 0, "durationMs": 0,
+            "gps": gpsValue, "gpsEnabled": gpsValue["enabled"] ?? false,
+            "gpsOver50": preferences.bool(forKey: gpsAutoKey(scope)), "connected": false,
+            "telemetry": [:], "telemetryTimes": [:], "fields": [:], "busy": false,
+            "finished": false, "saved": false, "retryAvailable": false,
+            "backgroundEnabled": false, "backgroundGuaranteed": false, "orphans": orphanSummary()]) { _, new in new }
+        return value
+    }
+
     private func snapshot(_ run: Run) -> [String: Any] {
-        let gpsValue = active === run && !run.ending ? gps.snapshot() : ["ok": true, "state": "disabled", "speedKph": NSNull(), "lat": NSNull(), "lng": NSNull()]
-        let ble = active === run && !run.ending ? bluetooth.snapshot() : ["connected": false, "telemetry": [:], "telemetryTimes": [:]]
-        // not_recorded 是终态：没有文件可写，但这条记录已经收尾，网页不能再等 saved。
-        // 网页 `s.saved !== true` 同时控制「结束并保存」按钮和 throw 分支，回 false 会让它无限重试。
+        let live = active === run && !run.ending && !run.userPaused
+        let gpsValue = live ? gps.snapshot() : ["ok": true, "enabled": false, "state": "disabled",
+            "speedKph": NSNull(), "at": NSNull(), "seq": 0, "lat": NSNull(), "lng": NSNull(),
+            "permissionGranted": gps.snapshot()["permissionGranted"] ?? NSNull()]
+        let ble = bluetooth.snapshot()
+        let nativeLease = bluetooth.currentRecordingLease()
+        let sameLease = live && nativeLease?.recordingID == run.id && nativeLease?.scope == run.scope
+            && bluetooth.canAcceptTelemetry
+        let readings = visibleBLE(run)
+        // not_recorded 是无文件终态，公共 UI 按 completed 退役；保留 nativeRecordState 解释真实原因。
         let saved = (run.completed && !run.saveFailed) || run.empty
-        var value: [String: Any] = ["ok": true, "id": run.id.uuidString.lowercased(), "ticket": run.id.uuidString.lowercased(),
-            "recordingId": run.id.uuidString.lowercased(), "state": run.state, "recordState": run.recordState,
+        var value = permissionProjection(gpsValue, ble)
+        value.merge(["ok": true, "accepted": false, "id": run.id.uuidString.lowercased(), "ticket": run.id.uuidString.lowercased(),
+            "recordingId": run.id.uuidString.lowercased(), "state": run.state,
+            "connectionGeneration": sameLease ? (nativeLease?.connectionGeneration as Any? ?? NSNull()) : NSNull(),
+            "nativeAuthenticated": sameLease, "authorizationFresh": sameLease, "canAcceptTelemetry": sameLease,
+            "recordState": IOSRideJSON.publicRecordState(run.recordState), "nativeRecordState": run.recordState,
             "reason": run.reason, "startedAt": run.startedAt, "endedAt": run.endedAt as Any? ?? NSNull(),
             "samples": run.samples, "recordedSamples": run.samples, "elapsedMs": run.elapsedMs, "durationMs": run.durationMs,
-            "gps": gpsValue, "gpsEnabled": run.gpsWanted, "connected": ble["connected"] ?? false,
-            "telemetry": ble["telemetry"] ?? [:], "telemetryTimes": ble["telemetryTimes"] ?? [:], "fields": ble["fields"] ?? [:],
-            "authenticated": false, "automaticUnlock": false, "backgroundRequested": run.backgroundWanted,
-            "backgroundEnabled": active === run && !run.ending && gps.backgroundAllowed, "backgroundGuaranteed": false,
-            "saved": saved, "retryAvailable": run.saveFailed, "savedBytes": run.savedBytes,
-            "orphans": orphanSummary(), "report": report(run)]
+            "gps": gpsValue, "gpsEnabled": run.gpsWanted, "gpsOver50": run.gpsOver50,
+            "connected": live && bluetooth.connected,
+            "telemetry": readings["telemetry"] ?? [:], "telemetryTimes": readings["telemetryTimes"] ?? [:],
+            "fields": live && bluetooth.connected ? run.latestBLEFields : [:],
+            "telemetryRunning": live && bleFresh(run), "dashSeen": live && run.latestBLETimes["speedKph"] != nil,
+            "dashRunning": live && (readings["telemetryTimes"] as? [String: Int64])?["speedKph"] != nil,
+            "dashConfirmed": false, "backgroundRequested": run.backgroundWanted,
+            "backgroundEnabled": live && (gps.backgroundAllowed || ble["backgroundEnabled"] as? Bool == true),
+            "backgroundGuaranteed": false, "busy": run.saveInFlight || run.recordState == "saving",
+            "finished": saved, "saved": saved, "retryAvailable": run.saveFailed, "savedBytes": run.savedBytes,
+            "orphans": orphanSummary(), "report": report(run)]) { _, new in new }
         if run.empty {
-            // 0 采样：让网页能把「没采到数据」和「保存失败」区分开，给各自的人读提示。
             value["reason"] = "no_samples"
             value["summary"] = IOSRideText.notRecorded
         }
+        return value
+    }
+
+    private func emptySnapshot(id: UUID, at: Int64, scope: IOSRideScope) -> [String: Any] {
+        var value = idleSnapshot(scope: scope)
+        value.merge(["id": id.uuidString.lowercased(), "ticket": id.uuidString.lowercased(),
+            "recordingId": id.uuidString.lowercased(), "state": "not_recorded", "recordState": "completed",
+            "nativeRecordState": "not_recorded", "reason": "no_samples", "summary": IOSRideText.notRecorded,
+            "saved": true, "finished": true, "endedAt": at]) { _, new in new }
         return value
     }
 
@@ -1108,15 +1318,13 @@ final class IOSRideService: NSObject, IOSBridgeService, IOSBridgeCancellableServ
         if let run = active, run.id == id, run.scope == scope {
             stop(run, state: "completed", reason: "user_stop", reply: reply)
         } else if let run = finals[id], run.scope.ownerHash == scope.ownerHash {
-            reply(snapshot(run), nil)
+            reply(acceptedSnapshot(run, status: ["ok": run.completed && !run.saveFailed]), nil)
         } else if let empty = emptyFinals.first(where: { $0.id == id && $0.owner == scope.ownerHash }) {
             // 0 采样记录已经销毁，但 end 的重复调用必须幂等回终态；
             // 之前这里落到 stale_ticket，网页只看到「重试」而看不到「本次没记录到数据」。
-            reply(["ok": true, "accepted": false, "id": id.uuidString.lowercased(),
-                   "ticket": id.uuidString.lowercased(), "recordingId": id.uuidString.lowercased(),
-                   "state": "not_recorded", "recordState": "not_recorded", "reason": "no_samples",
-                   "summary": IOSRideText.notRecorded, "saved": true, "samples": 0,
-                   "endedAt": empty.at, "retryAvailable": false, "acceptedAt": empty.at], nil)
+            var value = emptySnapshot(id: id, at: empty.at, scope: scope)
+            value["accepted"] = true
+            reply(value, nil)
         } else { reply(failure("stale_ticket"), nil) }
     }
 
@@ -1132,6 +1340,7 @@ final class IOSRideService: NSObject, IOSBridgeService, IOSBridgeCancellableServ
         run.endedAt = Int64(Date().timeIntervalSince1970 * 1000)
         run.endedUptime = ProcessInfo.processInfo.systemUptime
         pauseDuration(run)
+        invalidateGauge(run)
         publishSystemSurface(run, eventAt: run.endedAt, elapsedSeconds: Double(run.elapsedMs) / 1000)
         gps.endRecording(id: run.id)
         bluetooth.setRecordingContext(id: nil, background: false, scope: nil)
@@ -1280,7 +1489,7 @@ final class IOSRideService: NSObject, IOSBridgeService, IOSBridgeCancellableServ
             // not_recorded（empty）也算收尾成功：网页用这一条回执决定按钮文案和是否 throw，
             // 回 ok=false 会让它一直重试同一条已经不存在的记录。
             value["ok"] = !run.saveFailed
-            value["accepted"] = true
+            value["accepted"] = !run.saveFailed
             // retryAvailable 现在与 snapshot 语义一致：只有真的 saveFailed 才提示可重试。
             value["retryAvailable"] = run.saveFailed
             reply(value, nil)
@@ -1289,65 +1498,211 @@ final class IOSRideService: NSObject, IOSBridgeService, IOSBridgeCancellableServ
 
     private func action(scope: IOSRideScope, options: [String: Any], reply: @escaping (Any?, String?) -> Void) {
         guard let action = options["action"] as? String else { reply(failure("invalid_action"), nil); return }
-        if action == "records" { list(scope: scope, reply: reply); return }
-        if action == "stop" { end(scope: scope, options: options, reply: reply); return }
-        guard let id = requestedID(options) else { reply(failure("invalid_recording_id"), nil); return }
-        if action == "retry" || action == "retry_save" {
-            guard let run = finals[id], run.scope.ownerHash == scope.ownerHash, run.saveFailed else {
-                reply(failure("retry_unavailable"), nil); return
+        let suppliedID = options["id"] ?? options["ticket"] ?? options["recordingId"]
+        if suppliedID != nil && requestedID(options) == nil { reply(failure("invalid_recording_id"), nil); return }
+        let id = requestedID(options) ?? active?.id
+        let run = id.flatMap { active?.id == $0 ? active : finals[$0] }
+        if suppliedID != nil, run == nil || run?.scope.ownerHash != scope.ownerHash {
+            // 已销毁的空终态仍由 end 幂等处理，其他动作不准复活旧票据。
+            if action != "stop" { reply(failure("stale_ticket"), nil); return }
+        }
+        if action == "records" {
+            list(scope: scope) { [weak self, weak run] result, error in
+                guard let self = self else { return }
+                var value = run.map { self.snapshot($0) } ?? self.idleSnapshot(scope: scope)
+                if let result = result as? [String: Any] { value.merge(result) { _, new in new } }
+                else { value["ok"] = false; value["recordsError"] = error ?? "records_failed" }
+                value["accepted"] = value["ok"] as? Bool == true
+                reply(value, error)
             }
-            guard run.state != "saving" else { reply(failure("save_busy"), nil); return }
-            run.state = "saving"
-            run.recordState = "saving"
-            // 手动重试是新的一次机会，重置自动重试标记：否则这次再失败就不会补尝试了。
-            run.saveRetried = false
+            return
+        }
+        if action == "stop" {
+            var endOptions = options
+            if let id = id { endOptions["id"] = id.uuidString.lowercased() }
+            end(scope: scope, options: endOptions, reply: reply); return
+        }
+        if ["location-settings", "bluetooth-settings"].contains(action) {
+            openSettings(scope: scope, run: run, options: options, reply: reply); return
+        }
+        if ["permission", "location-permission"].contains(action) {
+            requestPermission(scope: scope, run: run, locationOnly: action == "location-permission", options: options, reply: reply); return
+        }
+        guard let id = id, let run = run, run.scope.ownerHash == scope.ownerHash else {
+            reply(failure("invalid_recording_id"), nil); return
+        }
+        if action == "retry" || action == "retry_save" {
+            guard finals[id] === run, run.saveFailed else {
+                var value = snapshot(run)
+                value["ok"] = false; value["accepted"] = false; value["available"] = false
+                // 原生只重试同 UUID 落盘；重连/续认证仍由 privateJS driver 发真实 exchange。
+                value["reason"] = active === run ? "private_driver_required" : "retry_unavailable"
+                reply(value, nil); return
+            }
+            guard !run.saveInFlight, run.saveWaiters.count < 16 else { reply(failure("save_busy"), nil); return }
+            run.state = "saving"; run.recordState = "saving"; run.saveRetried = false
             run.saveWaiters.append((page, scopeProvider?(), reply))
             saveFinal(run) // 同一 UUID 原子替换，不追加第二条历史。
             return
         }
-        guard let run = active, run.id == id, run.scope == scope, !run.ending else { reply(failure("stale_ticket"), nil); return }
+        guard owns(run) else { reply(failure("stale_ticket"), nil); return }
         switch action {
+        case "gps_auto_on", "gps_auto_off":
+            run.gpsOver50 = action == "gps_auto_on"
+            preferences.set(run.gpsOver50, forKey: gpsAutoKey(scope))
+            invalidateGauge(run) // 偏好不是新速度观测，等下一条真实速度样本再发布。
+            reply(acceptedSnapshot(run), nil)
         case "pause", "gps_off":
             markGap(run, source: "gps", reason: action == "pause" ? "user_pause" : "gps_disabled")
-            if action == "pause" { run.userPaused = true }
-            else { run.gpsWanted = false }
+            if action == "pause" { run.userPaused = true; invalidateGauge(run) }
+            else { run.gpsWanted = false; invalidateGauge(run, source: .gps) }
             run.lastRoute = nil
             gps.pauseRecording(id: run.id)
             if action == "pause" {
-                pauseDuration(run)
-                run.state = "paused"
-                run.recordState = "paused"
-                run.reason = "user_pause"
+                markGap(run, source: "ble", reason: "user_pause")
+                pauseDuration(run); run.state = "paused"; run.recordState = "paused"; run.reason = "user_pause"
                 bluetooth.setRecordingContext(id: nil, background: false, scope: nil)
+            } else if !bleFresh(run) {
+                pauseDuration(run); run.state = "interrupted"; run.recordState = "gap"; run.reason = "gps_disabled"
             }
             checkpoint(run, force: true)
             publishSystemSurface(run, eventAt: Int64(Date().timeIntervalSince1970 * 1000), elapsedSeconds: Double(run.elapsedMs) / 1000)
-            reply(snapshot(run), nil)
+            reply(acceptedSnapshot(run), nil)
         case "resume", "gps_on", "background_on":
             guard options["confirmed"] as? Bool == true else { reply(failure("user_action_required"), nil); return }
             confirm(method: "ride.action", id: id, scope: scope, title: IOSStrings.rideRecordTitle,
                     message: IOSStrings.rideRecordMessage, reply: reply) { [weak self, weak run] consent in
-                guard let self = self, let run = run, self.owns(run) else { return }
+                guard let self = self else { return }
+                guard let run = run, self.owns(run) else { self.finish(consent, self.failure("stale_ticket")); return }
+                var status: [String: Any] = ["ok": true]
                 if action == "background_on" {
-                    run.backgroundWanted = true
-                    if run.gpsWanted { _ = self.gps.setBackgroundRecording(id: run.id, enabled: true, requestPermission: true) }
+                    if run.gpsWanted { status = self.gps.setBackgroundRecording(id: run.id, enabled: true, requestPermission: true) }
+                    if status["ok"] as? Bool == true { run.backgroundWanted = true }
                 } else {
-                    run.userPaused = false
-                    run.gpsWanted = true
-                    _ = self.gps.beginRecording(id: run.id, background: run.backgroundWanted, requestPermission: true)
-                    _ = self.gps.resumeRecording(id: run.id, requestPermission: true)
-                    run.state = "waiting"; run.recordState = "waiting"; run.reason = "waiting_fix"
+                    let wantedGPS = action == "gps_on" || run.gpsWanted
+                    if wantedGPS { status = self.gps.beginRecording(id: run.id, background: run.backgroundWanted, requestPermission: true) }
+                    if status["ok"] as? Bool == true {
+                        run.userPaused = false; run.gpsWanted = wantedGPS
+                        run.state = "waiting"; run.recordState = "waiting"; run.reason = "waiting_fix"
+                    }
                 }
                 self.updateBLEContext(run)
                 self.publishSystemSurface(run, eventAt: Int64(Date().timeIntervalSince1970 * 1000), elapsedSeconds: Double(run.elapsedMs) / 1000)
-                self.finish(consent, self.snapshot(run))
+                self.finish(consent, self.acceptedSnapshot(run, status: status))
             }
         case "background_off":
-            run.backgroundWanted = false
-            _ = gps.setBackgroundRecording(id: run.id, enabled: false, requestPermission: false)
-            updateBLEContext(run)
-            reply(snapshot(run), nil)
-        default: reply(failure("invalid_action"), nil)
+            let status = run.gpsWanted ? gps.setBackgroundRecording(id: run.id, enabled: false, requestPermission: false) : ["ok": true]
+            if status["ok"] as? Bool == true { run.backgroundWanted = false; updateBLEContext(run) }
+            reply(acceptedSnapshot(run, status: status), nil)
+        default:
+            var value = snapshot(run)
+            value["ok"] = false; value["accepted"] = false; value["available"] = false; value["reason"] = "unsupported_action"
+            reply(value, nil)
+        }
+    }
+
+    private func acceptedSnapshot(_ run: Run, status: [String: Any] = ["ok": true]) -> [String: Any] {
+        var value = snapshot(run)
+        let accepted = status["ok"] as? Bool == true
+        value["ok"] = accepted; value["accepted"] = accepted
+        if !accepted { value["reason"] = status["reason"] ?? "source_unavailable" }
+        return value
+    }
+
+    private func openSettings(scope: IOSRideScope, run: Run?, options: [String: Any], reply: @escaping (Any?, String?) -> Void) {
+        guard options["confirmed"] as? Bool == true else { reply(failure("user_action_required"), nil); return }
+        confirm(method: "ride.action", id: run?.id, scope: scope, title: IOSStrings.settingsTitle,
+                message: IOSStrings.settingsMessage, reply: reply) { [weak self, weak run] consent in
+            guard let self = self else { return }
+            guard let url = URL(string: UIApplication.openSettingsURLString), UIApplication.shared.canOpenURL(url) else {
+                self.finish(consent, self.failure("settings_unavailable")); return
+            }
+            // iOS 只公开本 App 设置入口，不使用私有蓝牙/定位 URL，也不谎称打开了系统蓝牙页。
+            UIApplication.shared.open(url, options: [:]) { [weak self, weak run] opened in
+                DispatchQueue.main.async {
+                    guard let self = self else { return }
+                    var value = run.map { self.snapshot($0) } ?? self.idleSnapshot(scope: scope)
+                    value["ok"] = opened; value["accepted"] = opened; value["available"] = true
+                    value["settingsOpened"] = opened; value["settingsDestination"] = "app"
+                    if !opened { value["reason"] = "settings_unavailable" }
+                    self.finish(consent, value)
+                }
+            }
+        }
+    }
+
+    private func requestPermission(scope: IOSRideScope, run: Run?, locationOnly: Bool, options: [String: Any],
+                                   reply: @escaping (Any?, String?) -> Void) {
+        guard options["confirmed"] as? Bool == true else { reply(failure("user_action_required"), nil); return }
+        guard UIApplication.shared.applicationState == .active else { reply(failure("foreground_required"), nil); return }
+        guard !permissionBusy else { reply(failure("permission_busy"), nil); return }
+        if let run = run, !owns(run) { reply(failure("stale_ticket"), nil); return }
+        let ble = bluetooth.snapshot()
+        let wantsLocation = locationOnly || (run?.gpsWanted == true && ble["authorization"] as? String == "allowed")
+        if wantsLocation {
+            if let run = run {
+                confirm(method: "ride.action", id: run.id, scope: scope, title: IOSStrings.gpsReadTitle,
+                        message: IOSStrings.gpsReadMessage, reply: reply) { [weak self, weak run] consent in
+                    guard let self = self else { return }
+                    guard let run = run, self.owns(run), !run.userPaused else {
+                        self.finish(consent, self.failure("recording_paused")); return
+                    }
+                    // 真实原生确认后复用唯一定位服务；没有网页“已授权”捷径。
+                    let status = self.gps.beginRecording(id: run.id, background: run.backgroundWanted, requestPermission: true)
+                    if status["ok"] as? Bool == true { run.gpsWanted = true }
+                    self.finish(consent, self.acceptedSnapshot(run, status: status))
+                }
+            } else {
+                let revision = page
+                permissionBusy = true
+                gps.handle(method: "gps.begin", args: [["confirmed": true, "requestPermission": true]]) { [weak self] result, error in
+                    guard let self = self else { return }
+                    self.permissionBusy = false
+                    guard self.page == revision, self.scopeProvider?() == scope else { reply(nil, "stale_navigation"); return }
+                    let status = result as? [String: Any] ?? [:]
+                    var value = self.idleSnapshot(scope: scope)
+                    value["ok"] = error == nil && status["ok"] as? Bool == true
+                    value["accepted"] = error == nil && status["accepted"] as? Bool == true
+                    if value["accepted"] as? Bool != true { value["reason"] = status["reason"] ?? "permission_required" }
+                    // gps.begin 的 ticket 不是 Ride UUID；不得让页面把它拿去 stop/read/delete。
+                    reply(value, error)
+                }
+            }
+            return
+        }
+        if ble["authorization"] as? String == "allowed" {
+            var value = run.map { snapshot($0) } ?? idleSnapshot(scope: scope)
+            value["accepted"] = true; reply(value, nil); return
+        }
+        if ["denied", "restricted"].contains(ble["authorization"] as? String ?? "") {
+            var value = run.map { snapshot($0) } ?? idleSnapshot(scope: scope)
+            value["ok"] = false; value["accepted"] = false; value["available"] = false
+            value["reason"] = "permission_denied"; value["settingsAction"] = "bluetooth-settings"
+            reply(value, nil); return
+        }
+        confirm(method: "ride.action", id: run?.id, scope: scope, title: IOSStrings.rideRecordTitle,
+                message: IOSStrings.rideRecordMessage, reply: reply) { [weak self, weak run] consent in
+            guard let self = self else { return }
+            self.permissionBusy = true
+            // 现有有界扫描会创建唯一 CBCentralManager 并触发系统权限；不另建连接/认证服务。
+            self.bluetooth.handle(method: "ble.scan", args: [["confirmed": true, "timeoutMs": 1000]]) { [weak self, weak run] result, error in
+                guard let self = self else { return }
+                self.permissionBusy = false
+                guard self.live(consent) else { self.finish(consent, self.failure("stale_session")); return }
+                let status = result as? [String: Any] ?? [:]
+                var value = run.map { self.snapshot($0) } ?? self.idleSnapshot(scope: scope)
+                let accepted = error == nil && status["ok"] as? Bool == true
+                if accepted, run?.gpsWanted == true, self.bluetooth.snapshot()["authorization"] as? String == "allowed" {
+                    // 系统蓝牙回执已落定后才请求定位，不叠两个系统授权框。
+                    self.requestPermission(scope: scope, run: run, locationOnly: true, options: options) { value, error in
+                        self.finish(consent, value as? [String: Any] ?? self.failure(error ?? "permission_required"))
+                    }
+                    return
+                }
+                value["ok"] = accepted; value["accepted"] = accepted; value["available"] = accepted
+                if !accepted { value["reason"] = status["reason"] ?? "permission_required" }
+                self.finish(consent, value)
+            }
         }
     }
 
@@ -1536,6 +1891,6 @@ final class IOSRideService: NSObject, IOSBridgeService, IOSBridgeCancellableServ
     }
 
     private func failure(_ code: String) -> [String: Any] {
-        ["ok": false, "state": "error", "reason": code]
+        ["ok": false, "accepted": false, "available": false, "state": "error", "recordState": "error", "reason": code]
     }
 }

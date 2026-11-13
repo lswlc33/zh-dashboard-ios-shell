@@ -33,6 +33,7 @@ enum WidgetStrings {
     static let speedUnit = "km/h"
     static let elapsed = "已记录时长"
     static let activityUnavailable = "暂无数据"
+    static let nativeGauge = "原生仪表"
 }
 
 enum WidgetValueText {

@@ -3,12 +3,15 @@ import UIKit
 import ActivityKit
 import WidgetKit
 import CoreFoundation
+import CryptoKit
 import ZeehoSystemShared
 
 // 只有已由 Ride 的原生确认启动的记录才能发布；这个出口不启动 GPS、蓝牙、网络或后台定时任务。
 protocol IOSSystemSurfacePublisher: AnyObject {
     func publishRide(_ value: SystemRideSnapshot, scope: IOSRideScope)
     func systemSurfacesDisconnected(scope: IOSRideScope)
+    func publishGauge(_ value: SystemGaugeSnapshot, scope: IOSRideScope)
+    func systemGaugeDisconnected(scope: IOSRideScope)
 }
 
 private final class IOSSystemSurfaceLease: @unchecked Sendable {
@@ -41,7 +44,10 @@ private actor IOSLiveActivityManager {
         // Live Activity 全部杀掉。撤销只能走显式的 clearScope()。
         guard let next = next else { return }
         let old = Activity<ZeehoActivityAttributes>.activities.filter { $0.attributes.owner != next }
-        for activity in old { await finish(activity) }
+        for activity in old {
+            guard ticket == generation, owner == next else { return }
+            await finish(activity)
+        }
     }
 
     /// 显式撤销（关闭系统显示）：结束本 App 的全部活动，并清掉当前 owner 引用。
@@ -50,8 +56,12 @@ private actor IOSLiveActivityManager {
         guard ticket >= generation else { return 0 }
         generation = ticket; owner = nil
         let all = Activity<ZeehoActivityAttributes>.activities
-        for activity in all { await finish(activity) }
-        return all.count
+        var ended = 0
+        for activity in all {
+            guard ticket == generation, owner == nil else { return ended }
+            await finish(activity); ended += 1
+        }
+        return ended
     }
 
     // .stale 是 iOS 16.2 才有的 ActivityState；deployment target 15.4 必须用可用性分支，
@@ -79,16 +89,27 @@ private actor IOSLiveActivityManager {
         case .charging:
             guard snapshot.vehicle?.visibleCharging() == true else { throw SystemSnapshotError("fresh_charging_data_required") }
         case .ride:
-            guard let ride = snapshot.ride, ride.state != .ended else { throw SystemSnapshotError("native_recording_required") }
+            guard let ride = snapshot.ride, ride.state != .ended,
+                  SystemSnapshotFreshness.isFresh(ride.updatedAt, maxAgeSeconds: SystemSnapshotFreshness.rideSpeedMaxAgeSeconds) else {
+                throw SystemSnapshotError("native_recording_required")
+            }
         case .vehicle:
-            guard snapshot.vehicle != nil else { throw SystemSnapshotError("fresh_vehicle_data_required") }
+            guard let vehicle = snapshot.vehicle,
+                  SystemSnapshotFreshness.isFresh(vehicle.updatedAt, maxAgeSeconds: SystemSnapshotFreshness.vehicleMaxAgeSeconds) else {
+                throw SystemSnapshotError("fresh_vehicle_data_required")
+            }
+        case .gauge:
+            guard snapshot.gauge?.visibleSpeedKph() != nil else { throw SystemSnapshotError("native_gauge_sample_required") }
         }
         if let existing = running(owner: snapshot.owner).first {
             guard existing.kind == kind else { throw SystemSnapshotError("another_activity_running") }
             // 复用已有活动时也要刷新内容：否则用户点「开始活动」拿到的还是上一次
             // 发布的旧电量/旧速度（created:false 曾直接返回 id，不更新任何内容）。
-            // 用 try? 兜住「刚查到就结束」的竞态：活动确实存在过，仍如实回执 running。
-            _ = try? await update(snapshot, id: existing.id, generation: ticket, lease: lease)
+            // 复用也必须成功更新；取消/已结束的竞态不能被 try? 吞掉并骗报 running。
+            _ = try await update(snapshot, id: existing.id, generation: ticket, lease: lease)
+            guard lease.valid, ticket == generation, owner == snapshot.owner else {
+                throw SystemSnapshotError("operation_cancelled")
+            }
             return IOSStartedSystemActivity(id: existing.id, created: false)
         }
         let attributes = ZeehoActivityAttributes(owner: snapshot.owner, kind: kind)
@@ -124,21 +145,34 @@ private actor IOSLiveActivityManager {
             if #available(iOS 16.2, *) {
                 await activity.update(ActivityContent(state: state, staleDate: staleDate(snapshot, kind: activity.attributes.kind)))
             } else { await activity.update(using: state) }
+            // actor 在 await 时允许换 scope；不能用已经失效的样本确认成功或留下旧活动。
+            guard lease.valid, ticket == generation, owner == snapshot.owner else {
+                if owner != snapshot.owner { await finish(activity) }
+                throw SystemSnapshotError("operation_cancelled")
+            }
         }
         return targets.count
     }
 
-    func end(owner expected: SystemSnapshotOwner, id: String? = nil, kind: ZeehoActivityKind? = nil) async -> Int {
+    func end(owner expected: SystemSnapshotOwner, id: String? = nil, kind: ZeehoActivityKind? = nil,
+             generation ticket: UInt64? = nil) async -> Int {
+        if let ticket = ticket, ticket != generation { return 0 }
         let targets = Activity<ZeehoActivityAttributes>.activities.filter {
             $0.attributes.owner == expected && (id == nil || $0.id == id) && (kind == nil || $0.attributes.kind == kind)
         }
-        for activity in targets { await finish(activity) }
-        return targets.count
+        var ended = 0
+        for activity in targets {
+            if let ticket = ticket, ticket != generation { return ended }
+            await finish(activity); ended += 1
+        }
+        return ended
     }
 
     private func staleDate(_ snapshot: SystemSnapshot, kind: ZeehoActivityKind) -> Date {
         var deadlines = [snapshot.expiresAt]
-        if kind == .ride, let ride = snapshot.ride {
+        if kind == .gauge, let gauge = snapshot.gauge {
+            deadlines.append(gauge.updatedAt + 10_000)
+        } else if kind == .ride, let ride = snapshot.ride {
             deadlines.append(ride.updatedAt + 10_000)
             if ride.speedKph != nil, let timestamp = ride.speedUpdatedAt { deadlines.append(timestamp + 10_000) }
         } else if let vehicle = snapshot.vehicle {
@@ -171,7 +205,12 @@ final class IOSSystemSurfacesService: NSObject, IOSBridgeService, IOSBridgeCance
     private var approved = false
     private var revoking = false
     private var latest: SystemSnapshot?
+    // latest 可由 Gauge 提前更新给活动；只有 worker 写成功才更新 persistedSnapshot。
+    private var persistedSnapshot: SystemSnapshot?
+    private var nativeWritePending = false
     private var nativeRide: SystemRideSnapshot?
+    private var nativeGauge: SystemGaugeSnapshot?
+    private var lastGaugePublish = -Double.infinity
     private var liveManagerObject: AnyObject?
     private var jobs: [UUID: Job] = [:]
     private var interactiveJob: Job?
@@ -279,40 +318,27 @@ final class IOSSystemSurfacesService: NSObject, IOSBridgeService, IOSBridgeCance
         // 同一账号+VIN 重启后 owner 相等，上一会话的 Live Activity 能被接管而不是被结束。
         owner = next.flatMap {
             $0.valid ? SystemSnapshotOwner(scopeID: Self.stableScopeID(for: $0.ownerHash),
-                                           accountVINHash: $0.ownerHash) : nil
+                                           accountVINHash: $0.ownerHash,
+                                           accountHash: Self.anonymousAccount($0.accountID)) : nil
         }
-        revoking = false; latest = nil; nativeRide = nil; lastError = nil
+        revoking = false; latest = nil; persistedSnapshot = nil; nativeWritePending = false
+        nativeRide = nil; nativeGauge = nil; lastError = nil
+        lastNativePublish = -Double.infinity; lastGaugePublish = -Double.infinity
         lastWidgetReload = -Double.infinity; lastWidgetEdge = ""
         // approved 也从持久化里取；没拿到 scope 的中间态保留当前内存值，
         // 否则一次导航刷新就把用户授权抹成「每次都要求确认」。
         adoptPersistedState(for: owner?.accountVINHash)
         let ticket = epoch
         let selected = owner
-        // 只有「真的换账号/换 VIN」才清共享快照：
-        // - previousOwner == nil（冷启动、桥关闭）时上一会话的快照是小组件唯一的数据，
-        //   清掉就变成「每次启动小组件都空」；
-        // - 同 hash（同一辆车、同一账号）重启也是同一份数据，没有理由删；
-        // - scopeProvider 已被清空（bridgeClosed）表示不是用户的撤销动作，也保留。
+        // 同账号选车保留匿名目录；换账号/显式登出清账号摘要，桥关闭的未知状态不作撤销。
         let providerAlive = scopeProvider != nil
-        let shouldClearPrevious: Bool
-        if let previous = previousOwner {
-            if let next = selected { shouldClearPrevious = previous.accountVINHash != next.accountVINHash }
-            // 桥还在但没有车辆 = 用户明确登出/切换成无车状态，这时才清旧快照。
-            else { shouldClearPrevious = providerAlive }
-        } else { shouldClearPrevious = false }
-        let keepHash = selected?.accountVINHash
-        // 同一串行队列让旧写结束后必定清理；新 owner 写不能越过这道清理。
-        // previousOwner == nil 时（冷启动 / 桥关闭）只清「确定是别的账号」的遗留快照，
-        // 且必须已知 keepHash，否则就把上一会话的数据留下了（这正是 ② 要修的）。
         worker.async { [weak self] in
             do {
-                if let previous = previousOwner, shouldClearPrevious {
-                    try SystemSnapshotStore.clear(expectedOwner: previous)
-                } else if previousOwner == nil, let keepHash = keepHash,
-                          let persisted = try SystemSnapshotStore.currentOwner(),
-                          persisted.accountVINHash != keepHash {
-                    try SystemSnapshotStore.clear(expectedOwner: persisted)
+                if let previous = previousOwner,
+                   (selected.map { !previous.sharesAccount(with: $0) } ?? providerAlive) {
+                    try SystemSnapshotStore.clearAccount(expectedOwner: previous)
                 }
+                if let selected = selected { try SystemSnapshotStore.activate(selected) }
             } catch {
                 DispatchQueue.main.async { [weak self] in
                     guard let self = self, self.epoch == ticket else { return }
@@ -326,7 +352,12 @@ final class IOSSystemSurfacesService: NSObject, IOSBridgeService, IOSBridgeCance
         }
         if #available(iOS 16.1, *) {
             let manager = liveManager()
-            Task { await manager.setScope(selected, generation: ticket) }
+            Task {
+                await manager.setScope(selected, generation: ticket)
+                if selected == nil, providerAlive, let previous = previousOwner {
+                    _ = await manager.end(owner: previous, generation: ticket)
+                }
+            }
         }
     }
 
@@ -412,16 +443,24 @@ final class IOSSystemSurfacesService: NSObject, IOSBridgeService, IOSBridgeCance
                 guard approved, let value = latest, !value.isStale() else { finish(job, failure("fresh_snapshot_required")); return }
                 updateActivity(value, id: try activityID(options), job: job)
             case "liveActivity.end":
-                try validateAction(options)
+                try validateAction(options, allowing: ["kind"])
                 let id = try activityID(options)
+                let kind: ZeehoActivityKind?
+                if let value = options["kind"] {
+                    guard let text = value as? String, let parsed = ZeehoActivityKind(rawValue: text) else {
+                        throw SystemSnapshotError("invalid_activity_kind")
+                    }
+                    kind = parsed
+                } else { kind = nil }
                 confirm(job, title: IOSStrings.liveActivityEndTitle, message: IOSStrings.liveActivityEndMessage) { [weak self] in
-                    self?.endActivity(id: id, job: job)
+                    self?.endActivity(id: id, kind: kind, job: job)
                 }
             case "widgets.reload":
                 try validateAction(options, includeID: false)
                 guard approved, let value = latest else { finish(job, failure("snapshot_consent_required")); return }
                 let didReload = reloadWidgets(force: false, snapshot: value)
-                finish(job, ["ok": true, "reloaded": didReload, "reason": didReload ? "reload_requested" : "reload_throttled"])
+                finish(job, ["ok": true, "reloaded": didReload, "requested": didReload, "displayed": false,
+                    "budget": "os_managed", "reason": didReload ? "reload_requested" : "reload_throttled"])
             default: finish(job, failure("unsupported_method"))
             }
         } catch {
@@ -450,12 +489,19 @@ final class IOSSystemSurfacesService: NSObject, IOSBridgeService, IOSBridgeCance
             liveSupported = supported && declaredLive
             authorization = liveSupported && ActivityAuthorizationInfo().areActivitiesEnabled
         }
+        let metadata = plugin.appendingPathComponent("Metadata.appintents", isDirectory: true)
+        let intentMetadata = (try? metadata.resourceValues(forKeys: [.isDirectoryKey]).isDirectory) == true
+            && ((try? FileManager.default.contentsOfDirectory(atPath: metadata.path).isEmpty) == false)
+        var configurable = false
+        if #available(iOS 17.0, *) { configurable = supported && intentMetadata }
         let reason: String? = !group ? "app_group_unavailable" : (!embedded ? "widget_extension_missing" : nil)
         let liveReason = reason ?? (!declaredLive ? "live_activities_not_declared" : (!liveSupported ? "ios_16_1_required" : (!authorization ? "live_activities_disabled" : "available")))
         return ["supported": supported, "embedded": embedded, "appGroupAvailable": group,
                 "liveActivitiesSupported": liveSupported, "authorizationEnabled": authorization,
                 "reason": reason as Any? ?? NSNull(), "liveActivitiesReason": liveReason,
-                "verification": "runtime_bundle_check", "minimumLiveActivitiesIOS": "16.1"]
+                "verification": "runtime_bundle_check", "minimumLiveActivitiesIOS": "16.1",
+                "perInstanceVehicleMinimumIOS": "17.0", "perInstanceVehicleSelection": configurable,
+                "intentMetadataAvailable": intentMetadata, "backgroundPolling": false, "refreshBudget": "os_managed"]
     }
 
     private func status(_ job: Job) {
@@ -480,17 +526,20 @@ final class IOSSystemSurfacesService: NSObject, IOSBridgeService, IOSBridgeCance
         if #available(iOS 16.2, *) { live["staleDateAutomatic"] = liveSupported }
         else { live["staleDateAutomatic"] = false }
         if let first = running.first { live["id"] = first.id; live["kind"] = first.kind.rawValue }
-        var stored: [String: Any] = ["available": latest != nil && approved, "consentRequired": !approved,
-            "stale": latest?.isStale() ?? true, "capturedAt": latest?.capturedAt as Any? ?? NSNull(),
-            "expiresAt": latest?.expiresAt as Any? ?? NSNull(),
+        var stored: [String: Any] = ["available": persistedSnapshot != nil && approved, "consentRequired": !approved,
+            "stale": persistedSnapshot?.isStale() ?? true, "capturedAt": persistedSnapshot?.capturedAt as Any? ?? NSNull(),
+            "expiresAt": persistedSnapshot?.expiresAt as Any? ?? NSNull(),
             // 网页读 state.status?.snapshot?.reason 显示失败原因；后台发布失败只写进顶层
             // lastError，网页不刷新就永远看不到，所以这里同时落到 snapshot 里。
             "reason": lastError as Any? ?? NSNull()]
         if let owner = owner { stored["owner"] = ownerJSON(owner) }
+        let configurable = availability["perInstanceVehicleSelection"] as? Bool == true
         return ["ok": true, "supported": supported, "enabled": supported && approved,
-            "liveActivities": live, "widgets": ["supported": supported, "enabled": supported && approved && latest != nil,
+            "liveActivities": live, "widgets": ["supported": supported, "enabled": supported && approved && persistedSnapshot != nil,
                 "appGroupAvailable": availability["appGroupAvailable"] ?? false, "embedded": availability["embedded"] ?? false,
-                "kind": Self.widgetKind, "placement": "os_managed", "reason": availability["reason"] ?? NSNull()],
+                "kind": Self.widgetKind, "placement": "os_managed", "reason": availability["reason"] ?? NSNull(),
+                "perInstanceVehicleSelection": configurable, "perInstanceMinimumIOS": "17.0",
+                "supportedFamilies": ["systemSmall", "systemMedium", "systemLarge"], "refreshBudget": "os_managed", "displayed": false],
             "snapshot": stored, "scope": owner.map(ownerJSON) as Any? ?? NSNull(),
             "reason": lastError as Any? ?? availability["reason"] ?? NSNull(), "backgroundPolling": false,
             "pushNotifications": false, "verification": "runtime_bundle_check"]
@@ -591,17 +640,21 @@ final class IOSSystemSurfacesService: NSObject, IOSBridgeService, IOSBridgeCance
         guard let owner = owner else { throw SystemSnapshotError("authorized_vehicle_required") }
         let vehicle = vehicle ?? latest?.vehicle
         let ride = nativeRide ?? latest?.ride
-        let captured = [vehicle?.updatedAt, ride?.updatedAt].compactMap { $0 }.max()
+        // 不复用已断开的 latest.gauge；只有 native 服务本会话再次接受样本才能提供车速。
+        let gauge = nativeGauge
+        let captured = [vehicle?.updatedAt, ride?.updatedAt, gauge?.updatedAt].compactMap { $0 }.max()
         guard let captured = captured else { throw SystemSnapshotError("snapshot_data_required") }
-        let expiry = max(vehicle.map { $0.updatedAt + 180_000 } ?? 0, ride.map { $0.updatedAt + 10_000 } ?? 0)
+        let expiry = [vehicle.map { $0.updatedAt + 180_000 }, ride.map { $0.updatedAt + 10_000 },
+                      gauge.map { $0.updatedAt + 10_000 }].compactMap { $0 }.max() ?? captured + 1
         return try SystemSnapshot(owner: owner, capturedAt: captured, expiresAt: max(captured + 1, expiry),
-            vehicle: vehicle, ride: ride).validated(expectedOwner: owner)
+            vehicle: vehicle, ride: ride, gauge: gauge).validated(expectedOwner: owner)
     }
 
     private func disableSystemSurfaces(_ job: Job) {
         guard current(job), let selected = owner else { finish(job, failure("stale_session")); return }
         let ticket = epoch
-        revoking = true; latest = nil; nativeRide = nil
+        revoking = true; latest = nil; persistedSnapshot = nil; nativeWritePending = false
+        nativeRide = nil; nativeGauge = nil
         revokeApproval()
         ownerLease.cancel()
         publishWork?.cancel(); publishWork = nil
@@ -609,7 +662,7 @@ final class IOSSystemSurfacesService: NSObject, IOSBridgeService, IOSBridgeCance
         // clear 排在本服务所有旧写之后；未完成的 activity.start lease 已取消，不能在关闭之后复活。
         worker.async { [weak self] in
             let result: Result<Void, Error>
-            do { try SystemSnapshotStore.clear(expectedOwner: selected); result = .success(()) }
+            do { try SystemSnapshotStore.clearAccount(expectedOwner: selected); result = .success(()) }
             catch { result = .failure(error) }
             DispatchQueue.main.async { [weak self] in
                 guard let self = self else { return }
@@ -663,7 +716,8 @@ final class IOSSystemSurfacesService: NSObject, IOSBridgeService, IOSBridgeCance
             try persist(value, job: job)
         } catch { finish(job, failure(Self.code(error))) }
     }
-    private func persist(_ value: SystemSnapshot, job: Job?, completion: (() -> Void)? = nil) throws {
+    private func persist(_ value: SystemSnapshot, job: Job?, didPersist: ((Bool) -> Void)? = nil,
+                         completion: (() -> Void)? = nil) throws {
         guard approved, value.owner == owner, pendingWrites < 8 else { throw SystemSnapshotError("snapshot_store_busy") }
         let selectedScope = scope; let ticket = epoch; let lease = ownerLease
         pendingWrites += 1
@@ -681,16 +735,21 @@ final class IOSSystemSurfacesService: NSObject, IOSBridgeService, IOSBridgeCance
                 if let job = job, !self.current(job) { return }
                 switch result {
                 case .success:
-                    self.latest = value; self.lastError = nil
+                    self.persistedSnapshot = value
+                    // 写回调不能让活动车速倒退到排队前；车况沿用本次成功值，原生源使用最新已接受样本。
+                    self.latest = (try? self.candidate(vehicle: value.vehicle)) ?? value
+                    self.lastError = nil
                     self.reloadWidgets(force: false, snapshot: value)
                     if let completion = completion { completion() }
                     else {
-                        self.publishExistingActivity(value)
+                        self.publishExistingActivity(self.latest ?? value)
                         if let job = job { self.finishStored(job, value: value) }
                     }
+                    didPersist?(true)
                 case .failure(let error):
                     self.lastError = Self.code(error)
                     if let job = job { self.finish(job, self.failure(Self.code(error))) }
+                    didPersist?(false)
                 }
             }
         }
@@ -713,23 +772,74 @@ final class IOSSystemSurfacesService: NSObject, IOSBridgeService, IOSBridgeCance
                 Task { _ = await manager.end(owner: owner, kind: .ride) }
             }
         }
-        guard approved else { return }
+        scheduleNativePersistence(scope: captured, immediate: edge)
+    }
+
+    // Native Ride/Gauge 同 tick 共用一个待办；只能对比成功落盘值，不能以实时内存 latest 当已写。
+    private func scheduleNativePersistence(scope captured: IOSRideScope, immediate: Bool) {
+        guard approved, !revoking, !nativeWritePending else { return }
         publishWork?.cancel()
-        let delay = edge ? 0 : max(0, 5 - (ProcessInfo.processInfo.systemUptime - lastNativePublish))
+        let delay = immediate ? 0 : max(0, 5 - (ProcessInfo.processInfo.systemUptime - lastNativePublish))
         let ticket = epoch
         let work = DispatchWorkItem { [weak self] in
-            guard let self = self, self.epoch == ticket, self.scopeProvider?() == captured else { return }
+            guard let self = self, self.epoch == ticket, self.scopeProvider?() == captured,
+                  !self.nativeWritePending, self.approved, !self.revoking else { return }
             self.publishWork = nil
             do {
                 let candidate = try self.candidate()
-                guard candidate != self.latest else { return }
-                try self.persist(candidate, job: nil)
-                self.lastNativePublish = ProcessInfo.processInfo.systemUptime
-            } catch { self.lastError = Self.code(error) }
+                guard candidate != self.persistedSnapshot else { return }
+                self.nativeWritePending = true
+                try self.persist(candidate, job: nil, didPersist: { [weak self] saved in
+                    guard let self = self, self.epoch == ticket, self.scopeProvider?() == captured else { return }
+                    self.nativeWritePending = false
+                    // 失败不消费节流时间，不自动无限重试；下个真实样本可再次尝试。
+                    guard saved else { return }
+                    self.lastNativePublish = ProcessInfo.processInfo.systemUptime
+                    if let next = try? self.candidate(), next != self.persistedSnapshot {
+                        self.scheduleNativePersistence(scope: captured, immediate: false)
+                    }
+                })
+            } catch {
+                self.nativeWritePending = false
+                self.lastError = Self.code(error)
+            }
         }
         publishWork = work
         DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: work)
     }
+    // 只供 BLE/GPS 原生服务在其自身接受样本之后调用；没有 RPC 能伪造 recording 或原生车速。
+    func publishGauge(_ value: SystemGaugeSnapshot, scope captured: IOSRideScope) {
+        precondition(Thread.isMainThread)
+        scopeChanged()
+        guard captured == scope, captured == scopeProvider?(), value.speedKph.isFinite,
+              (0...400).contains(value.speedKph), value.visibleSpeedKph() != nil,
+              nativeGauge.map({ value.updatedAt >= $0.updatedAt }) ?? true else { return }
+        nativeGauge = value
+        if nativeRide != nil { scheduleNativePersistence(scope: captured, immediate: false) }
+        guard approved, !revoking, ProcessInfo.processInfo.systemUptime - lastGaugePublish >= 2 else { return }
+        do {
+            let value = try candidate()
+            // 活动车速采用有限频率；Widget 不随每个速度样本重写，避免系统预算与共享 IO 浪费。
+            latest = value
+            publishExistingActivity(value)
+            lastGaugePublish = ProcessInfo.processInfo.systemUptime
+        } catch { lastError = Self.code(error) }
+    }
+
+    func systemGaugeDisconnected(scope captured: IOSRideScope) {
+        precondition(Thread.isMainThread)
+        guard captured == scope, captured == scopeProvider?(), let selected = owner else { return }
+        nativeGauge = nil
+        for job in Array(jobs.values) where job.method == "liveActivity.update"
+            || (job.method == "liveActivity.start" && job.activityKind == .gauge) {
+            finish(job, failure("gauge_source_disconnected"), cancel: true)
+        }
+        if #available(iOS 16.1, *) {
+            let manager = liveManager()
+            Task { _ = await manager.end(owner: selected, kind: .gauge) }
+        }
+    }
+
     func systemSurfacesDisconnected(scope captured: IOSRideScope) {
         precondition(Thread.isMainThread)
         guard captured == scope, captured == scopeProvider?(), let owner = owner else { return }
@@ -789,12 +899,12 @@ final class IOSSystemSurfacesService: NSObject, IOSBridgeService, IOSBridgeCance
             _ = try? await manager.update(value, id: nil, generation: ticket, lease: lease)
         }
     }
-    private func endActivity(id: String?, job: Job) {
+    private func endActivity(id: String?, kind: ZeehoActivityKind? = nil, job: Job) {
         guard let owner = job.owner, current(job), #available(iOS 16.1, *) else { finish(job, failure("live_activity_unavailable")); return }
-        let manager = liveManager()
+        let manager = liveManager(); let ticket = epoch
         Task { @MainActor [weak self] in
             guard job.lease.valid else { return }
-            let count = await manager.end(owner: owner, id: id)
+            let count = await manager.end(owner: owner, id: id, kind: kind, generation: ticket)
             guard let self = self, self.current(job) else { return }
             guard count > 0 else { self.finish(job, self.failure("live_activity_not_running")); return }
             self.finish(job, ["ok": true, "ended": count, "running": false])
@@ -867,8 +977,145 @@ final class IOSSystemSurfacesService: NSObject, IOSBridgeService, IOSBridgeCance
         guard let job = interactiveJob else { return }
         finish(job, failure("user_cancelled"), cancel: true)
     }
+    // MARK: - 统一 Widget / Android 方法适配出口
+
+    static func anonymousAccount(_ accountID: String) -> String {
+        let data = Data(("ios-system-summary-account-v1\u{0}" + accountID).utf8)
+        return SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
+    }
+
+    func compatibilityScopeOptions() throws -> [String: Any] {
+        precondition(Thread.isMainThread)
+        scopeChanged()
+        let current = try checkedScope([:])
+        return ["accountId": current.accountID, "vin": current.vin, "generation": current.generation]
+    }
+
+    // 返回对象供主 router 依赖；操作仍使用本服务的 scope/导航/lease，不能另开一套后台状态。
+    func handleWidgetCompatibility(method: String, args: [Any], operation: String,
+                                   options: [String: Any], reply: @escaping (Any?, String?) -> Void) {
+        precondition(Thread.isMainThread)
+        scopeChanged()
+        var pending: Job?
+        do {
+            guard UIApplication.shared.applicationState == .active else { throw SystemSnapshotError("foreground_required") }
+            guard !revoking else { throw SystemSnapshotError("system_surfaces_busy") }
+            let currentScope = try checkedScope([:])
+            guard let selected = owner else { throw SystemSnapshotError("authorized_vehicle_required") }
+            let availability = runtimeAvailability()
+            guard availability["supported"] as? Bool == true else {
+                throw SystemSnapshotError(availability["reason"] as? String ?? "system_surfaces_unavailable")
+            }
+            let job = try begin(method, args: args, reply: reply)
+            pending = job
+            switch operation {
+            case "pin":
+                // iOS 没有 requestPinAppWidget。真正展示原生指引，不伪造 queued/requested/bound。
+                confirm(job, title: CompatibilityStrings.widgetTitle, message: CompatibilityStrings.widgetInstructions) { [weak self] in
+                    guard let self = self, self.current(job) else { return }
+                    self.finish(job, ["ok": true, "supported": true, "pinSupported": false, "queued": false,
+                        "requested": false, "added": false, "state": "instructions_presented", "placement": "os_managed"])
+                }
+            case "reload":
+                let didReload = reloadWidgets(force: false, snapshot: latest)
+                finish(job, ["ok": true, "reloaded": didReload, "requested": didReload, "displayed": false,
+                    "reason": didReload ? "reload_requested" : "reload_throttled", "budget": "os_managed"])
+            case "settings", "set", "reset":
+                let expected = selected
+                worker.async { [weak self] in
+                    let result: Result<[String: Any], Error>
+                    do {
+                        guard job.lease.valid else { throw SystemSnapshotError("operation_cancelled") }
+                        var settings = try SystemSnapshotStore.widgetSettings(expectedOwner: expected)
+                        if operation == "reset" {
+                            settings = SystemWidgetSettings(accountHash: expected.accountHash ?? expected.accountVINHash)
+                        } else if operation == "set" {
+                            switch options["key"] as? String {
+                            case "showName": settings.showName = options["value"] as? Bool ?? settings.showName
+                            case "showTime": settings.showTime = options["value"] as? Bool ?? settings.showTime
+                            case "vin", "vehicleID":
+                                let requested = options["value"] as? String ?? ""
+                                if requested.isEmpty { settings.vehicleID = nil }
+                                else if requested == currentScope.vin {
+                                    settings.vehicleID = expected.accountVINHash + "." + expected.scopeID
+                                } else if SystemSnapshotStore.ownerIdentifier(requested) != nil { settings.vehicleID = requested }
+                                else { throw SystemSnapshotError("widget_vehicle_unavailable") }
+                            default: throw SystemSnapshotError("system_widget_style_managed")
+                            }
+                        }
+                        if operation != "settings" {
+                            guard job.lease.valid else { throw SystemSnapshotError("operation_cancelled") }
+                            try SystemSnapshotStore.writeWidgetSettings(settings, expectedOwner: expected)
+                        }
+                        let vehicles = try SystemSnapshotStore.vehicles()
+                        let snapshot = try SystemSnapshotStore.readVehicle(identifier: settings.vehicleID)
+                        let snapshotData = try snapshot.map { try JSONEncoder().encode($0) }
+                        let snapshotObject = try snapshotData.map { try JSONSerialization.jsonObject(with: $0) }
+                        var value: [String: Any] = ["ok": true, "id": 0, "ids": [], "instances": [],
+                            "vehicleID": settings.vehicleID as Any? ?? NSNull(), "currentVin": currentScope.vin,
+                            "vin": settings.vehicleID == nil ? "" : settings.vehicleID == expected.accountVINHash + "." + expected.scopeID ? currentScope.vin : "",
+                            "effectiveVehicleID": settings.vehicleID ?? expected.accountVINHash + "." + expected.scopeID,
+                            "name": snapshot?.vehicle?.name ?? "", "vehicleName": snapshot?.vehicle?.name ?? "",
+                            "showName": settings.showName, "showTime": settings.showTime, "dark": -1, "timeMode": 0, "tap": 0,
+                            "statFields": [], "statSlots": 0, "stats": [], "statsDefault": true,
+                            "provider": Self.widgetKind, "configuration": "system_widget_editor", "instanceIDsSupported": false,
+                            "vehicles": vehicles.map { ["id": $0.id, "name": $0.name ?? "", "suffix": $0.suffix ?? ""] },
+                            "extraLimit": SystemSnapshotStore.maxVehicles, "extraRoundRobin": false,
+                            "backgroundPolling": false, "budget": "os_managed", "displayed": false]
+                        if let snapshotObject = snapshotObject { value["snapshot"] = snapshotObject }
+                        result = .success(value)
+                    } catch { result = .failure(error) }
+                    DispatchQueue.main.async { [weak self] in
+                        guard let self = self, self.current(job) else { return }
+                        switch result {
+                        case .failure(let error): self.finish(job, self.failure(Self.code(error)))
+                        case .success(var value):
+                            if operation != "settings" { value["reloadRequested"] = self.reloadWidgets(force: true, snapshot: self.latest) }
+                            value["perInstanceVehicleSelection"] = self.runtimeAvailability()["perInstanceVehicleSelection"] as? Bool == true
+                            value["perInstanceMinimumIOS"] = "17.0"
+                            WidgetCenter.shared.getCurrentConfigurations { result in
+                                DispatchQueue.main.async { [weak self] in
+                                    guard let self = self, self.current(job) else { return }
+                                    switch result {
+                                    case .success(let infos):
+                                        let actual = infos.filter { $0.kind == Self.widgetKind }
+                                        value["bound"] = !actual.isEmpty
+                                        value["instances"] = actual.map { ["kind": $0.kind, "family": Self.familyName($0.family),
+                                            "configuration": "system_widget_editor", "mutableID": false] as [String: Any] }
+                                        value["installedCount"] = actual.count
+                                    case .failure: value["bound"] = false; value["configurationQueryReason"] = "widget_configuration_query_failed"
+                                    }
+                                    self.finish(job, value)
+                                }
+                            }
+                        }
+                    }
+                }
+            default: finish(job, failure("unsupported_method"))
+            }
+        } catch {
+            if let job = pending { finish(job, failure(Self.code(error))) }
+            else { reply(failure(Self.code(error)), nil) }
+        }
+    }
+
+    private static func familyName(_ family: WidgetFamily) -> String {
+        switch family {
+        case .systemSmall: return "systemSmall"
+        case .systemMedium: return "systemMedium"
+        case .systemLarge: return "systemLarge"
+        default: return "unsupported"
+        }
+    }
+    private enum CompatibilityStrings {
+        static let widgetTitle = "添加车辆小组件"
+        static let widgetInstructions = "请长按桌面，选择添加小组件并搜索几何面板。添加后长按小组件，选择编辑小组件，可为每个小组件选择车辆（iOS 17 或更高版本）。系统决定显示与刷新时间。"
+    }
+
     private func ownerJSON(_ value: SystemSnapshotOwner) -> [String: String] {
-        ["scopeID": value.scopeID, "accountVINHash": value.accountVINHash]
+        var result = ["scopeID": value.scopeID, "accountVINHash": value.accountVINHash]
+        if let hash = value.accountHash { result["accountHash"] = hash }
+        return result
     }
     private func snapshotJSON(_ value: SystemSnapshot) -> [String: Any] {
         // 编码的只是 Shared 白名单；绝不回显桥凭据、原始 VIN 或 Ride 的 rawGPS。

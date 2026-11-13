@@ -79,6 +79,8 @@ def main():
     assert 'NSAppTransportSecurity' not in info
     assert info['CFBundleIdentifier'] == 'io.github.lswlc33.dashboard.ios'
     assert info['NSSupportsLiveActivities'] is True
+    assert info.get('NSLocalNetworkUsageDescription', '').strip(), '局域网 TCP 缺少用途说明'
+    assert 'NSBonjourServices' not in info, '纯 TCP 不应新增 Bonjour 服务发现'
 
     # -I 不从 cwd 导入 helper；这里只验证源码合同，不冒充 Apple 编译或签名通过。
     helper_spec = importlib.util.spec_from_file_location('zeeho_build_support', root / 'build-support.py')
@@ -86,12 +88,20 @@ def main():
     helper_spec.loader.exec_module(helper)
     inputs = helper.inventory(repo)
     assert all(path.count('/') == 1 for path in inputs['swiftSources'])
+    assert inputs['sharedSwiftSources'] and inputs['widgetSwiftSources'] and inputs['broadcastSwiftSources']
+    assert 'ZeehoShared' not in inputs['sharedSwiftImports'] + inputs['widgetSwiftImports'] + inputs['broadcastSwiftImports']
+    assert set(inputs['swiftSources']) & set(inputs['broadcastSwiftSources']) == {'ios-shell/CastProtocol.swift'}
+    assert 'ios-shell/CastEncoder.swift' not in inputs['swiftSources']
+    assert {'ios-shell/CastEncoder.swift', 'ios-shell/Broadcast/SampleHandler.swift'} <= set(inputs['broadcastSwiftSources'])
+    assert set(inputs['hostModuleImports']) | set(inputs['sharedSwiftImports']) == set(inputs['swiftImports'])
+    assert {'Network', 'NetworkExtension', 'CoreBluetooth', 'ReplayKit'} <= set(inputs['systemFrameworks'])
+    assert {'ReplayKit', 'Network', 'VideoToolbox'} <= set(inputs['broadcastSystemFrameworks'])
+    assert 'CommonCrypto' not in inputs['systemFrameworks'], 'CommonCrypto 是 SDK module，不是 framework'
+    assert not any('/InductiveCloud.swift' in r['path'] or '/InductiveSession.swift' in r['path'] for r in inputs['files'])
     # 新增更新业务源仍由 inventory 自动发现，不维护另一份硬编码上传表。
     for name in ('UpdateService.swift', 'UpdateSourceViewController.swift'):
         if (root / name).is_file():
             assert 'ios-shell/' + name in inputs['swiftSources'], name
-    assert inputs['sharedSwiftSources'] and inputs['widgetSwiftSources']
-    assert 'ZeehoShared' not in inputs['sharedSwiftImports'] + inputs['widgetSwiftImports']
     assert not any(r['path'].endswith('-test.swift') or '/commonTest/' in r['path'] or '/jvmTest/' in r['path'] for r in inputs['files'])
 
     # iOS 图标源必须进上传白名单：build.sh 把它当硬闸门，漏了会让远程 Mac 构建
@@ -147,10 +157,26 @@ def main():
     assert app_group == 'group.' + bundle_id, app_group
     widget_id = bundle_id + '.widgets'
     assert helper.WIDGET_ID == widget_id and helper.APP_GROUP == app_group
-    for name in ('App.entitlements', 'Widgets.entitlements'):
+    for name in ('App.entitlements', 'Widgets.entitlements', 'Broadcast.entitlements'):
         with (root / 'Entitlements' / name).open('rb') as f:
             entitlements = plistlib.load(f)
         assert entitlements.get('com.apple.security.application-groups') == [app_group], name
+        assert entitlements == (helper.HOST_ENTITLEMENTS if name == 'App.entitlements' else helper.EXTENSION_ENTITLEMENTS)
+    assert helper.BROADCAST_ID == bundle_id + '.broadcast'
+    with (root / 'Broadcast/Info.plist').open('rb') as f:
+        broadcast_info = plistlib.load(f)
+    helper.validate_extension_info(broadcast_info, helper.EXTENSIONS['broadcast'], template=True)
+    assert helper.MAX_IPA_BYTES == 30 * 1024 * 1024, '未实测新产物不能上调 Update.swift 大小闸门'
+    for token in ('--broadcast-list', '--broadcast-framework-list', '--host-module-imports-list',
+                  '-module-name ZeehoCastBroadcast', 'prepare-extension --target broadcast',
+                  '--scan-executable "$broadcast_dir/ZeehoCastBroadcast"',
+                  '--scan-folder "$broadcast_dir/Frameworks"', 'Entitlements/Broadcast.entitlements',
+                  'appintentsmetadataprocessor', '--source-files "${widget_sources[@]}"',
+                  'Metadata.appintents/extract.actionsdata', '-weak_framework -Xlinker AppIntents'):
+        assert token in build_sh, token
+    assert build_sh.index('--entitlements "$script_dir/Entitlements/Broadcast.entitlements"') < \
+        build_sh.index('--entitlements "$script_dir/Entitlements/Widgets.entitlements"') < \
+        build_sh.index('--entitlements "$script_dir/Entitlements/App.entitlements"'), '签名必须 Broadcast/Widget/App 由内到外'
     assert app_group in (root / 'Shared/SystemSnapshotStore.swift').read_text(encoding='utf-8'), \
         'Shared/SystemSnapshotStore 必须用 build-support.APP_GROUP 同一个 App Group'
     assert widget_id in (root / 'SystemSurfaces.swift').read_text(encoding='utf-8'), \

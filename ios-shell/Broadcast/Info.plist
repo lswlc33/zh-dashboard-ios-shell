@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+    <key>CFBundleIdentifier</key><string>io.github.lswlc33.dashboard.ios.broadcast</string>
+    <key>CFBundleName</key><string>ZeehoCastBroadcast</string>
+    <key>CFBundleDisplayName</key><string>ZEEHO Cast</string>
+    <key>CFBundleExecutable</key><string>ZeehoCastBroadcast</string>
+    <key>CFBundlePackageType</key><string>XPC!</string>
+    <key>CFBundleShortVersionString</key><string>1.0.0</string>
+    <key>CFBundleVersion</key><string>1</string>
+    <key>MinimumOSVersion</key><string>15.4</string>
+    <key>NSLocalNetworkUsageDescription</key><string>Only after you confirm screen broadcast, connect to the selected receiver over Wi-Fi and send your entire screen. Notifications and other apps may be visible. No audio is transmitted.</string>
+    <key>NSExtension</key><dict>
+        <key>NSExtensionPointIdentifier</key><string>com.apple.broadcast-services-upload</string>
+        <key>NSExtensionPrincipalClass</key><string>ZeehoCastBroadcast.SampleHandler</string>
+        <key>RPBroadcastProcessMode</key><string>RPBroadcastProcessModeSampleBuffer</string>
+    </dict>
+</dict></plist>

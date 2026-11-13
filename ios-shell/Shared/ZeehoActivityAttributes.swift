@@ -1,7 +1,7 @@
 import Foundation
 
 public enum ZeehoActivityKind: String, Codable, Hashable, Sendable {
-    case vehicle, charging, ride
+    case vehicle, charging, ride, gauge
 }
 
 #if os(iOS)

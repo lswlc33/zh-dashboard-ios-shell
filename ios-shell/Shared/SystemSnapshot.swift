@@ -9,8 +9,14 @@ public struct SystemSnapshotError: Error, Equatable, Sendable {
 public struct SystemSnapshotOwner: Codable, Equatable, Hashable, Sendable {
     public let scopeID: String
     public let accountVINHash: String
-    public init(scopeID: String, accountVINHash: String) {
-        self.scopeID = scopeID; self.accountVINHash = accountVINHash
+    // 仅用于同账号多车目录的匿名隔离；旧 v1 owner 没有此字段，仍只能按单车读取。
+    public let accountHash: String?
+    public init(scopeID: String, accountVINHash: String, accountHash: String? = nil) {
+        self.scopeID = scopeID; self.accountVINHash = accountVINHash; self.accountHash = accountHash
+    }
+    public func sharesAccount(with other: SystemSnapshotOwner) -> Bool {
+        if let account = accountHash, let otherAccount = other.accountHash { return account == otherAccount }
+        return accountVINHash == other.accountVINHash
     }
     public var isValid: Bool {
         !scopeID.isEmpty && scopeID.utf8.count <= 96
@@ -20,6 +26,9 @@ public struct SystemSnapshotOwner: Codable, Equatable, Hashable, Sendable {
             }
             && accountVINHash.utf8.count == 64
             && accountVINHash.unicodeScalars.allSatisfy { (48...57).contains($0.value) || (97...102).contains($0.value) }
+            && (accountHash.map { $0.utf8.count == 64 && $0.unicodeScalars.allSatisfy {
+                (48...57).contains($0.value) || (97...102).contains($0.value)
+            } } ?? true)
     }
 }
 
@@ -97,6 +106,21 @@ public struct SystemRideSnapshot: Codable, Equatable, Hashable, Sendable {
     }
 }
 
+// 只由已接受的原生 BLE/GPS 样本构造；不代表已录制行程，不携带位置坐标。
+public enum SystemGaugeSource: String, Codable, Hashable, Sendable { case ble, gps }
+public struct SystemGaugeSnapshot: Codable, Equatable, Hashable, Sendable {
+    public let source: SystemGaugeSource
+    public let speedKph: Double
+    public let updatedAt: Int64
+    public init(source: SystemGaugeSource, speedKph: Double, updatedAt: Int64) {
+        self.source = source; self.speedKph = speedKph; self.updatedAt = updatedAt
+    }
+    public func visibleSpeedKph(at date: Date = Date()) -> Double? {
+        SystemSnapshotFreshness.isFresh(updatedAt, at: date,
+            maxAgeSeconds: SystemSnapshotFreshness.rideSpeedMaxAgeSeconds) ? speedKph : nil
+    }
+}
+
 public struct SystemSnapshot: Codable, Equatable, Hashable, Sendable {
     public static let currentVersion = 1
     public static let maxLifetimeMs: Int64 = 15 * 60 * 1000
@@ -106,10 +130,12 @@ public struct SystemSnapshot: Codable, Equatable, Hashable, Sendable {
     public let expiresAt: Int64
     public let vehicle: SystemVehicleSnapshot?
     public let ride: SystemRideSnapshot?
+    public let gauge: SystemGaugeSnapshot?
     public init(version: Int = SystemSnapshot.currentVersion, owner: SystemSnapshotOwner, capturedAt: Int64,
-                expiresAt: Int64, vehicle: SystemVehicleSnapshot? = nil, ride: SystemRideSnapshot? = nil) {
+                expiresAt: Int64, vehicle: SystemVehicleSnapshot? = nil, ride: SystemRideSnapshot? = nil,
+                gauge: SystemGaugeSnapshot? = nil) {
         self.version = version; self.owner = owner; self.capturedAt = capturedAt; self.expiresAt = expiresAt
-        self.vehicle = vehicle; self.ride = ride
+        self.vehicle = vehicle; self.ride = ride; self.gauge = gauge
     }
     public func isStale(at date: Date = Date()) -> Bool {
         date.timeIntervalSince1970 * 1000 >= Double(expiresAt)
@@ -126,7 +152,7 @@ public struct SystemSnapshot: Codable, Equatable, Hashable, Sendable {
             value.map { $0.isFinite && range.contains($0) } ?? true
         }
         guard timestamp(capturedAt), expiresAt > capturedAt,
-              expiresAt - capturedAt <= Self.maxLifetimeMs, vehicle != nil || ride != nil else {
+              expiresAt - capturedAt <= Self.maxLifetimeMs, vehicle != nil || ride != nil || gauge != nil else {
             throw SystemSnapshotError("invalid_snapshot_time")
         }
         if let value = vehicle {
@@ -164,6 +190,11 @@ public struct SystemSnapshot: Codable, Equatable, Hashable, Sendable {
                   value.locationAgeSeconds == nil || value.lastLocationAt != nil,
                   value.state == .recording || value.speedKph == nil else {
                 throw SystemSnapshotError("invalid_ride_snapshot")
+            }
+        }
+        if let value = gauge {
+            guard sampleTime(value.updatedAt), number(value.speedKph, range: 0...400) else {
+                throw SystemSnapshotError("invalid_gauge_snapshot")
             }
         }
         return self

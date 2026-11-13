@@ -20,7 +20,7 @@ offline=false
 usage() {
     printf '%s\n' 'Usage: build.sh [--preflight-only] [--build-number POSITIVE_INTEGER] [--output-dir DIR] [--source-manifest FILE] [--offline]'
     printf '%s\n' 'Default version/build come from ios-shell/Info.plist; --build-number must equal that plist. Default output is ios-shell/dist/<UTC timestamp>.'
-    printf '%s\n' 'Output is ad-hoc signed with public App Group entitlement templates; their Apple provisioning approval and TrollStore compatibility are not verified. Ordinary Apple installation needs matching identity/profiles and inside-out signing.'
+    printf '%s\n' 'Output is ad-hoc signed with scoped App Group/HotspotConfiguration/wifi-info templates; Apple provisioning approval and TrollStore compatibility are not verified. Ordinary Apple installation needs matching identities/profiles for Host, Widget and Broadcast plus inside-out signing.'
 }
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -68,7 +68,7 @@ done
 [[ -f "$script_dir/bridge-bootstrap.js" ]] || missing+=('ios-shell/bridge-bootstrap.js')
 if [[ "$(uname -s)" == Darwin ]] && command -v xcrun >/dev/null 2>&1; then
     xcrun --sdk iphoneos --show-sdk-path >/dev/null 2>&1 || missing+=('iPhoneOS SDK (full Xcode, not only Command Line Tools)')
-    for tool in swiftc swift-stdlib-tool lipo otool; do
+    for tool in swiftc swift-stdlib-tool lipo otool nm appintentsmetadataprocessor; do
         xcrun --sdk iphoneos --find "$tool" >/dev/null 2>&1 || missing+=("Xcode $tool")
     done
     xcodebuild -version >/dev/null 2>&1 || missing+=('usable Xcode license/first-launch setup; prepare it manually')
@@ -85,6 +85,15 @@ if [[ ! "$java_version" =~ version\ \"21[.\"] ]]; then
     printf '%s\n' 'BLOCKED: JDK 21 is required. Set JAVA_HOME to your existing JDK; this script does not install it.' >&2
     exit 2
 fi
+# AppIntents 不能只链接 framework 就声称配置可发现；先核本机工具实际支持的参数。
+# 来源是 Xcode ExtractAppIntentsMetadata 真命令；版本有差异时 fail closed，交 CI 日志校核。
+intents_help="$(xcrun --sdk iphoneos appintentsmetadataprocessor --help 2>&1 || true)"
+for flag in --output --target-triple --module-name --toolchain-dir --binary-file --source-files --sdk-root; do
+    if ! printf '%s\n' "$intents_help" | grep -q -- "$flag"; then
+        printf 'BLOCKED: appintentsmetadataprocessor lacks required flag: %s\n%s\n' "$flag" "$intents_help" >&2
+        exit 2
+    fi
+done
 input_args=(--root "$repo_dir")
 if [[ -n "$source_manifest" ]]; then input_args+=(--source-manifest "$source_manifest"); fi
 # 只读检查源码、框架契约与传入的上传快照，不创建 build/dist，也不调用 Gradle。
@@ -99,14 +108,16 @@ trap 'rm -rf "$build_dir"' EXIT
 app_dir="$build_dir/Payload/Dashboard.app"
 staged_dist="$build_dir/artifacts"
 widget_dir="$app_dir/PlugIns/DashboardWidgets.appex"
-mkdir -p "$app_dir/Frameworks" "$widget_dir" "$staged_dist"
+broadcast_dir="$app_dir/PlugIns/ZeehoCastBroadcast.appex"
+mkdir -p "$app_dir/Frameworks" "$widget_dir/Frameworks" "$broadcast_dir/Frameworks" "$staged_dist"
 inputs="$build_dir/build-inputs.json"
-# --shared-framework-list 不传：host 的 systemFrameworks 已经覆盖 Shared 用到的框架
-# （两者都链接同一份 host 依赖），Shared 单独那份清单生成后从没被读过。
+# Host frameworks 合并 Host + Shared imports；Broadcast 单独清单，不链接 Bridge/KMP/Widget shared object。
 python3 -I "$support" inputs "${input_args[@]}" --manifest "$inputs" \
     --swift-list "$build_dir/swift-sources.txt" --shared-list "$build_dir/shared-sources.txt" --widget-list "$build_dir/widget-sources.txt" \
+    --broadcast-list "$build_dir/broadcast-sources.txt" --host-module-imports-list "$build_dir/host-module-imports.txt" \
     --framework-list "$build_dir/frameworks.txt" --library-list "$build_dir/libraries.txt" \
-    --widget-framework-list "$build_dir/widget-frameworks.txt"
+    --widget-framework-list "$build_dir/widget-frameworks.txt" \
+    --broadcast-framework-list "$build_dir/broadcast-frameworks.txt" --broadcast-library-list "$build_dir/broadcast-libraries.txt"
 
 # 两个短例子各自独立判断：上传白名单本来就不带 *-test.swift，远程 Mac 上一定缺失，
 # 拆开打印「已跳过（缺 X）」比原来静默跳过更容易看出测试根本没跑。
@@ -148,9 +159,11 @@ sdk_path="$(xcrun --sdk iphoneos --show-sdk-path)"
 swift_sources=()
 shared_sources=()
 widget_sources=()
+broadcast_sources=()
 while IFS= read -r path; do swift_sources+=("$repo_dir/$path"); done < "$build_dir/swift-sources.txt"
 while IFS= read -r path; do shared_sources+=("$repo_dir/$path"); done < "$build_dir/shared-sources.txt"
 while IFS= read -r path; do widget_sources+=("$repo_dir/$path"); done < "$build_dir/widget-sources.txt"
+while IFS= read -r path; do broadcast_sources+=("$repo_dir/$path"); done < "$build_dir/broadcast-sources.txt"
 # 根业务源只入 host；Shared 独立 module/static object，两端链接、不嵌入假 framework。
 activity_args=(-Xlinker -weak_framework -Xlinker ActivityKit)
 xcrun --sdk iphoneos swiftc -O -swift-version 5 -parse-as-library -whole-module-optimization -application-extension \
@@ -164,7 +177,7 @@ while IFS= read -r module; do
 done < "$build_dir/frameworks.txt"
 while IFS= read -r library; do link_args+=("-l$library"); done < "$build_dir/libraries.txt"
 xcrun --sdk iphoneos swiftc -O -swift-version 5 -parse-as-library \
-    -target arm64-apple-ios15.4 -sdk "$sdk_path" \
+    -target arm64-apple-ios15.4 -sdk "$sdk_path" -module-name Dashboard \
     "${link_args[@]}" "${swift_sources[@]}" -o "$app_dir/Dashboard"
 widget_args=(-I "$build_dir" "$build_dir/ZeehoSystemShared.o" "${activity_args[@]}" -framework Foundation \
     -Xlinker -e -Xlinker _NSExtensionMain \
@@ -172,16 +185,48 @@ widget_args=(-I "$build_dir" "$build_dir/ZeehoSystemShared.o" "${activity_args[@
     -Xlinker -rpath -Xlinker '@executable_path/Frameworks' -Xlinker -rpath -Xlinker /usr/lib/swift)
 while IFS= read -r module; do
     [[ -d "$sdk_path/System/Library/Frameworks/$module.framework" ]] || { printf 'BLOCKED: imported Widget SDK framework missing: %s\n' "$module" >&2; exit 2; }
-    [[ "$module" == ActivityKit ]] || widget_args+=(-framework "$module")
+    [[ "$module" == ActivityKit || "$module" == AppIntents ]] || widget_args+=(-framework "$module")
 done < "$build_dir/widget-frameworks.txt"
+# AppIntents API 从 iOS 16 开始；具体配置类型另有 iOS 17 availability，15.4 不能强加载它。
+widget_args+=(-Xlinker -weak_framework -Xlinker AppIntents)
 xcrun --sdk iphoneos swiftc -O -swift-version 5 -parse-as-library -application-extension \
-    -target arm64-apple-ios15.4 -sdk "$sdk_path" "${widget_args[@]}" "${widget_sources[@]}" -o "$widget_dir/DashboardWidgets"
+    -target arm64-apple-ios15.4 -sdk "$sdk_path" -module-name DashboardWidgets \
+    "${widget_args[@]}" "${widget_sources[@]}" -o "$widget_dir/DashboardWidgets"
+
+# ReplayKit 的标准 upload extension 仍由 _NSExtensionMain 进入 NSObject 子类 SampleHandler。
+# -framework ReplayKit 提供真实 API/入口依赖；不发明 _appexentry，也不复用 host main。
+# module-name 必须与展开后的 NSExtensionPrincipalClass 完全一致。
+broadcast_args=(-framework Foundation -framework ReplayKit -Xlinker -ObjC \
+    -Xlinker -e -Xlinker _NSExtensionMain \
+    -Xlinker -rpath -Xlinker '@executable_path/../../Frameworks' \
+    -Xlinker -rpath -Xlinker '@executable_path/Frameworks' -Xlinker -rpath -Xlinker /usr/lib/swift)
+while IFS= read -r module; do
+    [[ -d "$sdk_path/System/Library/Frameworks/$module.framework" ]] || { printf 'BLOCKED: imported Broadcast SDK framework missing: %s\n' "$module" >&2; exit 2; }
+    [[ "$module" == Foundation || "$module" == ReplayKit ]] || broadcast_args+=(-framework "$module")
+done < "$build_dir/broadcast-frameworks.txt"
+while IFS= read -r library; do broadcast_args+=("-l$library"); done < "$build_dir/broadcast-libraries.txt"
+xcrun --sdk iphoneos swiftc -O -swift-version 5 -parse-as-library -application-extension \
+    -target arm64-apple-ios15.4 -sdk "$sdk_path" -module-name ZeehoCastBroadcast \
+    "${broadcast_args[@]}" "${broadcast_sources[@]}" -o "$broadcast_dir/ZeehoCastBroadcast"
 
 plist_args=(--source "$script_dir/Info.plist" --destination "$app_dir/Info.plist")
 if [[ -n "$build_number" ]]; then plist_args+=(--build-number "$build_number"); fi
 python3 -I "$support" prepare-plist "${plist_args[@]}"
 python3 -I "$support" prepare-widget --source "$script_dir/Widgets/Info.plist" \
     --host-info "$app_dir/Info.plist" --destination "$widget_dir/Info.plist"
+python3 -I "$support" prepare-extension --target broadcast --source "$script_dir/Broadcast/Info.plist" \
+    --host-info "$app_dir/Info.plist" --destination "$broadcast_dir/Info.plist"
+# 在签名之前从真实 Widget executable/源码提取系统配置 metadata，不造目录/伪造 actionsdata。
+# 老版本 processor 可直接读取 binary/source；新版若需要 const-values 会在这里/非空闸门阻塞，
+# 必须以所选 Xcode 16.4 的真实 --help/编译日志修正，不把跳过当成功。
+swiftc_path="$(xcrun --sdk iphoneos --find swiftc)"
+toolchain_dir="$(CDPATH= cd -- "$(dirname -- "$swiftc_path")/../.." && pwd -P)"
+xcrun --sdk iphoneos appintentsmetadataprocessor \
+    --output "$widget_dir" --target-triple arm64-apple-ios15.4 --module-name DashboardWidgets \
+    --toolchain-dir "$toolchain_dir" --sdk-root "$sdk_path" --binary-file "$widget_dir/DashboardWidgets" \
+    --source-files "${widget_sources[@]}"
+[[ -s "$widget_dir/Metadata.appintents/extract.actionsdata" ]] || { printf '%s\n' 'BLOCKED: real Widget AppIntents metadata extraction produced no actionsdata; no IPA generated.' >&2; exit 2; }
+xcrun nm -g "$broadcast_dir/ZeehoCastBroadcast" | grep 'SampleHandler'
 cp "$script_dir/bridge-bootstrap.js" "$app_dir/bridge-bootstrap.js"
 # iOS 自己会给 App 图标切圆角，源图必须是「满出血」的正方形：
 # 用普通 icon-512.png 会在四角留透明区（iOS 底下衬白/黑底 → 四角白边），
@@ -213,7 +258,9 @@ fi
 stdlib_help="$(xcrun --sdk iphoneos swift-stdlib-tool --help 2>&1 || true)"
 stdlib_args=(--copy --platform iphoneos
     --scan-executable "$app_dir/Dashboard" --scan-executable "$widget_dir/DashboardWidgets"
-    --scan-folder "$app_dir/Frameworks" --destination "$app_dir/Frameworks")
+    --scan-executable "$broadcast_dir/ZeehoCastBroadcast"
+    --scan-folder "$app_dir/Frameworks" --scan-folder "$widget_dir/Frameworks" --scan-folder "$broadcast_dir/Frameworks"
+    --destination "$app_dir/Frameworks")
 if printf '%s\n' "$stdlib_help" | grep -q -- '--filter-for-swift-os'; then
     stdlib_args+=(--filter-for-swift-os)
 else
@@ -228,20 +275,25 @@ while IFS= read -r -d '' dylib; do
     fi
     codesign --force --sign - --timestamp=none "$dylib"
     codesign --verify --strict "$dylib"
-done < <(find "$app_dir/Frameworks" -type f -name '*.dylib' -print0)
-if [[ "$shared_kind" == dynamic ]]; then
-    codesign --force --sign - --timestamp=none "$app_dir/Frameworks/ZeehoShared.framework"
-    codesign --verify --strict "$app_dir/Frameworks/ZeehoShared.framework"
-fi
-# 两个真实 bundle 内到外签名。公开 App Group entitlement 不代表 Apple profile 已批准；不保证普通安装/TrollStore能力。
+done < <(find "$app_dir/Frameworks" "$widget_dir/Frameworks" "$broadcast_dir/Frameworks" -type f -name '*.dylib' -print0)
+# 所有 framework 同样由内到外签名，不限于 KMP；允许的实际嵌入范围仍由 validate_ipa 严格核对。
+while IFS= read -r -d '' framework; do
+    codesign --force --sign - --timestamp=none "$framework"
+    codesign --verify --strict "$framework"
+done < <(find "$app_dir/Frameworks" "$widget_dir/Frameworks" "$broadcast_dir/Frameworks" -depth -type d -name '*.framework' -print0)
+# 三个真实 bundle 内到外签名。模板不是 Apple 授权，不保证普通安装/TrollStore能力。
+codesign --force --sign - --timestamp=none --entitlements "$script_dir/Entitlements/Broadcast.entitlements" --identifier io.github.lswlc33.dashboard.ios.broadcast "$broadcast_dir"
+codesign --verify --strict "$broadcast_dir"
 codesign --force --sign - --timestamp=none --entitlements "$script_dir/Entitlements/Widgets.entitlements" --identifier io.github.lswlc33.dashboard.ios.widgets "$widget_dir"
 codesign --verify --strict "$widget_dir"
 codesign --force --sign - --timestamp=none --entitlements "$script_dir/Entitlements/App.entitlements" --identifier io.github.lswlc33.dashboard.ios "$app_dir"
 codesign --verify --deep --strict "$app_dir"
-file "$app_dir/Dashboard" | grep -q 'Mach-O 64-bit executable arm64'
-xcrun lipo "$app_dir/Dashboard" -verify_arch arm64
-xcrun otool -L "$app_dir/Dashboard"
-plutil -lint "$app_dir/Info.plist"
+for executable in "$app_dir/Dashboard" "$widget_dir/DashboardWidgets" "$broadcast_dir/ZeehoCastBroadcast"; do
+    file "$executable" | grep -q 'Mach-O 64-bit executable arm64'
+    xcrun lipo "$executable" -verify_arch arm64
+    xcrun otool -L "$executable"
+done
+plutil -lint "$app_dir/Info.plist" "$widget_dir/Info.plist" "$broadcast_dir/Info.plist"
 
 # 构建过程中源码变化也要阻塞；清单记录工作树哈希，不能只拿旧 commit 冒充全部来源。
 python3 -I "$support" inputs --root "$repo_dir" --source-manifest "$inputs" >/dev/null

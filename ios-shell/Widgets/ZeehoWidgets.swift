@@ -7,6 +7,8 @@ struct ZeehoVehicleEntry: TimelineEntry {
     let date: Date
     let snapshot: SystemSnapshot?
     let requiresRefresh: Bool
+    var showName = true
+    var showTime = true
 
     var presentation: WidgetVehiclePresentation {
         WidgetVehiclePresentation(snapshot: snapshot, date: date, requiresRefresh: requiresRefresh)
@@ -22,13 +24,16 @@ struct ZeehoVehicleProvider: TimelineProvider {
     }
 
     func getSnapshot(in context: Context, completion: @escaping (ZeehoVehicleEntry) -> Void) {
-        completion(read(at: Date()))
+        completion(Self.read(at: Date()))
     }
 
     func getTimeline(in context: Context, completion: @escaping (Timeline<ZeehoVehicleEntry>) -> Void) {
         let now = Date()
-        let entry = read(at: now)
-        let refreshAfter = now.addingTimeInterval(Self.refreshInterval)
+        completion(Self.timeline(entry: Self.read(at: now), now: now))
+    }
+
+    static func timeline(entry: ZeehoVehicleEntry, now: Date) -> Timeline<ZeehoVehicleEntry> {
+        let refreshAfter = now.addingTimeInterval(refreshInterval)
         var entries = [entry]
         if let snapshot = entry.snapshot, let vehicle = snapshot.vehicle,
            !entry.presentation.isStale {
@@ -40,20 +45,25 @@ struct ZeehoVehicleProvider: TimelineProvider {
                     .addingTimeInterval(SystemSnapshotFreshness.vehicleMaxAgeSeconds))
             }
             if let deadline = deadlines.filter({ $0 > now && $0 <= refreshAfter }).min() {
-                entries.append(ZeehoVehicleEntry(date: deadline, snapshot: snapshot, requiresRefresh: true))
+                entries.append(ZeehoVehicleEntry(date: deadline, snapshot: snapshot, requiresRefresh: true,
+                    showName: entry.showName, showTime: entry.showTime))
             }
         }
         // 这是刷新请求，不是系统保证；不调用 WidgetCenter 反复催更。
-        completion(Timeline(entries: entries, policy: .after(refreshAfter)))
+        return Timeline(entries: entries, policy: .after(refreshAfter))
     }
 
-    private func read(at date: Date) -> ZeehoVehicleEntry {
+    static func read(at date: Date, vehicleID: String? = nil, showName: Bool? = nil,
+                     showTime: Bool? = nil) -> ZeehoVehicleEntry {
         guard SystemSnapshotStore.isAvailable() else {
             return ZeehoVehicleEntry(date: date, snapshot: nil, requiresRefresh: false)
         }
         do {
-            let snapshot = try SystemSnapshotStore.readCurrent(now: date)
-            return ZeehoVehicleEntry(date: date, snapshot: snapshot, requiresRefresh: false)
+            let snapshot = try SystemSnapshotStore.readVehicle(identifier: vehicleID, now: date)
+            let active = try SystemSnapshotStore.currentOwner()
+            let settings = try active.map { try SystemSnapshotStore.widgetSettings(expectedOwner: $0) }
+            return ZeehoVehicleEntry(date: date, snapshot: snapshot, requiresRefresh: false,
+                showName: showName ?? settings?.showName ?? true, showTime: showTime ?? settings?.showTime ?? true)
         } catch {
             // 未声明/未获准的组、缺文件、坏 JSON、版本和 owner 不符统一 fail closed。
             return ZeehoVehicleEntry(date: date, snapshot: nil, requiresRefresh: false)
@@ -102,7 +112,7 @@ struct ZeehoVehicleWidgetView: View {
     }
 
     private var heading: some View {
-        Label(presentation.name, systemImage: "car.fill")
+        Label(entry.showName ? presentation.name : WidgetStrings.vehicle, systemImage: "car.fill")
             .font(.headline)
             .lineLimit(1)
             .minimumScaleFactor(0.8)
@@ -136,7 +146,8 @@ struct ZeehoVehicleWidgetView: View {
             battery
             charging
             Spacer(minLength: 0)
-            WidgetUpdatedAt(timestamp: presentation.updatedAt, stale: presentation.isStale)
+            if entry.showTime { WidgetUpdatedAt(timestamp: presentation.updatedAt, stale: presentation.isStale) }
+            else if presentation.isStale { Text(WidgetStrings.stale).font(.caption2).foregroundColor(.secondary) }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
     }
@@ -153,7 +164,8 @@ struct ZeehoVehicleWidgetView: View {
                 }
             }
             Spacer(minLength: 0)
-            WidgetUpdatedAt(timestamp: presentation.updatedAt, stale: presentation.isStale)
+            if entry.showTime { WidgetUpdatedAt(timestamp: presentation.updatedAt, stale: presentation.isStale) }
+            else if presentation.isStale { Text(WidgetStrings.stale).font(.caption2).foregroundColor(.secondary) }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
     }
@@ -175,7 +187,8 @@ struct ZeehoVehicleWidgetView: View {
                 }
             }
             Spacer(minLength: 0)
-            WidgetUpdatedAt(timestamp: presentation.updatedAt, stale: presentation.isStale)
+            if entry.showTime { WidgetUpdatedAt(timestamp: presentation.updatedAt, stale: presentation.isStale) }
+            else if presentation.isStale { Text(WidgetStrings.stale).font(.caption2).foregroundColor(.secondary) }
             Text(WidgetStrings.snapshotOnly).font(.caption).foregroundColor(.secondary)
             Text(WidgetStrings.refreshHint).font(.caption2).foregroundColor(.secondary)
         }
@@ -200,7 +213,8 @@ struct ZeehoVehicleWidget: Widget {
 struct ZeehoWidgets: WidgetBundle {
     @WidgetBundleBuilder
     var body: some Widget {
-        ZeehoVehicleWidget()
+        if #available(iOS 17.0, *) { ZeehoConfiguredVehicleWidget() }
+        else { ZeehoVehicleWidget() }
         if #available(iOS 16.1, *) {
             ZeehoLiveActivityWidget()
         }

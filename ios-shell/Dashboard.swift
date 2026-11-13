@@ -294,12 +294,109 @@ final class PanelController: UIViewController, WKNavigationDelegate, WKUIDelegat
         let system = IOSSystemService(controller: { [weak self] in self })
         let surfaces = IOSSystemSurfacesService()
         let line = IOSPanelLineService()
+        let utility = IOSNativeUtilityService()
+        let secrets = IOSSecretHandleService()
+        let renewal = IOSSessionRenewalService(secrets: secrets)
+        let wifi = IOSVehicleNetworkService()
+        let tcp = IOSVehicleTCPService(network: wifi)
+        let assets = IOSNativeAssetService(network: wifi)
+        let blobs = IOSNativeFileStreamService()
+        let cast = IOSCastService()
+        let widgets = IOSWidgetCompatibilityService(systemSurfaces: surfaces)
+        let compatibility = IOSCompatibilityService(ride: ride, gps: IOSLocationService.shared,
+                                                   system: system, widget: widgets, utility: utility)
         let updates = IOSUpdateService(controller: { [weak self] in self },
             welcome: { [weak self] in self?.requestWelcome() ?? false },
             restart: { [weak self] in self?.restartAfterPanelUpdate() })
-        let core = IOSBridge(webView: web, services: [IOSLocationService.shared, bluetooth, ride, history, system, surfaces, line, updates])
+        let core = IOSBridge(webView: web, services: [IOSLocationService.shared, bluetooth, ride, history,
+                             system, surfaces, line, utility, secrets, renewal, wifi, tcp, assets, blobs, cast, widgets, compatibility, updates])
         let scope: () -> IOSRideScope? = { [weak core] in core?.nativeSessionScope() }
         let presenter: () -> UIViewController? = { [weak self] in self }
+        let metadata: () -> [String: Any]? = { [weak core] in core?.nativeSessionMetadata() }
+        let navigation: () -> String? = { [weak core] in core?.currentNavigationID() }
+        let frame: () -> String? = { [weak core] in core?.currentSessionFrame() }
+        utility.configureMetadataProvider(metadata)
+        utility.configurePresenter(presenter)
+        secrets.configureScopeProvider(scope)
+        secrets.configureSessionMetadataProvider(metadata)
+        renewal.configureScopeProvider(scope)
+        renewal.configureSessionMetadataProvider(metadata)
+        renewal.configureRecordingProvider { [weak bluetooth] in bluetooth?.currentRecordingLease() }
+        renewal.configureConsentProvider { id, selected, completion in
+            guard let current = scope(), current == selected else { completion(false); return {} }
+            return utility.requestConsent(title: IOSStrings.backgroundRenewalTitle,
+                message: IOSStrings.backgroundRenewalMessage) { approved in
+                    completion(approved && scope() == selected)
+                } ?? {}
+        }
+        renewal.configureDidRenew { [weak bluetooth] id, selected, generation, expiry in
+            bluetooth?.renewRecordingLease(id: id, scope: selected,
+                                           connectionGeneration: generation, expiresUptime: expiry) == true
+        }
+        renewal.configureAuthorizationExpired { [weak bluetooth] id, selected, generation, reason in
+            bluetooth?.invalidateRecordingAuthorization(id: id, scope: selected,
+                                                         connectionGeneration: generation, reason: reason)
+        }
+        renewal.configureMaterialChanged { [weak bluetooth, weak secrets] change, completion in
+            guard let bluetooth = bluetooth, let secrets = secrets, scope() == change.scope else {
+                completion(nil); return
+            }
+            bluetooth.reauthenticate(change, secretResolver: { handle in
+                // 只在原生执行器短时读取当前录制材料；句柄没有网页导出或磁盘路径。
+                try? secrets.withSecret(handle: handle, scope: change.scope,
+                                        purpose: .baseline, recordingID: change.recordingID) { Data($0) }
+            }, completion: completion)
+        }
+        bluetooth.configureRenewalProvider(activate: { [weak renewal] in renewal?.activate(recordingId: $0) == true },
+            observe: { [weak renewal] id, selected, generation in
+                renewal?.observe(recordingId: id, scope: selected, connectionGeneration: generation) == true
+            }, ended: { [weak renewal] in renewal?.recordingEnded(recordingId: $0) })
+        compatibility.configureMetadataProvider(metadata)
+        wifi.setScopeProvider(scope)
+        wifi.setMetadataProvider(metadata)
+        wifi.setPresenterProvider(presenter)
+        tcp.setScopeProvider(scope)
+        tcp.setNavigationProvider(navigation)
+        tcp.setFrameProvider(frame)
+        tcp.setPortConfirmer { selected, navID, address, port, completion in
+            guard let current = metadata(), scope() == selected,
+                  current["navId"] as? String == navID else { completion(false); return nil }
+            return utility.requestConsent(title: IOSStrings.localConnectionTitle,
+                message: String(format: IOSStrings.localConnectionMessage, address, Int(port))) { approved in
+                guard let refreshed = metadata() else { completion(false); return }
+                completion(approved && IOSNativeUtilityService.matches(current, refreshed))
+            }
+        }
+        assets.setScopeProvider(scope)
+        assets.setNavigationProvider(navigation)
+        assets.setFrameProvider(frame)
+        blobs.configureScopeProvider(scope)
+        blobs.configureMetadataProvider(metadata)
+        blobs.configurePresenter(presenter)
+        cast.configureScopeProvider(scope)
+        cast.configureMetadataProvider(metadata)
+        cast.configurePresenter(presenter)
+        bluetooth.configurePipeAuthorizationProvider { input, completion in
+            guard let captured = metadata(), let selected = scope(),
+                  captured["navId"] as? String == input.navID,
+                  captured["frame"] as? String == input.frame, selected.vin == input.vin else {
+                completion(.failure(IOSBLEPipeFailure("stale_session"))); return nil
+            }
+            // 服务不读取网页账号或 token；租约只属于原生已经持久化并确认的车辆。
+            completion(.success(IOSBLEPipeAuthorization(scope: selected, navID: input.navID,
+                frame: input.frame, expiresUptime: ProcessInfo.processInfo.systemUptime + 300,
+                isCurrent: {
+                    guard let current = metadata() else { return false }
+                    return IOSNativeUtilityService.matches(captured, current)
+                })))
+            return nil
+        }
+        bluetooth.configurePipeConsentProvider { input, completion in
+            let title = input.purpose == "system_pairing" ? IOSStrings.bluetoothPairingTitle : IOSStrings.bluetoothConnectionTitle
+            let message = input.purpose == "provisioning" ? IOSStrings.bluetoothProvisioningMessage
+                : input.purpose == "system_pairing" ? IOSStrings.bluetoothPairingMessage : IOSStrings.bluetoothConnectionMessage
+            return utility.requestConsent(title: title, message: message, completion: completion)
+        }
         ride.configureScopeProvider(scope)
         bluetooth.configureScopeProvider(scope)
         history.configureScopeProvider(scope)

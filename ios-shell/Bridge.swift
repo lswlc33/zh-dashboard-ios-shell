@@ -161,6 +161,24 @@ final class IOSBridge {
         return IOSRideScope(accountID: session.accountID, vin: session.vin, generation: String(epoch))
     }
 
+    // 兼容层只获得已持久化会话的代号；token 和凭据摘要不穿过网页/系统展示桥。
+    func nativeSessionMetadata() -> [String: Any]? {
+        precondition(Thread.isMainThread)
+        guard let scope = nativeSessionScope(), let session = session, prepared else { return nil }
+        return ["navId": navigationID, "frame": session.frame, "epoch": epoch, "generation": generation,
+                "accountId": scope.accountID, "vin": scope.vin]
+    }
+
+    func currentNavigationID() -> String? {
+        precondition(Thread.isMainThread)
+        return !closed && prepared && !navigationID.isEmpty ? navigationID : nil
+    }
+
+    func currentSessionFrame() -> String? {
+        precondition(Thread.isMainThread)
+        return nativeSessionScope() == nil ? nil : session?.frame
+    }
+
     func isPreparedNavigation(_ url: URL) -> Bool {
         !closed && prepared && PanelNavigation.isPanel(url) && PanelNavigation.navigationID(in: url) == navigationID
     }
@@ -400,7 +418,12 @@ final class IOSBridge {
         let reply = Pending(id: id, method: method, args: args, generation: generation, epoch: epoch,
                             navigationID: navigationID, frame: message.frameInfo, bytes: size, handler: replyHandler)
         pending[id] = reply; pendingBytes += size
-        let timeout: Double = IOSBridgePolicy.interactiveMethods.contains(method) ? 300 : 30
+        let timeout: Double
+        if IOSBridgePolicy.interactiveMethods.contains(method) { timeout = 300 }
+        else if method == "network.read", let options = args.first as? [String: Any] {
+            let requested = IOSBridgePolicy.integer(options["timeoutMs"]) ?? 15_000
+            timeout = Double(min(60_000, max(1_000, requested))) / 1000 + 2
+        } else { timeout = 30 }
         arm(reply, seconds: timeout)
         // 有界 JSON 序列化、请求体 Base64 校验在后台做，回主线程时再次核验导航。
         worker.async { [weak self, weak reply] in
@@ -554,7 +577,8 @@ final class IOSBridge {
                 }
             }
         }
-        finish(reply, ["ok": true, "frame": session?.frame ?? "", "generation": generation, "epoch": epoch])
+        finish(reply, ["ok": true, "frame": session?.frame ?? "", "generation": generation, "epoch": epoch,
+                       "navId": navigationID, "accountId": session?.accountID ?? "", "vin": session?.vin ?? ""])
         emitLifecycle("session")
     }
 
@@ -590,6 +614,9 @@ final class IOSBridge {
         services.compactMap { $0 as? IOSSystemSurfacesService }.forEach { $0.scopeChanged() }
         services.compactMap { $0 as? IOSRideService }.forEach { $0.scopeChanged() }
         services.compactMap { $0 as? IOSBluetoothService }.forEach { $0.scopeChanged() }
+        services.compactMap { $0 as? IOSCastService }.forEach { $0.scopeChanged() }
+        services.compactMap { $0 as? IOSSessionRenewalService }.forEach { $0.scopeChanged() }
+        services.compactMap { $0 as? IOSSecretHandleService }.forEach { $0.scopeChanged() }
     }
 
     private func applySnapshot(_ next: IOSStore.Snapshot) {

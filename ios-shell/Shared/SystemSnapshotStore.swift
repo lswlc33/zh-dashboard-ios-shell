@@ -3,12 +3,14 @@ import Foundation
 import Darwin
 #endif
 
-// 一次只共享当前车辆的一份有界快照。没有 App Group 权益时明确失败，不能回退到临时目录骗报支持。
+// 共享同账号最多 8 辆已批准车辆的有界摘要；无 App Group 权益明确失败，Broadcast 使用独立目录。
 public enum SystemSnapshotStore {
     public static let appGroupIdentifier = "group.io.github.lswlc33.dashboard.ios"
     public static let maxSnapshotBytes = 8 * 1024
+    public static let maxVehicles = 8
     private static let markerName = "active-owner.json"
     private static let lockName = ".snapshot-lock"
+    private static let settingsName = "widget-settings.json"
 
     public static func isAvailable() -> Bool {
         #if os(iOS) || os(macOS)
@@ -39,6 +41,95 @@ public enum SystemSnapshotStore {
         }
     }
 
+    // 配置选 B 时缺测就是 nil，绝不能回退当前 A。活动 account marker 在同一锁内验证。
+    public static func readVehicle(identifier: String?, now: Date = Date()) throws -> SystemSnapshot? {
+        try coordinated(create: false) { root in
+            guard let active = try owner(at: root) else { return nil }
+            let requested = try identifier ?? settings(at: root, active: active).vehicleID
+            guard let requested = requested else { return try snapshot(at: root, expectedOwner: active, now: now) }
+            guard let selected = try selectedOwner(requested, at: root), selected.sharesAccount(with: active) else {
+                return nil
+            }
+            return try snapshot(at: root, expectedOwner: selected, now: now)
+        }
+    }
+
+    public static func vehicles(now: Date = Date()) throws -> [SystemWidgetVehicle] {
+        try coordinated(create: false) { root in
+            guard let active = try owner(at: root) else { return [] }
+            return try snapshotOwners(at: root).compactMap { selected in
+                guard selected.sharesAccount(with: active),
+                      let value = try snapshot(at: root, expectedOwner: selected, now: now) else { return nil }
+                return SystemWidgetVehicle(owner: selected, name: value.vehicle?.name, suffix: value.vehicle?.vinDisplaySuffix)
+            }
+        }
+    }
+
+    public static func widgetSettings(expectedOwner: SystemSnapshotOwner) throws -> SystemWidgetSettings {
+        try coordinated(create: false) { root in
+            guard let active = try owner(at: root), active == expectedOwner else {
+                throw SystemSnapshotError("snapshot_owner_mismatch")
+            }
+            return try settings(at: root, active: active)
+        }
+    }
+
+    public static func writeWidgetSettings(_ value: SystemWidgetSettings, expectedOwner: SystemSnapshotOwner) throws {
+        _ = try value.validated()
+        try coordinated(create: true) { root in
+            guard let active = try owner(at: root), active == expectedOwner,
+                  (active.accountHash ?? active.accountVINHash) == value.accountHash else {
+                throw SystemSnapshotError("snapshot_owner_mismatch")
+            }
+            if let id = value.vehicleID {
+                guard let selected = try selectedOwner(id, at: root), selected.sharesAccount(with: active) else {
+                    throw SystemSnapshotError("widget_vehicle_unavailable")
+                }
+            }
+            let target = root.appendingPathComponent(settingsName)
+            try ensureRegularFile(target, missingAllowed: true)
+            try protectedWrite(try JSONEncoder().encode(value), to: target)
+        }
+    }
+
+    public static func ownerIdentifier(_ id: String) -> SystemSnapshotOwner? {
+        let parts = id.split(separator: ".", omittingEmptySubsequences: false)
+        guard parts.count == 2 else { return nil }
+        let owner = SystemSnapshotOwner(scopeID: String(parts[1]), accountVINHash: String(parts[0]))
+        return owner.isValid ? owner : nil
+    }
+
+    private static func selectedOwner(_ id: String, at root: URL) throws -> SystemSnapshotOwner? {
+        guard let parsed = ownerIdentifier(id),
+              let data = try boundedRead(path(root, owner: parsed), limit: maxSnapshotBytes) else { return nil }
+        try validateShape(data)
+        let value = try JSONDecoder().decode(SystemSnapshot.self, from: data)
+        guard value.owner.scopeID == parsed.scopeID, value.owner.accountVINHash == parsed.accountVINHash else {
+            throw SystemSnapshotError("snapshot_owner_mismatch")
+        }
+        return try value.validated(expectedOwner: value.owner).owner
+    }
+
+    private static func snapshotOwners(at root: URL) throws -> [SystemSnapshotOwner] {
+        let entries = try FileManager.default.contentsOfDirectory(atPath: root.path).sorted()
+        let ids = entries.filter { $0.hasSuffix(".json") && $0 != markerName && $0 != settingsName }
+        guard ids.count <= maxVehicles else { throw SystemSnapshotError("snapshot_storage_limit") }
+        return try ids.compactMap { try selectedOwner(String($0.dropLast(5)), at: root) }
+    }
+
+    private static func settings(at root: URL, active: SystemSnapshotOwner) throws -> SystemWidgetSettings {
+        let account = active.accountHash ?? active.accountVINHash
+        guard let data = try boundedRead(root.appendingPathComponent(settingsName), limit: 1024) else {
+            return SystemWidgetSettings(accountHash: account)
+        }
+        let shape = try object(data)
+        guard Set(shape.keys).isSubset(of: ["accountHash", "vehicleID", "showName", "showTime"]) else {
+            throw SystemSnapshotError("invalid_widget_settings")
+        }
+        let value = try JSONDecoder().decode(SystemWidgetSettings.self, from: data).validated()
+        return value.accountHash == account ? value : SystemWidgetSettings(accountHash: account)
+    }
+
     public static func write(_ value: SystemSnapshot, expectedOwner: SystemSnapshotOwner) throws {
         _ = try value.validated(expectedOwner: expectedOwner)
         let encoder = JSONEncoder()
@@ -53,14 +144,78 @@ public enum SystemSnapshotStore {
             // orphan 清理排在实际发布之前：旧快照先删掉，目录里就不会因为残留的
             // 临时文件/未知条目把下面的原子写卡死在 snapshot_storage_invalid。
             // （清理本身只删「本 store 命名的旧快照」与临时文件，不碰别的文件。）
+            // 同文件旧 v1 owner 可迁移到带 accountHash 的摘要，不先删正在写的 target。
             let target = path(root, owner: expectedOwner)
-            try removeOrphans(root, keeping: [target.lastPathComponent, markerName, lockName])
+            if let data = try boundedRead(target, limit: maxSnapshotBytes) {
+                try validateShape(data)
+                let old = try JSONDecoder().decode(SystemSnapshot.self, from: data)
+                guard old.owner.accountVINHash == expectedOwner.accountVINHash,
+                      old.owner.scopeID == expectedOwner.scopeID else { throw SystemSnapshotError("snapshot_owner_mismatch") }
+                if old.owner != expectedOwner { try FileManager.default.removeItem(at: target) }
+            }
+            try removeOrphans(root, keepingOwner: expectedOwner)
+            // 超过目录容量如实拒绝，不静默驱逐用户配置的车辆。
+            let existing = try snapshotOwners(at: root)
+            guard existing.contains(expectedOwner) || existing.count < maxVehicles else {
+                throw SystemSnapshotError("widget_vehicle_limit")
+            }
             // 先完整原子写数据，再原子发布 owner；崩溃中断时最多读不到，绝不读到另一账号的数据。
             try ensureRegularFile(target, missingAllowed: true)
             try protectedWrite(data, to: target)
             let marker = root.appendingPathComponent(markerName, isDirectory: false)
             try ensureRegularFile(marker, missingAllowed: true)
             try protectedWrite(try encoder.encode(expectedOwner), to: marker)
+        }
+    }
+
+    // 主服务切换到经过原生会话核验的 owner；同账号保留可配置车辆，换账号先清后发布 marker。
+    public static func activate(_ selected: SystemSnapshotOwner) throws {
+        guard selected.isValid else { throw SystemSnapshotError("invalid_snapshot_owner") }
+        try coordinated(create: true) { root in
+            // 激活新 scope 前撤掉旧 marker；清理失败时最多无数据，不能继续展示旧 owner。
+            if let active = try owner(at: root), active != selected {
+                if !active.sharesAccount(with: selected) { try revokeAccount(at: root, expectedOwner: active) }
+                else { try FileManager.default.removeItem(at: root.appendingPathComponent(markerName)) }
+            }
+            try removeOrphans(root, keepingOwner: selected)
+            let marker = root.appendingPathComponent(markerName)
+            try ensureRegularFile(marker, missingAllowed: true)
+            try protectedWrite(try JSONEncoder().encode(selected), to: marker)
+        }
+    }
+
+    public static func clearAccount(expectedOwner: SystemSnapshotOwner) throws {
+        guard expectedOwner.isValid else { throw SystemSnapshotError("invalid_snapshot_owner") }
+        // 撤权不能被目录数量/坏 sibling 挡在锁外；仍验证 App Group、真实目录与跨进程锁。
+        try coordinated(create: false, revoking: true) { root in
+            try revokeAccount(at: root, expectedOwner: expectedOwner)
+        }
+    }
+
+    // 独立于 Apple 容器的文件操作，fixture 可对真实临时目录覆盖损坏 sibling。
+    // 必须先撤 marker：下面的清理是 best effort，不是读取权限成立的前置条件。
+    static func revokeAccount(at root: URL, expectedOwner: SystemSnapshotOwner) throws {
+        let active = try owner(at: root)
+        if active?.sharesAccount(with: expectedOwner) == true {
+            try FileManager.default.removeItem(at: root.appendingPathComponent(markerName))
+            let settings = root.appendingPathComponent(settingsName)
+            if (try? ensureRegularFile(settings, missingAllowed: true)) != nil,
+               FileManager.default.fileExists(atPath: settings.path) {
+                try? FileManager.default.removeItem(at: settings)
+            }
+        }
+        // 只有验证过归属与真实 regular file 的摘要才删；坏文件/未知条目原样保留，不牵连撤权。
+        guard let entries = try? FileManager.default.contentsOfDirectory(at: root, includingPropertiesForKeys: nil),
+              entries.count <= 64 else { return }
+        for entry in entries {
+            let name = entry.lastPathComponent
+            guard name.hasSuffix(".json"), ownerIdentifier(String(name.dropLast(5))) != nil else { continue }
+            do {
+                guard let selected = try selectedOwner(String(name.dropLast(5)), at: root),
+                      selected.sharesAccount(with: expectedOwner) else { continue }
+                try ensureRegularFile(entry, missingAllowed: false)
+                try FileManager.default.removeItem(at: entry)
+            } catch { continue }
         }
     }
 
@@ -84,7 +239,10 @@ public enum SystemSnapshotStore {
     private static func owner(at root: URL) throws -> SystemSnapshotOwner? {
         guard let data = try boundedRead(root.appendingPathComponent(markerName), limit: 512) else { return nil }
         let shape = try object(data)
-        guard Set(shape.keys) == ["scopeID", "accountVINHash"] else { throw SystemSnapshotError("invalid_snapshot_owner") }
+        guard Set(shape.keys).isSubset(of: ["scopeID", "accountVINHash", "accountHash"]),
+              Set(["scopeID", "accountVINHash"]).isSubset(of: Set(shape.keys)) else {
+            throw SystemSnapshotError("invalid_snapshot_owner")
+        }
         let selected = try JSONDecoder().decode(SystemSnapshotOwner.self, from: data)
         guard selected.isValid else { throw SystemSnapshotError("invalid_snapshot_owner") }
         return selected
@@ -111,15 +269,19 @@ public enum SystemSnapshotStore {
                 throw SystemSnapshotError("snapshot_fields_not_allowed")
             }
         }
-        try keys(value, allowed: ["version", "owner", "capturedAt", "expiresAt", "vehicle", "ride"],
+        try keys(value, allowed: ["version", "owner", "capturedAt", "expiresAt", "vehicle", "ride", "gauge"],
                  required: ["version", "owner", "capturedAt", "expiresAt"])
         guard let selected = value["owner"] as? [String: Any] else { throw SystemSnapshotError("invalid_snapshot_owner") }
-        try keys(selected, allowed: ["scopeID", "accountVINHash"], required: ["scopeID", "accountVINHash"])
+        try keys(selected, allowed: ["scopeID", "accountVINHash", "accountHash"], required: ["scopeID", "accountVINHash"])
         if let source = value["vehicle"], !(source is NSNull) {
             guard let source = source as? [String: Any] else { throw SystemSnapshotError("invalid_vehicle_snapshot") }
             try keys(source, allowed: ["name", "vinDisplaySuffix", "socPercent", "socUpdatedAt", "charging",
                                       "chargingUpdatedAt", "chargeProgressPercent", "chargeProgressUpdatedAt", "updatedAt"],
                      required: ["updatedAt"])
+        }
+        if let source = value["gauge"], !(source is NSNull) {
+            guard let source = source as? [String: Any] else { throw SystemSnapshotError("invalid_gauge_snapshot") }
+            try keys(source, allowed: ["source", "speedKph", "updatedAt"], required: ["source", "speedKph", "updatedAt"])
         }
         if let source = value["ride"], !(source is NSNull) {
             guard let source = source as? [String: Any] else { throw SystemSnapshotError("invalid_ride_snapshot") }
@@ -162,40 +324,31 @@ public enum SystemSnapshotStore {
         try protected.setResourceValues(resource)
     }
 
-    /// 删除本 store 不再需要的旧快照与残留临时文件。
-    ///
-    /// `keeping` 里是要保留的条目名（本次要写的目标、owner marker、跨进程锁）。
-    ///
-    /// 为什么要容忍临时文件：`Data.write(.atomic)` 会先在同目录写一个临时文件再 rename；
-    /// 进程被杀（或 extension 被系统回收）就会留下 `.dat.nosyncXXXX` 这类条目。
-    /// 旧实现遇到不认识的名字直接抛 `snapshot_storage_invalid`，于是一个残留临时文件
-    /// 就能让后续每一次写入永久失败——只能删 App 才能恢复。临时文件没有保留价值，直接删。
-    private static func removeOrphans(_ root: URL, keeping names: Set<String>) throws {
-        let entries = try FileManager.default.contentsOfDirectory(at: root, includingPropertiesForKeys: [.isRegularFileKey],
-                                                                  options: [])
-        for entry in entries where !names.contains(entry.lastPathComponent) {
+    // 仅清本匿名 summary 命名空间；保留同账号车辆，未知文件 fail closed，绝不触碰 Broadcast。
+    private static func removeOrphans(_ root: URL, keepingOwner active: SystemSnapshotOwner) throws {
+        let entries = try FileManager.default.contentsOfDirectory(at: root, includingPropertiesForKeys: [.isRegularFileKey], options: [])
+        for entry in entries {
             let name = entry.lastPathComponent
-            // 原子写留下的临时条目：以 "." 开头（`.dat.nosync...`）或含 `.nosync`。
-            if name.hasPrefix(".") || name.contains(".nosync") {
-                try? FileManager.default.removeItem(at: entry)
+            if [markerName, lockName, settingsName].contains(name) { continue }
+            if name.hasPrefix(".dat.nosync") {
+                try ensureRegularFile(entry, missingAllowed: false)
+                try FileManager.default.removeItem(at: entry)
                 continue
             }
-            // 不枚举账号历史；仅清理由此 store 命名的旧匿名快照。
-            let parts = name.split(separator: ".")
-            guard parts.count == 3, parts[2] == "json",
-                  SystemSnapshotOwner(scopeID: String(parts[1]), accountVINHash: String(parts[0])).isValid else {
+            guard name.hasSuffix(".json"), ownerIdentifier(String(name.dropLast(5))) != nil else {
                 throw SystemSnapshotError("snapshot_storage_invalid")
             }
-            try ensureRegularFile(entry, missingAllowed: false)
-            try FileManager.default.removeItem(at: entry)
+            guard let selected = try selectedOwner(String(name.dropLast(5)), at: root) else { continue }
+            if !selected.sharesAccount(with: active)
+                || (selected.accountVINHash == active.accountVINHash && selected.scopeID != active.scopeID) {
+                try FileManager.default.removeItem(at: entry)
+            }
         }
-        // 数量上限放在清理之后：目录里堆了多个旧快照时，先删再判断才有机会自愈；
-        // 放在前面会让「条目过多」变成永久失败。`coordinated` 入口仍有一道同样的闸门。
         let remaining = try FileManager.default.contentsOfDirectory(atPath: root.path).count
-        guard remaining <= 8 else { throw SystemSnapshotError("snapshot_storage_limit") }
+        guard remaining <= maxVehicles + 3 else { throw SystemSnapshotError("snapshot_storage_limit") }
     }
 
-    private static func coordinated<T>(create: Bool, action: (URL) throws -> T) throws -> T {
+    private static func coordinated<T>(create: Bool, revoking: Bool = false, action: (URL) throws -> T) throws -> T {
         #if os(iOS) || os(macOS)
         let manager = FileManager.default
         guard let container = manager.containerURL(forSecurityApplicationGroupIdentifier: appGroupIdentifier) else {
@@ -227,11 +380,11 @@ public enum SystemSnapshotStore {
         }
         guard locked else { throw SystemSnapshotError("snapshot_store_busy") }
         defer { _ = flock(descriptor, LOCK_UN) }
-        let entries = try manager.contentsOfDirectory(at: root, includingPropertiesForKeys: nil, options: [])
-        // 写路径放宽到 64：目录里堆了旧快照 + 原子写临时文件时，必须能进到
-        // removeOrphans 才有机会删干净并自愈；8 条硬门槛会把这种状态锁死成永久失败。
-        // 仍然有硬上限，避免被异常目录拖进无界枚举。读路径保持严格的 8。
-        guard entries.count <= (create ? 64 : 8) else { throw SystemSnapshotError("snapshot_storage_limit") }
+        // 撤权先进入 action 删除匹配 marker；枚举限额只约束可选清理，不能阻断撤权。
+        if !revoking {
+            let entries = try manager.contentsOfDirectory(at: root, includingPropertiesForKeys: nil, options: [])
+            guard entries.count <= (create ? 64 : maxVehicles + 3) else { throw SystemSnapshotError("snapshot_storage_limit") }
+        }
         return try action(root)
         #else
         throw SystemSnapshotError("app_group_unavailable")

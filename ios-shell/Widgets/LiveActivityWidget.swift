@@ -22,10 +22,13 @@ private struct LiveActivityPresentation {
         WidgetVehiclePresentation(snapshot: snapshot, date: date, requiresRefresh: systemIsStale)
     }
     var ride: SystemRideSnapshot? { snapshot?.ride }
-    var available: Bool { kind == .ride ? ride != nil : snapshot?.vehicle != nil }
+    var isGauge: Bool { kind == .gauge }
+    var speedDisplay: Bool { kind == .ride || isGauge }
+    var available: Bool { isGauge ? snapshot?.gauge != nil : kind == .ride ? ride != nil : snapshot?.vehicle != nil }
     var isStale: Bool {
         guard let snapshot = snapshot else { return false }
         if systemIsStale || snapshot.isStale(at: date) { return true }
+        if isGauge { return snapshot.gauge?.visibleSpeedKph(at: date) == nil }
         if kind == .ride, let ride = ride {
             let stateFresh = SystemSnapshotFreshness.isFresh(ride.updatedAt, at: date,
                 maxAgeSeconds: SystemSnapshotFreshness.rideSpeedMaxAgeSeconds)
@@ -34,16 +37,19 @@ private struct LiveActivityPresentation {
         return vehicle.isStale
     }
     var name: String { snapshot?.vehicle?.name ?? WidgetStrings.vehicle }
-    var updatedAt: Int64? { kind == .ride ? ride?.updatedAt : snapshot?.vehicle?.updatedAt }
-    var speed: Double? { isStale ? nil : ride?.visibleSpeedKph(at: date) }
+    var updatedAt: Int64? { isGauge ? snapshot?.gauge?.updatedAt : kind == .ride ? ride?.updatedAt : snapshot?.vehicle?.updatedAt }
+    var speed: Double? {
+        isStale ? nil : isGauge ? snapshot?.gauge?.visibleSpeedKph(at: date) : ride?.visibleSpeedKph(at: date)
+    }
     var elapsedText: String { WidgetValueText.elapsed(isStale ? nil : ride?.elapsedSeconds) }
     var primaryText: String {
-        kind == .ride ? WidgetValueText.speed(speed) : WidgetValueText.percent(vehicle.soc)
+        speedDisplay ? WidgetValueText.speed(speed) : WidgetValueText.percent(vehicle.soc)
     }
-    var primaryLabel: String { kind == .ride ? WidgetStrings.speed : WidgetStrings.soc }
+    var primaryLabel: String { speedDisplay ? WidgetStrings.speed : WidgetStrings.soc }
     var icon: String {
         guard available else { return "questionmark.circle" }
         if isStale { return "exclamationmark.circle" }
+        if isGauge { return "speedometer" }
         if kind == .ride {
             switch ride?.state {
             case .recording?: return "bicycle"
@@ -58,6 +64,7 @@ private struct LiveActivityPresentation {
     var status: String {
         guard available else { return WidgetStrings.activityUnavailable }
         if isStale { return WidgetStrings.stale }
+        if isGauge { return WidgetStrings.nativeGauge }
         if kind == .ride {
             switch ride?.state {
             case .waiting?: return WidgetStrings.rideWaiting
@@ -89,7 +96,7 @@ private struct LiveActivityBanner: View {
                 Spacer(minLength: 4)
                 Text(presentation.status).font(.caption).lineLimit(1)
             }
-            if presentation.kind == .ride {
+            if presentation.speedDisplay {
                 HStack(alignment: .firstTextBaseline, spacing: 20) {
                     VStack(alignment: .leading, spacing: 3) {
                         Text(WidgetStrings.speed).font(.caption).foregroundColor(.secondary)
@@ -99,9 +106,11 @@ private struct LiveActivityBanner: View {
                         }
                     }
                     Spacer(minLength: 0)
-                    VStack(alignment: .trailing, spacing: 3) {
-                        Text(WidgetStrings.elapsed).font(.caption).foregroundColor(.secondary)
-                        Text(presentation.elapsedText).font(.title2.monospacedDigit())
+                    if !presentation.isGauge {
+                        VStack(alignment: .trailing, spacing: 3) {
+                            Text(WidgetStrings.elapsed).font(.caption).foregroundColor(.secondary)
+                            Text(presentation.elapsedText).font(.title2.monospacedDigit())
+                        }
                     }
                 }
             } else {
@@ -153,7 +162,7 @@ private struct LiveActivityExpandedTrailing: View {
         VStack(alignment: .trailing, spacing: 3) {
             Text(presentation.primaryLabel).font(.caption2)
             Text(presentation.primaryText).font(.title2.monospacedDigit()).lineLimit(1)
-            if presentation.kind == .ride {
+            if presentation.speedDisplay {
                 Text(WidgetStrings.speedUnit).font(.caption2)
             }
         }

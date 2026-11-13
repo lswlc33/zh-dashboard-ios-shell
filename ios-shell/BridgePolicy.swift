@@ -12,12 +12,14 @@ enum IOSBridgePolicy {
     static let maxServiceBytes = 512 * 1024
     static let maxFileEnvelopeBytes = 28 * 1024 * 1024
     static let maxPendingBytes = 32 * 1024 * 1024
-    static let fileMethods: Set<String> = ["file.share", "file.save", "photos.save"]
+    static let fileMethods: Set<String> = ["file.share", "file.save", "photos.save", "asset.zip.build.begin"]
     static let interactiveMethods: Set<String> = [
         "file.share", "file.save", "photos.save", "clipboard.read", "clipboard.write", "media.permission",
         "notifications.request", "notifications.schedule", "notifications.cancel", "app.settings",
         "gps.begin", "ble.scan", "ble.connect", "ble.write", "ride.begin", "history.clear",
-        "system.snapshot", "liveActivity.start", "liveActivity.end", "panel.update"
+        "system.snapshot", "liveActivity.start", "liveActivity.end", "panel.update",
+        "ui.confirm", "wifi.join", "network.open", "blob.pick", "ble.open", "ble.systemPairing",
+        "ble.diagnostic.open", "session.renew.prepare", "compat.call", "cast.start"
     ]
     static let maxBodyBytes = 8 * 1024 * 1024
     static let maxResponseBytes = 4 * 1024 * 1024

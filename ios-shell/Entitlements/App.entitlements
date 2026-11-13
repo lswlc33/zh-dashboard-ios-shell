@@ -1,7 +1,11 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0"><dict>
-    <!-- 公开模板不是授权凭据。签名身份和 provisioning 必须真实批准这个 App Group。 -->
+    <!-- 公开模板不是授权凭据。ad-hoc 结构验签不证明 Apple profile 批准任何能力。
+         HotspotConfiguration 只申请加入用户指定的 Wi-Fi；wifi-info 读取当前网络作连接核对，
+         仍受系统隐私授权/配置来源限制，不申请 VPN、组播、HotspotHelper 或 Wi-Fi Direct。 -->
+    <key>com.apple.developer.networking.HotspotConfiguration</key><true/>
+    <key>com.apple.developer.networking.wifi-info</key><true/>
     <key>com.apple.security.application-groups</key><array>
         <string>group.io.github.lswlc33.dashboard.ios</string>
     </array>

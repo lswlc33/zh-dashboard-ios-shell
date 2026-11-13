@@ -21,7 +21,9 @@
     <key>NSPhotoLibraryAddUsageDescription</key><string>仅在你点击保存图片后，将面板生成的图片添加到照片；不会读取已有照片。</string>
     <key>NSCameraUsageDescription</key><string>仅在你点击相机扫码或拍摄上传时使用摄像头，不会在启动时开启。</string>
     <key>NSMicrophoneUsageDescription</key><string>仅在你点击现场录音后使用麦克风，录制你的专属车辆音效。</string>
-    <key>NSBluetoothAlwaysUsageDescription</key><string>用于你主动连接车辆、使用感应钥匙或读取车辆蓝牙状态。</string>
+    <key>NSBluetoothAlwaysUsageDescription</key><string>仅在你确认连接后扫描或连接蓝牙设备，按你的操作读写已选择的设备特征。</string>
+    <!-- 仅连接用户选定的 Wi-Fi 与局域网 TCP 端点；没有 Bonjour、组播发现或 Wi-Fi Direct。 -->
+    <key>NSLocalNetworkUsageDescription</key><string>仅在你确认后连接指定的局域网设备，发送所选文件或屏幕画面，并检查连接状态。</string>
     <key>NSLocationWhenInUseUsageDescription</key><string>仅在你开启骑行记录时获取位置，用于绘制路线和记录距离。</string>
     <key>NSLocationAlwaysAndWhenInUseUsageDescription</key><string>仅在你明确开启骑行记录后，允许切到后台继续记录路线；结束记录后停止获取位置。</string>
     <key>UIBackgroundModes</key><array>
