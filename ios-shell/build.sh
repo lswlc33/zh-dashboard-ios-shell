@@ -86,11 +86,14 @@ if [[ ! "$java_version" =~ version\ \"21[.\"] ]]; then
     exit 2
 fi
 # AppIntents 不能只链接 framework 就声称配置可发现；先核本机工具实际支持的参数。
-# 来源是 Xcode ExtractAppIntentsMetadata 真命令；版本有差异时 fail closed，交 CI 日志校核。
+# Xcode 16.4 的真实契约是「列表文件」而不是裸 --source-files/--binary-file；
+# 缺任一项 processor 会 Unable to parse options 直接失败，所以按可用参数逐项校验。
 intents_help="$(xcrun --sdk iphoneos appintentsmetadataprocessor --help 2>&1 || true)"
-for flag in --output --target-triple --module-name --toolchain-dir --binary-file --source-files --sdk-root; do
+intents_required=(--output --target-triple --module-name --toolchain-dir --sdk-root
+                  --source-file-list --swift-const-vals-list --platform-family --deployment-target --xcode-version)
+for flag in "${intents_required[@]}"; do
     if ! printf '%s\n' "$intents_help" | grep -q -- "$flag"; then
-        printf 'BLOCKED: appintentsmetadataprocessor lacks required flag: %s\n%s\n' "$flag" "$intents_help" >&2
+        printf 'BLOCKED: appintentsmetadataprocessor lacks required flag: %s\n' "$flag" >&2
         exit 2
     fi
 done
@@ -217,14 +220,20 @@ python3 -I "$support" prepare-widget --source "$script_dir/Widgets/Info.plist" \
 python3 -I "$support" prepare-extension --target broadcast --source "$script_dir/Broadcast/Info.plist" \
     --host-info "$app_dir/Info.plist" --destination "$broadcast_dir/Info.plist"
 # 在签名之前从真实 Widget executable/源码提取系统配置 metadata，不造目录/伪造 actionsdata。
-# 老版本 processor 可直接读取 binary/source；新版若需要 const-values 会在这里/非空闸门阻塞，
-# 必须以所选 Xcode 16.4 的真实 --help/编译日志修正，不把跳过当成功。
+# Xcode 16.4 只接受列表文件：--source-file-list / --swift-const-vals-list。
+# Widget 没有编译器生成的 supplementary const-values 时传空列表（= 没有额外常量），
+# 这与伪造 actionsdata 不同：产物里出现的 metadata 仍必须由真实源码提取。
 swiftc_path="$(xcrun --sdk iphoneos --find swiftc)"
 toolchain_dir="$(CDPATH= cd -- "$(dirname -- "$swiftc_path")/../.." && pwd -P)"
+xcode_version="$(xcodebuild -version | awk 'NR==1{print $2}')"
+printf '%s\n' "${widget_sources[@]}" > "$build_dir/widget-sources-list.txt"
+: > "$build_dir/widget-const-vals-list.txt"
 xcrun --sdk iphoneos appintentsmetadataprocessor \
     --output "$widget_dir" --target-triple arm64-apple-ios15.4 --module-name DashboardWidgets \
-    --toolchain-dir "$toolchain_dir" --sdk-root "$sdk_path" --binary-file "$widget_dir/DashboardWidgets" \
-    --source-files "${widget_sources[@]}"
+    --toolchain-dir "$toolchain_dir" --sdk-root "$sdk_path" \
+    --platform-family iphoneos --deployment-target 15.4 --xcode-version "$xcode_version" \
+    --source-file-list "$build_dir/widget-sources-list.txt" \
+    --swift-const-vals-list "$build_dir/widget-const-vals-list.txt"
 [[ -s "$widget_dir/Metadata.appintents/extract.actionsdata" ]] || { printf '%s\n' 'BLOCKED: real Widget AppIntents metadata extraction produced no actionsdata; no IPA generated.' >&2; exit 2; }
 xcrun nm -g "$broadcast_dir/ZeehoCastBroadcast" | grep 'SampleHandler'
 cp "$script_dir/bridge-bootstrap.js" "$app_dir/bridge-bootstrap.js"

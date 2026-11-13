@@ -171,7 +171,8 @@ def main():
                   '-module-name ZeehoCastBroadcast', 'prepare-extension --target broadcast',
                   '--scan-executable "$broadcast_dir/ZeehoCastBroadcast"',
                   '--scan-folder "$broadcast_dir/Frameworks"', 'Entitlements/Broadcast.entitlements',
-                  'appintentsmetadataprocessor', '--source-files "${widget_sources[@]}"',
+                  'appintentsmetadataprocessor', '--source-file-list "$build_dir/widget-sources-list.txt"',
+                  '--swift-const-vals-list "$build_dir/widget-const-vals-list.txt"',
                   'Metadata.appintents/extract.actionsdata', '-weak_framework -Xlinker AppIntents'):
         assert token in build_sh, token
     assert build_sh.index('--entitlements "$script_dir/Entitlements/Broadcast.entitlements"') < \

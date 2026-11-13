@@ -30,7 +30,8 @@ assert.ok(![...records].some(n => /Inductive(?:Cloud|Session)\.swift$/.test(n)))
 const build = readFileSync(path.join(shell, 'build.sh'), 'utf8');
 for (const token of ['-module-name ZeehoCastBroadcast', '-Xlinker -e -Xlinker _NSExtensionMain',
   '--scan-executable "$broadcast_dir/ZeehoCastBroadcast"', '--scan-folder "$broadcast_dir/Frameworks"',
-  'appintentsmetadataprocessor', '--source-files "${widget_sources[@]}"',
+  'appintentsmetadataprocessor', '--source-file-list "$build_dir/widget-sources-list.txt"',
+  '--swift-const-vals-list "$build_dir/widget-const-vals-list.txt"',
   'Metadata.appintents/extract.actionsdata', '-weak_framework -Xlinker AppIntents']) assert.ok(build.includes(token), token);
 assert.ok(build.indexOf('appintentsmetadataprocessor \\') < build.indexOf('codesign --force'), 'Metadata must precede signing');
 assert.ok(build.indexOf('Entitlements/Broadcast.entitlements') < build.indexOf('Entitlements/Widgets.entitlements'));
