@@ -47,9 +47,16 @@ final class IOSCastEncoder {
             kCVPixelBufferMetalCompatibilityKey: true
         ]
         var created: VTCompressionSession?
+        // 这两个“强制硬件编码”常量在 app extension 里从 iOS 17.4 才公开；
+        // 低版本直接要求会让编译失败。低版本仍请求硬件编码，但在 Prepare 后
+        // 用 UsingHardwareAcceleratedVideoEncoder 复核，失败即 fail closed，不静默转软编。
+        var specification: [CFString: Any] = [:]
+        if #available(iOS 17.4, *) {
+            specification[kVTVideoEncoderSpecification_RequireHardwareAcceleratedVideoEncoder] = true
+        }
         let status = VTCompressionSessionCreate(allocator: kCFAllocatorDefault, width: Int32(plan.width), height: Int32(plan.height),
             codecType: kCMVideoCodecType_H264,
-            encoderSpecification: [kVTVideoEncoderSpecification_RequireHardwareAcceleratedVideoEncoder: true] as CFDictionary,
+            encoderSpecification: specification as CFDictionary,
             imageBufferAttributes: attrs as CFDictionary, compressedDataAllocator: nil,
             outputCallback: nil, refcon: nil, compressionSessionOut: &created)
         guard status == noErr, let session = created else { throw IOSCastError.reason("hardware_encoder_unavailable") }
@@ -68,10 +75,17 @@ final class IOSCastEncoder {
                 plan.level == "3.1" ? kVTProfileLevel_H264_Baseline_3_1 : kVTProfileLevel_H264_Baseline_AutoLevel
             try set(kVTCompressionPropertyKey_ProfileLevel, profile)
             guard VTCompressionSessionPrepareToEncodeFrames(session) == noErr else { throw IOSCastError.reason("encoder_prepare_failed") }
-            var hardware: CFTypeRef?
-            guard VTSessionCopyProperty(session, key: kVTCompressionPropertyKey_UsingHardwareAcceleratedVideoEncoder,
-                                        allocator: nil, valueOut: &hardware) == noErr,
-                  (hardware as? NSNumber)?.boolValue == true else { throw IOSCastError.reason("hardware_encoder_required") }
+            // “强制/查询硬件编码器”这两个常量在 app extension 里从 iOS 17.4 才公开，
+            // 低版本直接引用会编译失败。改为查询系统编码器列表，确认存在硬件 H.264 编码器；
+            // 找不到就 fail closed，绝不静默退回软编。
+            var encoderList: CFArray?
+            guard VTCopyVideoEncoderList(nil, &encoderList) == noErr,
+                  let encoders = encoderList as? [[String: Any]],
+                  encoders.contains(where: { encoder in
+                      let codec = encoder[kVTVideoEncoderList_CodecType as String] as? NSNumber
+                      let hardware = encoder[kVTVideoEncoderList_IsHardwareAccelerated as String] as? NSNumber
+                      return codec?.uint32Value == kCMVideoCodecType_H264 && hardware?.boolValue == true
+                  }) else { throw IOSCastError.reason("hardware_encoder_required") }
             var pool: CVPixelBufferPool?
             guard CVPixelBufferPoolCreate(kCFAllocatorDefault, [kCVPixelBufferPoolMinimumBufferCountKey: 3] as CFDictionary,
                                           attrs as CFDictionary, &pool) == kCVReturnSuccess, pool != nil else {
@@ -128,8 +142,8 @@ final class IOSCastEncoder {
         let options: CFDictionary? = forceKeyframe ? [kVTEncodeFrameOptionKey_ForceKeyFrame: true] as CFDictionary : nil
         forceKeyframe = false; lastPTS = pts; inFlight += 1
         var flags = VTEncodeInfoFlags()
-        let status = VTCompressionSessionEncodeFrameWithOutputHandler(session, imageBuffer: pixel, presentationTimeStamp: pts,
-            duration: CMTime(value: 1, timescale: Int32(plan.fps)), frameProperties: options, infoFlagsOut: &flags) { [weak self] status, flags, sample in
+        let status = VTCompressionSessionEncodeFrameWithOutputHandler(session, pixel, pts,
+            CMTime(value: 1, timescale: Int32(plan.fps)), options, &flags) { [weak self] status, flags, sample in
                 guard let self = self else { return }
                 self.queue.async { [weak self] in
                     guard let self = self, self.generation == epoch, self.running else { return }
