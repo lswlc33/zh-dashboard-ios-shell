@@ -194,8 +194,12 @@ while IFS= read -r module; do
 done < "$build_dir/widget-frameworks.txt"
 # AppIntents API 从 iOS 16 开始；具体配置类型另有 iOS 17 availability，15.4 不能强加载它。
 widget_args+=(-Xlinker -weak_framework -Xlinker AppIntents)
+# AppIntents metadata 提取依赖 Swift 编译器产出的 const-values；
+# 没有 -emit-const-values 时 processor 会报 "No swift const values found" 并跳过输出。
+# 明确产出 const-values 列表文件，供下面的 appintentsmetadataprocessor 读取。
 xcrun --sdk iphoneos swiftc -O -swift-version 5 -parse-as-library -application-extension \
     -target arm64-apple-ios15.4 -sdk "$sdk_path" -module-name DashboardWidgets \
+    -emit-const-values-path "$build_dir/widget-const-vals.json" \
     "${widget_args[@]}" "${widget_sources[@]}" -o "$widget_dir/DashboardWidgets"
 
 # ReplayKit 的标准 upload extension 仍由 _NSExtensionMain 进入 NSObject 子类 SampleHandler。
@@ -229,13 +233,16 @@ swiftc_path="$(xcrun --sdk iphoneos --find swiftc)"
 toolchain_dir="$(CDPATH= cd -- "$(dirname -- "$swiftc_path")/../.." && pwd -P)"
 xcode_version="$(xcodebuild -version | awk 'NR==1{print $2}')"
 printf '%s\n' "${widget_sources[@]}" > "$build_dir/widget-sources-list.txt"
-: > "$build_dir/widget-const-vals-list.txt"
+# --swift-const-vals-list 要的是「每行一个 const-values 文件路径」的列表，
+# 不是编译器产出的 JSON 本身；没有该文件时 processor 提取不到任何 AppIntents 符号。
+printf '%s\n' "$build_dir/widget-const-vals.json" > "$build_dir/widget-const-vals-list.txt"
 xcrun --sdk iphoneos appintentsmetadataprocessor \
     --output "$widget_dir" --target-triple arm64-apple-ios15.4 --module-name DashboardWidgets \
     --toolchain-dir "$toolchain_dir" --sdk-root "$sdk_path" \
     --platform-family iphoneos --deployment-target 15.4 --xcode-version "$xcode_version" \
     --source-file-list "$build_dir/widget-sources-list.txt" \
     --swift-const-vals-list "$build_dir/widget-const-vals-list.txt"
+[[ -s "$build_dir/widget-const-vals.json" ]] || { printf '%s\n' 'BLOCKED: Widget compilation produced no const-values; AppIntents metadata cannot be extracted.' >&2; exit 2; }
 [[ -s "$widget_dir/Metadata.appintents/extract.actionsdata" ]] || { printf '%s\n' 'BLOCKED: real Widget AppIntents metadata extraction produced no actionsdata; no IPA generated.' >&2; exit 2; }
 xcrun nm -g "$broadcast_dir/ZeehoCastBroadcast" | grep 'SampleHandler'
 cp "$script_dir/bridge-bootstrap.js" "$app_dir/bridge-bootstrap.js"
