@@ -295,9 +295,14 @@ final class IOSSystemService: NSObject, IOSBridgeCancellableService, IOSBridgeMe
                     self.confirm(job, title: IOSStrings.settingsTitle, message: IOSStrings.settingsMessage,
                                  button: IOSStrings.openSettings) { [weak self, weak job] in
                         guard let self = self, let job = job, self.mayContinue(job) else { return }
-                        let urlString = kind == "notifications"
-                            ? UIApplication.openNotificationSettingsURLString
-                            : UIApplication.openSettingsURLString
+                        // openNotificationSettingsURLString 是 iOS 16+；15.x 落回本 App 设置页。
+                        let urlString: String
+                        if kind == "notifications",
+                           #available(iOS 16.0, *) {
+                            urlString = UIApplication.openNotificationSettingsURLString
+                        } else {
+                            urlString = UIApplication.openSettingsURLString
+                        }
                         guard let url = URL(string: urlString) else { return }
                         job.submitted = true
                         UIApplication.shared.open(url, options: [:]) { [weak self, weak job] opened in
