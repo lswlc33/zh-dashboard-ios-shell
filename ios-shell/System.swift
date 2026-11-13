@@ -287,12 +287,18 @@ final class IOSSystemService: NSObject, IOSBridgeCancellableService, IOSBridgeMe
                         self.finish(job, value: ["status": text.isEmpty ? "empty" : "read", "text": text])
                     }
                 case "app.settings":
-                    guard options.isEmpty else { throw Failure(IOSStrings.invalidArguments) }
+                    // kind 可省（旧调用方）：notifications 打开系统的通知设置页，
+                    // battery/autostart 没有公开 URL，退回本 App 设置页（与 Android 分流对齐）。
+                    let kind = (options["kind"] as? String ?? "app").lowercased()
+                    guard ["app", "notifications", "battery", "autostart"].contains(kind) else { throw Failure(IOSStrings.invalidArguments) }
                     let job = try self.begin(method: method, args: args, interactive: true, reply: reply)
                     self.confirm(job, title: IOSStrings.settingsTitle, message: IOSStrings.settingsMessage,
                                  button: IOSStrings.openSettings) { [weak self, weak job] in
-                        guard let self = self, let job = job, self.mayContinue(job),
-                              let url = URL(string: UIApplication.openSettingsURLString) else { return }
+                        guard let self = self, let job = job, self.mayContinue(job) else { return }
+                        let urlString = kind == "notifications"
+                            ? UIApplication.openNotificationSettingsURLString
+                            : UIApplication.openSettingsURLString
+                        guard let url = URL(string: urlString) else { return }
                         job.submitted = true
                         UIApplication.shared.open(url, options: [:]) { [weak self, weak job] opened in
                             self?.onMain {

@@ -19,7 +19,10 @@ enum IOSBridgePolicy {
         "gps.begin", "ble.scan", "ble.connect", "ble.write", "ride.begin", "history.clear",
         "system.snapshot", "liveActivity.start", "liveActivity.end", "panel.update",
         "ui.confirm", "wifi.join", "network.open", "blob.pick", "ble.open", "ble.systemPairing",
-        "ble.diagnostic.open", "session.renew.prepare", "compat.call", "cast.start"
+        "ble.diagnostic.open", "session.renew.prepare", "compat.call", "cast.start",
+        // 本地实验壁纸 ZIP 构建+MD5 可能超默认 30s；与 ios-bridge.js 的 INTERACTIVE 逐项对齐，
+        // 不加会让「网页还在等、原生 30s 到点已撤单」。
+        "asset.zip.build.begin"
     ]
     static let maxBodyBytes = 8 * 1024 * 1024
     static let maxResponseBytes = 4 * 1024 * 1024

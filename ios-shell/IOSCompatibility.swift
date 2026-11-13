@@ -105,7 +105,10 @@ final class IOSCompatibilityService: IOSBridgeCancellableService, IOSBridgeBackg
             utility.handle(method: "app.keepScreenOn", args: [["on": on]], reply: reply); return
         }
         if let native = Self.systemMethods[name] {
-            let values: [Any] = name == "copyText" ? [["text": parameters.first as? String ?? ""]] : []
+            // openSettings 的 JS 侧传的是裸字符串 kind（'notifications'/'battery'/'autostart'/'app'），
+            // 包成 {kind: …} 交给系统服务分流；其余系统方法保持原签名。
+            let values: [Any] = name == "copyText" ? [["text": parameters.first as? String ?? ""]]
+                : name == "openSettings" ? [["kind": parameters.first as? String ?? "app"]] : []
             system.handle(method: native, args: values, reply: reply); return
         }
         if widget.methods.contains(name) { widget.handle(method: name, args: parameters, reply: reply); return }
