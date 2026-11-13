@@ -27,13 +27,14 @@ IPA_URL = 'https://zhb.xn--fiqz59cpva341l.top/app/zeehowebnext.ipa'
 RELEASE_NOTES = '解决了一些已知问题。\n\n目前软件处于快速更新迭代中，请及时更新并反馈问题'
 SOURCE_ICON_NAME = 'icon-ios-1024.png'
 SOURCE_ICON_URL = 'https://zhb.xn--fiqz59cpva341l.top/app/icon-ios-1024.png'
-SOURCE_DESCRIPTION = ('官方更新源仓库：https://github.com/lswlc33/zeeho-3d-models\n'
-                  '官方 iOS 源码仓库：https://github.com/lswlc33/zh-dashboard-ios-shell\n\n'
-                  '几何面板是独立的极核电动车数据面板，提供车况、电量、骑行记录和已适配车辆设置。'
-                  'iOS 客户端使用 WKWebView 与原生桥，支持账号管理、面板资源更新和 iOS App 更新；'
-                  '小组件与实时活动按系统能力和授权开放。\n\n'
-                  '本 IPA 为 ad-hoc 构建，当前通过 TrollStore 侧载。采用 AltStore 源格式不代表已经验证 AltStore 重签安装；'
-                  '下载后请按设备支持的方式确认覆盖安装。')
+# 源简介只保留一句事实描述；仓库地址与 ad-hoc 说明不进客户端介绍（详情见产物仓库 README）。
+SOURCE_DESCRIPTION = ('几何面板是独立的极核电动车数据面板，提供车况、电量、骑行记录和已适配车辆设置。'
+                      'iOS 客户端使用 WKWebView 与原生桥，支持账号管理、面板资源更新和 iOS App 更新')
+# 源顶层 message 是给全能签等工具展示的公告位（AltStore 忽略未知键），可换行。
+SOURCE_MESSAGE = ('本软件完全免费，请勿购买和付费。\n'
+                  '不要从网盘等风险渠道获取该软件。\n'
+                  '让你关注，通过网盘下载或者转存下载的 都是骗子，请举报!\n'
+                  '请关注抖音作者@奶龙')
 MAX_IPA_BYTES = 31_457_280  # 必须仍能通过 Update.swift 的下载大小闸门。
 MAX_ARCHIVE_BYTES = 64 * 1024 * 1024
 MAX_UNCOMPRESSED_BYTES = 256 * 1024 * 1024
@@ -71,6 +72,9 @@ IOS_ICON = 'public/icons/icon-ios-1024.png'
 SHELL_SCRIPTS = ('ios-shell/build.sh', 'native-shared/gradlew')
 FIXED_INPUTS = {
     'ios-shell/Info.plist', 'ios-shell/build.sh', 'ios-shell/build-support.py',
+    # 移交闸门与构建脚本同为可信代码：公开 CI 用它决定是否覆盖线上产物，
+    # 必须进指纹白名单，否则「门禁代码被改过」不会被 sourceTreeSha256 发现。
+    'ios-shell/publish-artifacts.py',
     'ios-shell/test.py', 'ios-shell/bridge-bootstrap.js', 'test/ios-parity-build-contract.mjs',
     'ios-shell/Entitlements/App.entitlements', 'ios-shell/Entitlements/Widgets.entitlements',
     'ios-shell/Entitlements/Broadcast.entitlements', 'ios-shell/Broadcast/Info.plist',
@@ -976,7 +980,11 @@ def validate_release_date(value):
 
 
 def source_json(path, report, release_date):
-    """生成 AltStore source；仅一个 App 和最新版本，介绍使用官方字段。"""
+    """生成双读源：AltStore 读 apps/versions + appPermissions，全能签读 app 层扁平 version/downloadURL/size。
+
+    同一份文件喂两种解析器，扁平字段必须与 versions[0] 逐值相等；顶层 message 是全能签的公告位，
+    AltStore 忽略未知键，因此不再写 nsfw（避免用「是否成人内容」表达公告）。
+    """
     info = report['info']
     metadata = release_metadata(path, info)
     entitlement_keys = set()
@@ -987,16 +995,20 @@ def source_json(path, report, release_date):
     require(all(isinstance(value, str) and value.strip() for value in privacy.values()), 'Invalid privacy usage description')
     name = info.get('CFBundleDisplayName')
     require(isinstance(name, str) and name.strip(), 'App display name must come from host Info.plist')
+    download = IPA_URL + '?sha256=' + metadata['sha256']
+    version = {'version': metadata['version'], 'buildVersion': metadata['build'],
+               'date': validate_release_date(release_date), 'localizedDescription': RELEASE_NOTES,
+               'downloadURL': download, 'size': metadata['size'],
+               'minOSVersion': info['MinimumOSVersion']}
     return {'name': '几何面板 iOS 官方源', 'subtitle': '几何面板 iOS 客户端与最新版本更新',
-            'description': SOURCE_DESCRIPTION, 'iconURL': SOURCE_ICON_URL,
+            'description': SOURCE_DESCRIPTION, 'message': SOURCE_MESSAGE, 'iconURL': SOURCE_ICON_URL,
             'website': 'https://github.com/lswlc33/zeeho-3d-models',
             'apps': [{'name': name, 'bundleIdentifier': info['CFBundleIdentifier'], 'developerName': 'lswlc33',
                       'subtitle': '极核电动车车况与骑行数据面板', 'localizedDescription': SOURCE_DESCRIPTION,
                       'iconURL': SOURCE_ICON_URL, 'category': 'utilities',
-                      'versions': [{'version': metadata['version'], 'buildVersion': metadata['build'],
-                                    'date': validate_release_date(release_date), 'localizedDescription': RELEASE_NOTES,
-                                    'downloadURL': IPA_URL + '?sha256=' + metadata['sha256'], 'size': metadata['size'],
-                                    'minOSVersion': info['MinimumOSVersion']}],
+                      # 全能签扁平字段：与 versions[0] 同值，缺一个就识别不到可装版本。
+                      'version': version['version'], 'downloadURL': download, 'size': version['size'],
+                      'versions': [version],
                       'appPermissions': {'entitlements': sorted(entitlement_keys), 'privacy': privacy}}], 'news': []}
 
 
@@ -1028,6 +1040,13 @@ def from_source(value):
     require(app.get('bundleIdentifier') == BUNDLE_ID and latest.get('minOSVersion') == MINIMUM_IOS
             and latest.get('localizedDescription') == RELEASE_NOTES,
             'Unexpected AltStore identity/deployment/notes contract')
+    # 全能签读 app 层扁平字段；三值与 versions[0] 不一致时两种客户端会装到不同字节，必须拒绝。
+    # 旧版清单没有这三个键（当时只有 AltStore 读），缺省时按 AltStore 源处理，不因此拒绝历史快照。
+    flat = ('version', 'downloadURL', 'size')
+    if any(key in app for key in flat):
+        require({key: app.get(key) for key in flat}
+                == {'version': version, 'downloadURL': download, 'size': latest['size']},
+                'Flat universal-signer fields must equal the latest version')
     return {'version': version, 'build': build, 'bundleIdentifier': app['bundleIdentifier'],
             'minimumIOS': latest['minOSVersion'], 'architecture': 'arm64', 'installer': 'TrollStore',
             'file': IPA_NAME, 'size': latest['size'], 'sha256': digest,

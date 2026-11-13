@@ -143,6 +143,14 @@ def main():
     assert helper.PUBLISHED_ARTIFACTS == ('zeehowebnext.ipa', 'version2.json', 'build-manifest.json', 'source-commit.txt', 'SHA256SUMS')
     assert helper.IPA_URL == 'https://zhb.xn--fiqz59cpva341l.top/app/zeehowebnext.ipa'
     assert helper.RELEASE_NOTES == '解决了一些已知问题。\n\n目前软件处于快速更新迭代中，请及时更新并反馈问题'
+    # 源简介只保留事实描述：仓库地址与 ad-hoc 免责声明不再塞进客户端介绍。
+    assert helper.SOURCE_DESCRIPTION == ('几何面板是独立的极核电动车数据面板，提供车况、电量、骑行记录和已适配车辆设置。'
+                                         'iOS 客户端使用 WKWebView 与原生桥，支持账号管理、面板资源更新和 iOS App 更新')
+    assert 'http' not in helper.SOURCE_DESCRIPTION, '客户端介绍里不放链接'
+    # 公告位用可换行的 message（全能签读），不写 nsfw 冒充公告。
+    assert helper.SOURCE_MESSAGE.count('\n') == 3
+    assert helper.SOURCE_MESSAGE.startswith('本软件完全免费，请勿购买和付费。')
+    assert 'ios-shell/publish-artifacts.py' in helper.FIXED_INPUTS, '移交闸门必须进指纹白名单'
     assert 'dashboard-trollstore.ipa' not in build_sh
 
     # ④ 默认输出目录不能是固定 `dist/`：第二次构建必被 OUTPUT_ARTIFACT_EXISTS 拦下。

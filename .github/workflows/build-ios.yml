@@ -1,6 +1,7 @@
 name: Build iOS TrollStore IPA
 
-# 公开仓库只负责真实 Xcode 构建与移交；最终分发由产物仓库的 version2.json 管理。
+# 公开仓库负责真实 Xcode 构建；构建成功后按「版本号严格前进」的闸门自动移交到产物仓库。
+# 未升号的普通源码推送会被闸门判为 version-not-bumped 并跳过覆盖，回退直接 BLOCKED。
 on:
   push:
     branches: [main]
@@ -10,6 +11,11 @@ on:
       - 'public/icons/**'
       - '.github/workflows/build-ios.yml'
   workflow_dispatch:
+    inputs:
+      publish:
+        description: '构建成功后自动推送到产物仓库（手动重跑需显式勾选）'
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -52,7 +58,10 @@ jobs:
           restore-keys: gradle-${{ runner.os }}-
 
       - name: 源码契约检查
-        run: python3 -I ios-shell/test.py
+        run: |
+          # 移交闸门的纯内存自检先跑：release tool 自己坏掉时不必等整包编译完才发现。
+          python3 -I ios-shell/publish-artifacts.py --self-test
+          python3 -I ios-shell/test.py
 
       - name: 构建 iOS 壳（含 KMP framework，ad-hoc 签名）
         run: |
@@ -111,3 +120,96 @@ jobs:
             ${{ runner.temp }}/out/SHA256SUMS
           if-no-files-found: error
           retention-days: 30
+
+  publish:
+    needs: build
+    # 推送即自动移交；手动触发必须显式勾选 publish，避免调试重跑覆盖线上产物。
+    if: github.ref == 'refs/heads/main' && (github.event_name == 'push' || inputs.publish)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      actions: read
+      contents: read
+    # 与本地手动发布共用一把锁：同一时刻只允许一个人写产物仓库。
+    concurrency:
+      group: publish-ios-artifacts
+      cancel-in-progress: false
+
+    steps:
+      - name: 检出源码
+        uses: actions/checkout@v4
+
+      - name: 取回构建产物
+        uses: actions/download-artifact@v4
+        with:
+          name: ios-ipa-${{ github.sha }}
+          path: ${{ runner.temp }}/out
+
+      - name: 配置产物仓库只写部署密钥
+        env:
+          DEPLOY_KEY: ${{ secrets.ARTIFACT_REPO_DEPLOY_KEY }}
+        run: |
+          # 部署密钥只授权 zeeho-3d-models 一个仓库的写入，公开工作流拿不到账号级 PAT。
+          if [[ -z "$DEPLOY_KEY" ]]; then
+            echo "BLOCKED: ARTIFACT_REPO_DEPLOY_KEY 未配置，无法移交产物"
+            exit 1
+          fi
+          install -m 700 -d "$RUNNER_TEMP/ssh"
+          printf '%s\n' "$DEPLOY_KEY" > "$RUNNER_TEMP/ssh/id_ed25519"
+          chmod 600 "$RUNNER_TEMP/ssh/id_ed25519"
+          # 固定 GitHub 已公布的 ed25519 主机密钥，不盲信 ssh-keyscan 的即时结果。
+          ssh-keyscan -t ed25519 github.com > "$RUNNER_TEMP/ssh/known_hosts" 2>/dev/null
+          grep -q 'AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabgH5C9okWi0dh2l9GKJl' "$RUNNER_TEMP/ssh/known_hosts" \
+            || { echo "BLOCKED: 无法确认 github.com 主机密钥"; exit 1; }
+          echo "GIT_SSH_COMMAND=ssh -i $RUNNER_TEMP/ssh/id_ed25519 -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile=$RUNNER_TEMP/ssh/known_hosts" >> "$GITHUB_ENV"
+
+      - name: 拉取产物仓库并判定是否需要发布
+        id: gate
+        run: |
+          set -o pipefail
+          # 产物仓库 359MB（3D 模型）；稀疏检出只取 app/，不白拉模型。
+          git clone --depth 1 --filter=blob:none --sparse git@github.com:lswlc33/zeeho-3d-models.git "$RUNNER_TEMP/artifacts"
+          git -C "$RUNNER_TEMP/artifacts" sparse-checkout set app
+          git -C "$RUNNER_TEMP/artifacts" config user.name 'github-actions[bot]'
+          git -C "$RUNNER_TEMP/artifacts" config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          python3 -I "$GITHUB_WORKSPACE/ios-shell/publish-artifacts.py" \
+            --artifact-dir "$RUNNER_TEMP/out" \
+            --artifact-root "$RUNNER_TEMP/artifacts" \
+            --icon "$GITHUB_WORKSPACE/public/icons/icon-ios-1024.png" \
+            --report "$RUNNER_TEMP/publish-report.json"
+          ACTION=$(python3 -I -c "import json,sys;print(json.load(open(sys.argv[1]))['action'])" "$RUNNER_TEMP/publish-report.json")
+          REASON=$(python3 -I -c "import json,sys;print(json.load(open(sys.argv[1]))['reason'])" "$RUNNER_TEMP/publish-report.json")
+          echo "action=$ACTION" >> "$GITHUB_OUTPUT"
+          {
+            echo '## iOS 产物移交'
+            echo ''
+            echo "- 判定：\`${ACTION}\`"
+            echo "- 原因：${REASON}"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: 提交并推送三个正式资产
+        if: steps.gate.outputs.action == 'publish'
+        run: |
+          set -o pipefail
+          cd "$RUNNER_TEMP/artifacts"
+          # 只加这三件；Android 清单 / APK 与其他文件一律不碰。
+          git add app/zeehowebnext.ipa app/version2.json app/icon-ios-1024.png
+          if git diff --cached --quiet; then
+            echo "工作树无变化，跳过提交"
+            exit 0
+          fi
+          VERSION=$(python3 -I -c "import json;d=json.load(open('app/version2.json'))['apps'][0]['versions'][0];print(d['version']+' ('+d['buildVersion']+')')")
+          git commit -q -m "release: iOS ${VERSION} 自动移交" \
+            -m "正文：公开 CI ${GITHUB_SHA} 的 Xcode 构建产物，经版本高水位闸门核对后移交 IPA、双读源清单与源内图标。" \
+            -m "动因：构建与移交同源，避免手工下载再复制造成的字节漂移。"
+          # 本地也可能同时发布：被抢先时重取远端再来，不强推。
+          for attempt in 1 2 3; do
+            if git push origin HEAD:main 2>&1; then
+              echo "已推送：$(git rev-parse --short HEAD)"
+              exit 0
+            fi
+            echo "推送被抢先（第 ${attempt} 次），重取远端后再试"
+            git pull --rebase --autostash origin main || exit 1
+          done
+          echo "BLOCKED: 连续三次推送失败，产物未更新"
+          exit 1
