@@ -82,6 +82,9 @@ enum IOSStrings {
     /// 百分比占位。NSString 的 format 用 %d，不是安卓的 %1$d。
     static let recoveryStatusProgress = "面板初始化（进度%d%%）"
     static let recoveryStatusDone = "面板初始化（已完成）"
+    /// 这次初始化失败了，但磁盘上还有可用的旧快照：状态行不能只说「已完成」或「待完成」，
+    /// 否则会和下面同时展示的错误卡自相矛盾。
+    static let recoveryStatusFallback = "面板初始化（失败，可用旧快照进入）"
     static let recoveryResourceProgress = "资源 %d/%d · %@"
     static let recoveryBytes = "已下载 %@ / %@"
     static let recoveryBytesUnknown = "已下载 %@；总量未知"

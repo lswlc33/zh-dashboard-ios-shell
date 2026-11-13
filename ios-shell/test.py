@@ -243,11 +243,17 @@ def main():
     assert 'initializeButton.isHidden = cancellable' in recovery
     assert 'cancelButton.isHidden = !cancellable' in recovery
     assert 'enterButton.isEnabled = state.canEnter && !busy' in recovery
-    # 上面这条用 canEnter 而非 ready：ready 代表「这次初始化成功了」，UpdateService 与
+    # 光有按钮还不够：点击守卫必须用同一个判据，否则「失败但旧快照可用」时按钮是亮的、
+    # 点下去却静默 return（比灰着更糟）。这两处任何一个回到 ready 都会让功能变成假的。
+    assert 'guard cacheState.canEnter else { return }' in recovery, \
+        'enterTapped 的守卫必须与按钮同判据（canEnter），否则按钮可点但点击无效'
+    # 上面这两条用 canEnter 而非 ready：ready 代表「这次初始化成功了」，UpdateService 与
     # 更新面板靠它判断强制更新成败，不能放宽；而初始化失败时磁盘上的旧快照往往仍可用
     # （State.fallbackAvailable），此时欢迎页应当允许离线进入。
     assert 'var canEnter: Bool { ready || (phase == .error && fallbackAvailable) }' in \
         (root / 'PanelCache.swift').read_text(encoding='utf-8')
+    assert 'var ready: Bool { phase == .ready }' in (root / 'PanelCache.swift').read_text(encoding='utf-8'), \
+        'ready 必须保持「本次初始化成功」的严格语义，不能被放宽成「可以进入」'
     # 初始化进度走推送而不是轮询。
     assert 'IOSPanelCache.shared.onState' in recovery
     # 「版本与更新」打开独立面板，不再是 Alert。

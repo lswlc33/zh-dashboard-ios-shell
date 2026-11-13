@@ -173,15 +173,21 @@ final class IOSStore {
         let manager = FileManager.default
         guard let entries = try? manager.contentsOfDirectory(
             at: directory,
-            includingPropertiesForKeys: [.isRegularFileKey, .isSymbolicLinkKey],
+            includingPropertiesForKeys: [.isRegularFileKey, .isSymbolicLinkKey, .contentModificationDateKey],
             // 不能跳过隐藏文件：临时档名是 `.store-<uuid>.tmp`，本身就是点开头的。
             // 按常规过滤隐藏文件等于把要清的东西全滤掉，永远清不到。
             options: []) else { return }
         for entry in entries {
             let name = entry.lastPathComponent
             guard name.hasPrefix(".store-"), name.hasSuffix(".tmp") else { continue }
-            guard let values = try? entry.resourceValues(forKeys: [.isRegularFileKey, .isSymbolicLinkKey]),
+            guard let values = try? entry.resourceValues(
+                forKeys: [.isRegularFileKey, .isSymbolicLinkKey, .contentModificationDateKey]),
                   values.isRegularFile == true, values.isSymbolicLink != true else { continue }
+            // 只清「老于 90 秒」的：IOSStore 每个 bridge 一份，重新进面板会新建实例，
+            // 上一个实例的 atomicWrite 可能还在队列里写着自己那份 .tmp。
+            // 无年龄判断地清扫会把它 unlink 掉，导致那次 rename 失败、设置静默没写进去。
+            if let modified = values.contentModificationDate,
+               Date().timeIntervalSince(modified) < 90 { continue }
             guard (try? manager.removeItem(at: entry)) != nil else { continue }
             IOSDiagnostics.shared.log("store: 清理崩溃遗留临时档 \(name)")
         }
