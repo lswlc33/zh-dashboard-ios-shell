@@ -11,7 +11,8 @@ enum WidgetStrings {
     static let displayName = "车辆状态"
     static let description = "显示 App 最近同步的电量与充电状态；系统决定刷新时间。"
     static let unavailable = "车况暂无数据"
-    static let unavailableHint = "请打开 App 同步车辆；共享数据不可用时不显示示例车辆。"
+    static let unavailableShort = "打开 App 主页同步"
+    static let unavailableHint = "打开 App 进入主页即可同步当前车辆；系统决定小组件的刷新时间。"
     static let unknown = "未知"
     static let missing = "—"
     static let soc = "电量"
@@ -20,6 +21,7 @@ enum WidgetStrings {
     static let chargingState = "充电状态"
     static let chargeProgress = "充电进度"
     static let stale = "数据已过期"
+    static let mayBeStale = "可能已过期"
     static let lastUpdated = "最后更新"
     static let snapshotOnly = "仅显示 App 最近同步的数据"
     static let refreshHint = "不会在小组件中查询车辆或获取位置。"
@@ -82,26 +84,51 @@ enum WidgetValueText {
     }
 }
 
+// 桌面小组件的「可能已过期」时间窗。
+//
+// 共享层的新鲜窗口是 180 秒（Live Activity 需要），但 WidgetKit 的刷新由系统
+// 预算决定，通常十几分钟才一次；沿用 180 秒会让桌面小组件永远挂着过期标记。
+// 这里对齐 Android 小组件的 30 分钟口径（BaseWidget.updated()）。
+enum WidgetFreshness {
+    static let maxAgeSeconds: Double = 30 * 60
+}
+
 // 这是对共享 schema 的展示包装，不复制 wire 字段或另设一套 TTL。
 struct WidgetVehiclePresentation {
     let snapshot: SystemSnapshot?
     let date: Date
     var requiresRefresh = false
+    // 桌面小组件保留最后已知值（过期只标注时间，和 Android 小组件一致）；
+    // Live Activity 不打开这个开关：锁屏上的数值会被当成实时读数。
+    var keepsLastKnown = false
+    // 判过期用的时间窗；桌面小组件传 WidgetFreshness.maxAgeSeconds，其余保持 180 秒。
+    var freshWindow: Double = SystemSnapshotFreshness.vehicleMaxAgeSeconds
 
     var vehicle: SystemVehicleSnapshot? { snapshot?.vehicle }
     var name: String { vehicle?.name ?? WidgetStrings.vehicle }
+    /// 数值本身是否已过 freshWindow 新鲜窗口。
     var isStale: Bool {
         guard let snapshot = snapshot else { return false }
-        if requiresRefresh || snapshot.isStale(at: date) { return true }
-        guard let vehicle = vehicle else { return false }
+        if requiresRefresh { return true }
+        guard let vehicle = vehicle else { return snapshot.isStale(at: date) }
+        if freshWindow > SystemSnapshotFreshness.vehicleMaxAgeSeconds {
+            // 宽窗口模式（桌面小组件）：只看最后同步时间，不看 expiresAt
+            // （expiresAt 是 180 秒的会话级期限，用它判断会让小组件长期显示过期）。
+            let age = date.timeIntervalSince1970 - Double(vehicle.updatedAt) / 1000
+            return age > freshWindow || age < -SystemSnapshotFreshness.futureToleranceSeconds
+        }
+        if snapshot.isStale(at: date) { return true }
         return (vehicle.socPercent != nil && vehicle.visibleSOCPercent(at: date) == nil)
             || (vehicle.charging != nil && vehicle.visibleCharging(at: date) == nil)
             || (vehicle.chargeProgressPercent != nil && vehicle.visibleChargeProgress(at: date) == nil)
     }
-    var soc: Double? { isStale ? nil : vehicle?.visibleSOCPercent(at: date) }
-    var charging: Bool? { isStale ? nil : vehicle?.visibleCharging(at: date) }
+    // keepsLastKnown 时直接给原始值：过期了也显示「上次同步到的电量 + 更新时间」，
+    // 而不是把整块数据抹成「—」（那正是小组件长期空白的原因）。
+    var soc: Double? { keepsLastKnown ? vehicle?.socPercent : (isStale ? nil : vehicle?.visibleSOCPercent(at: date)) }
+    var charging: Bool? { keepsLastKnown ? vehicle?.charging : (isStale ? nil : vehicle?.visibleCharging(at: date)) }
     var chargeProgress: Double? {
-        charging == true && !isStale ? vehicle?.visibleChargeProgress(at: date) : nil
+        guard charging == true else { return nil }
+        return keepsLastKnown ? vehicle?.chargeProgressPercent : vehicle?.visibleChargeProgress(at: date)
     }
     var updatedAt: Int64? { vehicle?.updatedAt }
 }
@@ -109,16 +136,19 @@ struct WidgetVehiclePresentation {
 struct WidgetUpdatedAt: View {
     let timestamp: Int64?
     let stale: Bool
+    // 桌面小组件保留最后已知值时用 true：同一行写「时间 · 可能已过期」，
+    // 与 Android 小组件的 widget_updated_stale 一致，不再单独占一行红字。
+    var keepsLastKnown = false
 
     var body: some View {
         VStack(alignment: .leading, spacing: 3) {
-            if stale {
+            if stale && !keepsLastKnown {
                 Label(WidgetStrings.stale, systemImage: "exclamationmark.circle")
                     .font(.caption2)
             }
             if let timestamp = timestamp {
                 let date = Date(timeIntervalSince1970: Double(timestamp) / 1000)
-                Text("\(WidgetStrings.lastUpdated) \(date.formatted(date: .numeric, time: .shortened))")
+                Text(line(date))
                     .font(.caption2)
                     .lineLimit(2)
             } else {
@@ -127,6 +157,11 @@ struct WidgetUpdatedAt: View {
             }
         }
         .foregroundColor(.secondary)
+    }
+
+    private func line(_ date: Date) -> String {
+        let stamp = "\(WidgetStrings.lastUpdated) \(date.formatted(date: .numeric, time: .shortened))"
+        return stale && keepsLastKnown ? "\(stamp) · \(WidgetStrings.mayBeStale)" : stamp
     }
 }
 

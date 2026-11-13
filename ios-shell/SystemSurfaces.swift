@@ -247,10 +247,13 @@ final class IOSSystemSurfacesService: NSObject, IOSBridgeService, IOSBridgeCance
     // 为什么必须持久化：
     // 1) scopeID 每次启动随机生成，重启后 owner 必然与上一会话不等，旧 Live Activity
     //    会被 setScope 当作「别人的活动」结束掉——用户会觉得每次冷启动活动都消失；
-    // 2) approved 是纯内存字段，scopeChanged 每次都置 false，于是「首次启用需确认」
-    //    实际退化成「每次会话都要确认」，与文档不符，且普通前台采样会被静默拒绝。
+    // 2) 用户显式关闭过系统显示这件事必须跨会话记住，否则重启后又开始往共享区写快照。
     private static let scopeIDPrefix = "io.github.lswlc33.dashboard.ios.system.scope."
-    private static let approvedPrefix = "io.github.lswlc33.dashboard.ios.system.approved."
+    // 小组件默认共享：只有用户显式点过「关闭系统显示」才落一个 disabled 标记。
+    // 旧版用 approved 白名单（默认 false，必须先点「启用」并确认），结果新装用户
+    // 加完桌面小组件永远只有「车况暂无数据」——现在改成默认开启、可显式关闭。
+    private static let disabledPrefix = "io.github.lswlc33.dashboard.ios.system.disabled."
+    private static let legacyApprovedPrefix = "io.github.lswlc33.dashboard.ios.system.approved."
     private static let defaults = UserDefaults.standard
 
     /// 读取（或首次生成并落盘）该账号+VIN 的稳定 scopeID。
@@ -262,33 +265,36 @@ final class IOSSystemSurfacesService: NSObject, IOSBridgeService, IOSBridgeCance
         return value
     }
 
+    /// 默认开启，只有显式关闭过才是 false。
     private static func loadApproved(for hash: String) -> Bool {
-        defaults.bool(forKey: approvedPrefix + hash)
+        !defaults.bool(forKey: disabledPrefix + hash)
     }
 
     private static func saveApproved(_ value: Bool, for hash: String) {
-        let key = approvedPrefix + hash
-        if value { defaults.set(true, forKey: key) } else { defaults.removeObject(forKey: key) }
+        let key = disabledPrefix + hash
+        if value { defaults.removeObject(forKey: key) } else { defaults.set(true, forKey: key) }
+        // 旧白名单键已无意义，顺手清掉，避免以后又有人按它判断。
+        defaults.removeObject(forKey: legacyApprovedPrefix + hash)
     }
 
     /// scopeChanged 时调用。
     ///
-    /// - 有 owner：以持久化授权为准（同一账号+VIN 重启后仍然是「已启用」）；
+    /// - 有 owner：以持久化的「是否被显式关闭」为准（默认开启）；
     /// - 没有 owner（冷启动未握手 / 桥关闭 / 未登录）：内存里置 false，让 status 如实
-    ///   显示「尚未授权」，但**不**删除 UserDefaults 里的值——下一次 sync.session 会读回来，
-    ///   否则一次页面刷新就要用户重新确认一遍。
+    ///   显示「当前车辆范围未确认」，但**不**删除 UserDefaults 里的关闭标记——
+    ///   下一次 sync.session 会读回来，否则一次页面刷新就把用户的关闭选择抹掉。
     private func adoptPersistedState(for hash: String?) {
         guard let hash = hash else { approved = false; return }
         approved = Self.loadApproved(for: hash)
     }
 
-    /// 用户点了「启用」确认框：内存 + UserDefaults 同时置位，重启后不必再确认一次。
+    /// 用户主动开启系统显示（或首次添加小组件触发的隐式共享）。
     private func grantApproval() {
         approved = true
         if let hash = owner?.accountVINHash { Self.saveApproved(true, for: hash) }
     }
 
-    /// 用户点了「关闭系统显示」：撤销持久化授权，下次必须重新走原生确认。
+    /// 用户点了「关闭系统显示」：撤销持久化授权，下次启动也不会自动写入。
     private func revokeApproval() {
         approved = false
         if let hash = owner?.accountVINHash { Self.saveApproved(false, for: hash) }
@@ -326,7 +332,7 @@ final class IOSSystemSurfacesService: NSObject, IOSBridgeService, IOSBridgeCance
         lastNativePublish = -Double.infinity; lastGaugePublish = -Double.infinity
         lastWidgetReload = -Double.infinity; lastWidgetEdge = ""
         // approved 也从持久化里取；没拿到 scope 的中间态保留当前内存值，
-        // 否则一次导航刷新就把用户授权抹成「每次都要求确认」。
+        // 否则一次导航刷新就把用户的关闭选择抹掉。
         adoptPersistedState(for: owner?.accountVINHash)
         let ticket = epoch
         let selected = owner
@@ -419,13 +425,13 @@ final class IOSSystemSurfacesService: NSObject, IOSBridgeService, IOSBridgeCance
                     return
                 }
                 let vehicle = try vehicleSnapshot(options, scope: current)
+                // 小组件零门槛：前台采样直接落盘，不再要求先去设置页点「启用」并确认。
+                // 用户显式关闭过系统显示时 approved 为 false，这里如实跳过（不写快照、不弹框）。
+                // enable:true 仍保留为「显式重新开启」，供设置页的启用按钮使用。
                 if approved { saveVehicle(vehicle, job: job) }
                 else if try optionalBoolean(options["enable"]) == true {
-                    confirm(job, title: IOSStrings.systemSnapshotTitle, message: IOSStrings.systemSnapshotMessage) { [weak self] in
-                        guard let self = self, self.current(job) else { return }
-                        self.grantApproval()
-                        self.saveVehicle(vehicle, job: job)
-                    }
+                    grantApproval()
+                    saveVehicle(vehicle, job: job)
                 } else { finish(job, failure("snapshot_consent_required")) }
             case "liveActivity.start":
                 try validateAction(options, allowing: ["kind"])
@@ -457,8 +463,9 @@ final class IOSSystemSurfacesService: NSObject, IOSBridgeService, IOSBridgeCance
                 }
             case "widgets.reload":
                 try validateAction(options, includeID: false)
-                guard approved, let value = latest else { finish(job, failure("snapshot_consent_required")); return }
-                let didReload = reloadWidgets(force: false, snapshot: value)
+                // 刷新只是请求 WidgetKit 重读；就算本会话还没有最新样本也允许触发，
+                // 让用户手动刷一下就能看到磁盘上已有的快照（冷启动后 latest 是空的）。
+                let didReload = reloadWidgets(force: true, snapshot: latest)
                 finish(job, ["ok": true, "reloaded": didReload, "requested": didReload, "displayed": false,
                     "budget": "os_managed", "reason": didReload ? "reload_requested" : "reload_throttled"])
             default: finish(job, failure("unsupported_method"))
@@ -502,6 +509,22 @@ final class IOSSystemSurfacesService: NSObject, IOSBridgeService, IOSBridgeCance
     }
 
     private func status(_ job: Job) {
+        // 冷启动时 persistedSnapshot 只在内存里，磁盘上可能已经有上次写入的快照
+        // （小组件就是读那份）。回读一次，否则设置页会显示「没有快照」而桌面却显示着数据。
+        // 读盘放 worker：这里带着跨进程 flock，不能占主线程。
+        let ticket = epoch
+        let enabled = approved
+        worker.async { [weak self] in
+            let stored = enabled ? try? SystemSnapshotStore.readCurrent() : nil
+            DispatchQueue.main.async { [weak self] in
+                guard let self = self, self.epoch == ticket, self.current(job) else { return }
+                if self.persistedSnapshot == nil, let stored = stored { self.persistedSnapshot = stored }
+                self.finishStatus(job)
+            }
+        }
+    }
+
+    private func finishStatus(_ job: Job) {
         if #available(iOS 16.1, *) {
             let manager = liveManager(); let selected = owner; let ticket = epoch
             Task { @MainActor [weak self] in
@@ -523,7 +546,11 @@ final class IOSSystemSurfacesService: NSObject, IOSBridgeService, IOSBridgeCance
         if #available(iOS 16.2, *) { live["staleDateAutomatic"] = liveSupported }
         else { live["staleDateAutomatic"] = false }
         if let first = running.first { live["id"] = first.id; live["kind"] = first.kind.rawValue }
-        var stored: [String: Any] = ["available": persistedSnapshot != nil && approved, "consentRequired": !approved,
+        // consentRequired 现在只在「用户显式关闭过系统显示」时为 true。
+        // 默认开启后它不再是首次使用门槛：没有 owner（未登录/未握手）属于范围未确认，
+        // 不该被网页解读成「要用户点启用」。
+        let consentRequired = owner != nil && !approved
+        var stored: [String: Any] = ["available": persistedSnapshot != nil && approved, "consentRequired": consentRequired,
             "stale": persistedSnapshot?.isStale() ?? true, "capturedAt": persistedSnapshot?.capturedAt as Any? ?? NSNull(),
             "expiresAt": persistedSnapshot?.expiresAt as Any? ?? NSNull(),
             // 网页读 state.status?.snapshot?.reason 显示失败原因；后台发布失败只写进顶层
@@ -1031,12 +1058,13 @@ final class IOSSystemSurfacesService: NSObject, IOSBridgeService, IOSBridgeCance
                             case "showName": settings.showName = options["value"] as? Bool ?? settings.showName
                             case "showTime": settings.showTime = options["value"] as? Bool ?? settings.showTime
                             case "vin", "vehicleID":
-                                let requested = options["value"] as? String ?? ""
-                                if requested.isEmpty { settings.vehicleID = nil }
-                                else if requested == currentScope.vin {
-                                    settings.vehicleID = expected.accountVINHash + "." + expected.scopeID
-                                } else if SystemSnapshotStore.ownerIdentifier(requested) != nil { settings.vehicleID = requested }
-                                else { throw SystemSnapshotError("widget_vehicle_unavailable") }
+                                // iOS 小组件只显示主页当前车辆，不支持按实例指定别的车。
+                                // 传空串等于「跟随当前车辆」，等价于清掉旧选择；传具体车则明确拒绝，
+                                // 让网页知道这是能力边界而不是保存失败。
+                                guard (options["value"] as? String ?? "").isEmpty else {
+                                    throw SystemSnapshotError("system_widget_follows_current_vehicle")
+                                }
+                                settings.vehicleID = nil
                             default: throw SystemSnapshotError("system_widget_style_managed")
                             }
                         }
@@ -1044,20 +1072,31 @@ final class IOSSystemSurfacesService: NSObject, IOSBridgeService, IOSBridgeCance
                             guard job.lease.valid else { throw SystemSnapshotError("operation_cancelled") }
                             try SystemSnapshotStore.writeWidgetSettings(settings, expectedOwner: expected)
                         }
-                        let vehicles = try SystemSnapshotStore.vehicles()
-                        let snapshot = try SystemSnapshotStore.readVehicle(identifier: settings.vehicleID)
+                        // 只读当前 owner 的快照，和小组件本身完全同一条路径。
+                        let snapshot = try SystemSnapshotStore.readCurrent()
                         let snapshotData = try snapshot.map { try JSONEncoder().encode($0) }
                         let snapshotObject = try snapshotData.map { try JSONSerialization.jsonObject(with: $0) }
+                        // 只回当前这一辆：网页据此知道「没有别的车可选」，不会渲染出无效列表。
+                        let vehicles: [[String: Any]] = snapshot.map { value in
+                            [["id": expected.accountVINHash + "." + expected.scopeID,
+                              "name": value.vehicle?.name ?? "",
+                              "suffix": value.vehicle?.vinDisplaySuffix ?? ""]]
+                        } ?? []
                         var value: [String: Any] = ["ok": true, "id": 0, "ids": [], "instances": [],
-                            "vehicleID": settings.vehicleID as Any? ?? NSNull(), "currentVin": currentScope.vin,
-                            "vin": settings.vehicleID == nil ? "" : settings.vehicleID == expected.accountVINHash + "." + expected.scopeID ? currentScope.vin : "",
-                            "effectiveVehicleID": settings.vehicleID ?? expected.accountVINHash + "." + expected.scopeID,
+                            // iOS 只有「跟随主页当前车辆」一种模式：vehicleID 恒为 nil，
+                            // effectiveVehicleID 就是当前 owner。
+                            "vehicleID": NSNull(), "currentVin": currentScope.vin,
+                            // vin 留空 = 「跟随当前车辆」。填当前车架号会让网页以为已经选定某辆车，
+                            // 于是渲染出选择器，而选具体车现在会被明确拒绝（iOS 只跟随主页车辆）。
+                            "vin": "",
+                            "effectiveVehicleID": expected.accountVINHash + "." + expected.scopeID,
                             "name": snapshot?.vehicle?.name ?? "", "vehicleName": snapshot?.vehicle?.name ?? "",
                             "showName": settings.showName, "showTime": settings.showTime, "dark": -1, "timeMode": 0, "tap": 0,
                             "statFields": [], "statSlots": 0, "stats": [], "statsDefault": true,
                             "provider": Self.widgetKind, "configuration": "system_widget_editor", "instanceIDsSupported": false,
-                            "vehicles": vehicles.map { ["id": $0.id, "name": $0.name ?? "", "suffix": $0.suffix ?? ""] },
-                            "extraLimit": SystemSnapshotStore.maxVehicles, "extraRoundRobin": false,
+                            "vehicles": vehicles,
+                            "followsCurrentVehicle": true,
+                            "extraLimit": 1, "extraRoundRobin": false,
                             "backgroundPolling": false, "budget": "os_managed", "displayed": false]
                         if let snapshotObject = snapshotObject { value["snapshot"] = snapshotObject }
                         result = .success(value)

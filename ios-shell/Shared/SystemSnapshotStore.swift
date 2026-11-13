@@ -42,6 +42,10 @@ public enum SystemSnapshotStore {
     }
 
     // 配置选 B 时缺测就是 nil，绝不能回退当前 A。活动 account marker 在同一锁内验证。
+    //
+    // 注意：iOS 壳已改为「小组件只跟随主页当前车辆」（见 ZeehoWidgets.read 用 readCurrent），
+    // 这个方法目前没有调用方。它仍是共享层的公开能力，Android/未来的多实例选车会用到；
+    // 不要因为「没引用」删掉，也不要改回 widget-settings 驱动小组件。
     public static func readVehicle(identifier: String?, now: Date = Date()) throws -> SystemSnapshot? {
         try coordinated(create: false) { root in
             guard let active = try owner(at: root) else { return nil }

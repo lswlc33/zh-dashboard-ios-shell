@@ -11,7 +11,12 @@ struct ZeehoVehicleEntry: TimelineEntry {
     var showTime = true
 
     var presentation: WidgetVehiclePresentation {
-        WidgetVehiclePresentation(snapshot: snapshot, date: date, requiresRefresh: requiresRefresh)
+        // 桌面小组件过期后保留最后已知电量/充电状态，只把时间标注成过期，
+        // 与 Android 小组件「更新时间 + 可能已过期」口径一致。
+        var value = WidgetVehiclePresentation(snapshot: snapshot, date: date, requiresRefresh: requiresRefresh)
+        value.keepsLastKnown = true
+        value.freshWindow = WidgetFreshness.maxAgeSeconds
+        return value
     }
 }
 
@@ -37,14 +42,13 @@ struct ZeehoVehicleProvider: TimelineProvider {
         var entries = [entry]
         if let snapshot = entry.snapshot, let vehicle = snapshot.vehicle,
            !entry.presentation.isStale {
-            // 唯一未来 entry 只撤下过期数值，不预测电量/车速，也不改变原始数据时间。
-            var deadlines = [Date(timeIntervalSince1970: Double(snapshot.expiresAt) / 1000)]
-            let times = [vehicle.socUpdatedAt, vehicle.chargingUpdatedAt, vehicle.chargeProgressUpdatedAt]
-            for timestamp in times.compactMap({ $0 }) {
-                deadlines.append(Date(timeIntervalSince1970: Double(timestamp) / 1000)
-                    .addingTimeInterval(SystemSnapshotFreshness.vehicleMaxAgeSeconds))
-            }
-            if let deadline = deadlines.filter({ $0 > now && $0 <= refreshAfter }).min() {
+            // 未来 entry 只把数值标成「可能已过期」，不再抹掉电量/充电状态：
+            // 过期后保留最后同步值 + 更新时间，和 Android 小组件同一口径。
+            // 期限按小组件的 30 分钟窗口算，不能用 180 秒的会话级 expiresAt——
+            // 那会让小组件刚加上 3 分钟就显示「可能已过期」。
+            let deadline = Date(timeIntervalSince1970: Double(vehicle.updatedAt) / 1000)
+                .addingTimeInterval(WidgetFreshness.maxAgeSeconds)
+            if deadline > now && deadline <= refreshAfter {
                 entries.append(ZeehoVehicleEntry(date: deadline, snapshot: snapshot, requiresRefresh: true,
                     showName: entry.showName, showTime: entry.showTime))
             }
@@ -59,9 +63,13 @@ struct ZeehoVehicleProvider: TimelineProvider {
             return ZeehoVehicleEntry(date: date, snapshot: nil, requiresRefresh: false)
         }
         do {
-            let snapshot = try SystemSnapshotStore.readVehicle(identifier: vehicleID, now: date)
-            let active = try SystemSnapshotStore.currentOwner()
-            let settings = try active.map { try SystemSnapshotStore.widgetSettings(expectedOwner: $0) }
+            // iOS 端只显示「主页当前选中车辆」：不读 widget-settings 里的旧选车记录，
+            // 也不提供按实例切换车辆（那是 Android 的 4×2/4×4 多实例模型）。
+            // 主 App 切换车辆时会把 active-owner.json 一起换掉，这里自然跟着变。
+            let snapshot = try SystemSnapshotStore.readCurrent(now: date)
+            // 显示开关只是装饰：配置文件坏了也必须照样显示车况，不能连带吞掉快照。
+            let settings = (try? SystemSnapshotStore.currentOwner())
+                .flatMap { try? SystemSnapshotStore.widgetSettings(expectedOwner: $0) }
             return ZeehoVehicleEntry(date: date, snapshot: snapshot, requiresRefresh: false,
                 showName: showName ?? settings?.showName ?? true, showTime: showTime ?? settings?.showTime ?? true)
         } catch {
@@ -93,20 +101,16 @@ struct ZeehoVehicleWidgetView: View {
     }
 
     private var unavailable: some View {
-        VStack(alignment: .leading, spacing: 10) {
+        VStack(alignment: .leading, spacing: 8) {
             Label(WidgetStrings.title, systemImage: "car.fill")
                 .font(.caption)
             Text(WidgetStrings.unavailable)
                 .font(.headline)
-            Text(WidgetStrings.missing)
-                .font(.largeTitle.monospacedDigit())
-            if family != .systemSmall {
-                Text(WidgetStrings.unavailableHint)
-                    .font(.caption)
-                    .foregroundColor(.secondary)
-            }
+            Text(family == .systemSmall ? WidgetStrings.unavailableShort : WidgetStrings.unavailableHint)
+                .font(.caption)
+                .foregroundColor(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
             Spacer(minLength: 0)
-            WidgetUpdatedAt(timestamp: nil, stale: false)
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
     }
@@ -140,14 +144,19 @@ struct ZeehoVehicleWidgetView: View {
             .minimumScaleFactor(0.8)
     }
 
+    /// 时间行：桌面小组件保留最后已知值，所以过期只标注「可能已过期」而不是抹掉数值。
+    private var updatedLine: some View {
+        WidgetUpdatedAt(timestamp: presentation.updatedAt, stale: presentation.isStale, keepsLastKnown: true)
+    }
+
     private var small: some View {
         VStack(alignment: .leading, spacing: 6) {
             heading
             battery
             charging
             Spacer(minLength: 0)
-            if entry.showTime { WidgetUpdatedAt(timestamp: presentation.updatedAt, stale: presentation.isStale) }
-            else if presentation.isStale { Text(WidgetStrings.stale).font(.caption2).foregroundColor(.secondary) }
+            if entry.showTime { updatedLine }
+            else if presentation.isStale { Text(WidgetStrings.mayBeStale).font(.caption2).foregroundColor(.secondary) }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
     }
@@ -164,8 +173,8 @@ struct ZeehoVehicleWidgetView: View {
                 }
             }
             Spacer(minLength: 0)
-            if entry.showTime { WidgetUpdatedAt(timestamp: presentation.updatedAt, stale: presentation.isStale) }
-            else if presentation.isStale { Text(WidgetStrings.stale).font(.caption2).foregroundColor(.secondary) }
+            if entry.showTime { updatedLine }
+            else if presentation.isStale { Text(WidgetStrings.mayBeStale).font(.caption2).foregroundColor(.secondary) }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
     }
@@ -187,8 +196,8 @@ struct ZeehoVehicleWidgetView: View {
                 }
             }
             Spacer(minLength: 0)
-            if entry.showTime { WidgetUpdatedAt(timestamp: presentation.updatedAt, stale: presentation.isStale) }
-            else if presentation.isStale { Text(WidgetStrings.stale).font(.caption2).foregroundColor(.secondary) }
+            if entry.showTime { updatedLine }
+            else if presentation.isStale { Text(WidgetStrings.mayBeStale).font(.caption2).foregroundColor(.secondary) }
             Text(WidgetStrings.snapshotOnly).font(.caption).foregroundColor(.secondary)
             Text(WidgetStrings.refreshHint).font(.caption2).foregroundColor(.secondary)
         }
