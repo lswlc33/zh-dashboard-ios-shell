@@ -47,14 +47,17 @@ struct ZeehoVehicleConfigurationIntent: WidgetConfigurationIntent {
 
 @available(iOS 17.0, *)
 struct ZeehoConfiguredVehicleWidget: Widget {
-    let kind = "ZeehoVehicleWidget"
+    // 独立 kind：两个 WidgetConfiguration 若同 kind 会被系统判为重复注册。
+    // 旧版 StaticConfiguration 保留原 kind，升级后已有组件继续工作。
+    static let configuredKind = "ZeehoVehicleWidgetConfigured"
+    let kind = configuredKind
     var body: some WidgetConfiguration {
         AppIntentConfiguration(kind: kind, intent: ZeehoVehicleConfigurationIntent.self,
                                provider: ZeehoConfiguredVehicleProvider()) { entry in
             ZeehoVehicleWidgetView(entry: entry)
         }
-        .configurationDisplayName(WidgetStrings.displayName)
-        .description(WidgetStrings.description)
+        .configurationDisplayName(WidgetStrings.configuredDisplayName)
+        .description(WidgetStrings.configuredDescription)
         .supportedFamilies([.systemSmall, .systemMedium, .systemLarge])
     }
 }

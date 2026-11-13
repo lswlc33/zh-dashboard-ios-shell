@@ -10,6 +10,8 @@ enum WidgetStrings {
     static let vehicle = "车辆"
     static let displayName = "车辆状态"
     static let description = "显示 App 最近同步的电量与充电状态；系统决定刷新时间。"
+    static let configuredDisplayName = "车辆状态（可选车）"
+    static let configuredDescription = "iOS 17 起可在每个组件单独选择车辆；只显示 App 已同步的数据，系统决定刷新时间。"
     static let unavailable = "车况暂无数据"
     static let unavailableHint = "请打开 App 同步车辆；共享数据不可用时不显示示例车辆。"
     static let unknown = "未知"

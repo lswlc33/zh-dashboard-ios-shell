@@ -927,6 +927,10 @@ final class IOSSystemSurfacesService: NSObject, IOSBridgeService, IOSBridgeCance
         let now = ProcessInfo.processInfo.systemUptime
         guard force || edge != lastWidgetEdge || now - lastWidgetReload >= 300 else { return false }
         WidgetCenter.shared.reloadTimelines(ofKind: Self.widgetKind)
+        // iOS 17 的每实例选车版本使用独立 kind，刷新时一并请求。
+        if #available(iOS 17.0, *) {
+            WidgetCenter.shared.reloadTimelines(ofKind: "ZeehoVehicleWidgetConfigured")
+        }
         lastWidgetEdge = edge; lastWidgetReload = now
         return true
     }
