@@ -58,24 +58,27 @@ final class IOSVehicleCancellation {
 }
 
 struct IOSVehicleRoute {
-    let interface: NWInterface
+    let interface: Network.NWInterface
     let sourceIP: String
     let ssid: String
     let carIP: String
 
-    func matches(_ path: NWPath) -> Bool {
+    // Network 与 NetworkExtension/SystemConfiguration 存在同名符号，显式限定到 Network 模块。
+    func matches(_ path: Network.NWPath) -> Bool {
         path.status == .satisfied && path.usesInterfaceType(.wifi)
             && !path.usesInterfaceType(.cellular) && !path.usesInterfaceType(.other)
             && path.availableInterfaces.contains(where: { $0.name == interface.name && $0.type == .wifi })
     }
 
-    func parameters() -> NWParameters {
-        let tcp = NWProtocolTCP.Options(); tcp.noDelay = true
-        let parameters = NWParameters(tls: nil, tcp: tcp)
+    func parameters() -> Network.NWParameters {
+        let tcp = Network.NWProtocolTCP.Options(); tcp.noDelay = true
+        let parameters = Network.NWParameters(tls: nil, tcp: tcp)
         parameters.requiredInterfaceType = .wifi
         parameters.requiredInterface = interface
         parameters.prohibitedInterfaceTypes = [.cellular, .wiredEthernet, .loopback, .other]
-        parameters.localEndpoint = .hostPort(host: NWEndpoint.Host(sourceIP), port: .any)
+        // NWParameters 没有 localEndpoint；绑定源地址用 requiredLocalEndpoint。
+        parameters.requiredLocalEndpoint = .hostPort(host: Network.NWEndpoint.Host(sourceIP),
+                                                     port: Network.NWEndpoint.Port.any)
         parameters.includePeerToPeer = false
         return parameters
     }
