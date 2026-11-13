@@ -943,10 +943,19 @@ def validate_target_frameworks(reports, inputs):
     targets.extend((APP_PREFIX + c['directory'] + c['product'],
                     {'widgets': 'widgetSystemFrameworks', 'broadcast': 'broadcastSystemFrameworks'}[key])
                    for key, c in EXTENSIONS.items())
+    # Swift overlay 模块不一定以 .framework 形式出现在 LC_LOAD_DYLIB：
+    # Network 的 Swift API 由 /usr/lib/swift/libswiftNetwork.dylib 承载，
+    # 链接后没有 Network.framework 条目。这里按两种真实形态分别接受，
+    # 不放松「必须真的链接」这条要求。
+    swift_overlays = {'Network': '/usr/lib/swift/libswiftNetwork.dylib'}
     for binary, key in targets:
         linked = '\n'.join(item['path'] for item in reports[binary]['imports'])
         for name in inputs[key]:
-            require('/' + name + '.framework/' in linked, 'Imported system framework not linked into ' + binary + ': ' + name)
+            forms = ['/' + name + '.framework/']
+            if name in swift_overlays:
+                forms.append(swift_overlays[name])
+            require(any(form in linked for form in forms),
+                    'Imported system framework not linked into ' + binary + ': ' + name)
 
 
 def release_metadata(path, info):
