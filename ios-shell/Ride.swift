@@ -1395,22 +1395,21 @@ final class IOSRideService: NSObject, IOSBridgeService, IOSBridgeCancellableServ
         run.checkpointing = true
         run.checkpointDirty = false
         run.lastCheckpoint = now
-        // evictionBudget 是「还能不能再删历史」的许可，只在 worker 内被 persist 扣减。
-        // 回收成功或失败都由它自己置 false，回主线程后再同步到 run.evictionAttempted。
-        var evictionBudget = !run.evictionAttempted
+        // eviction 许可：进 worker 前取快照（主线程读 run），在 worker 内被 persist 扣减。
+        // 回收成功或失败都会把它置 false，回主线程后同步到 run.evictionAttempted。
+        let initialEvictionBudget = !run.evictionAttempted
         let value = record(run, final: false)
         let owner = run.scope.ownerHash
         worker.async { [weak self, weak run] in
             guard let run = run else { return }
-            // persist 会在真正动手回收前把 budget 扣成 false（成败都一样），
-            // 主线程回调里再同步给 run —— 这样「回收 8 条也不够」时不会反复删。
-            var budget = evictionBudget
+            var budget = initialEvictionBudget
             let result: Result<Saved, Error>
             do { result = .success(try Self.persist(value, owner: owner, id: run.id, evictionBudget: &budget)) }
             catch { result = .failure(error) }
             DispatchQueue.main.async {
                 guard let self = self else { return }
                 run.checkpointing = false
+                // 回收成败都钉住：budget 一旦被扣就不允许这条 run 再删历史。
                 if !budget { run.evictionAttempted = true }
                 switch result {
                 case .success(let saved):
@@ -1562,13 +1561,13 @@ final class IOSRideService: NSObject, IOSBridgeService, IOSBridgeCancellableServ
     private func saveFinal(_ run: Run) {
         guard !run.saveInFlight else { return }
         run.saveInFlight = true
-        // 同 checkpoint：evictionBudget 在 worker 里被 persist 扣减，成功后同步回 run。
-        var evictionBudget = !run.evictionAttempted
+        // 同 checkpoint：eviction 许可在 worker 内被 persist 扣减，回主线程同步回 run。
+        let initialEvictionBudget = !run.evictionAttempted
         let value = record(run, final: true)
         let owner = run.scope.ownerHash
         worker.async { [weak self, weak run] in
             guard let run = run else { return }
-            var budget = evictionBudget
+            var budget = initialEvictionBudget
             var result: Result<Saved, Error>
             do { result = .success(try Self.persist(value, owner: owner, id: run.id, evictionBudget: &budget)) }
             catch { result = .failure(error) }
