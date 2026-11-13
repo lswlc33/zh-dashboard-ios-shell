@@ -139,7 +139,7 @@ final class IOSCompatibilityService: IOSBridgeCancellableService, IOSBridgeBackg
 
 // 通用确认/加解密只处理当前可信页面的有界数据，不包含任何车辆协议操作码。
 final class IOSNativeUtilityService: IOSBridgeCancellableService {
-    let methods = ["ui.confirm", "crypto.aes.decrypt", "app.keepScreenOn"]
+    let methods = ["ui.confirm", "crypto.aes.decrypt", "crypto.aes.encrypt", "app.keepScreenOn"]
     private var metadataProvider: (() -> [String: Any]?)?
     private var presenterProvider: (() -> UIViewController?)?
     private var confirmation: UUID?
@@ -231,24 +231,35 @@ final class IOSNativeUtilityService: IOSBridgeCancellableService {
             }
             return
         }
-        guard method == "crypto.aes.decrypt", !cryptoPending,
+        // crypto.aes.encrypt：本地快照（zeeho-panel: scheme）不是 secure context，
+        // crypto.subtle 不存在，网页无法自己算车控 secret；由原生代算同样的
+        // AES-ECB/PKCS7 单块序列。数据约束与 decrypt 对称（≤16KB、块对齐）。
+        guard (method == "crypto.aes.decrypt" || method == "crypto.aes.encrypt"), !cryptoPending,
               options["mode"] as? String == "ecb", options["padding"] as? String == "pkcs7",
               let keyText = options["keyB64"] as? String, keyText.utf8.count <= 44,
               let key = Data(base64Encoded: keyText), [16, 24, 32].contains(key.count),
-              let cipherText = options["cipherB64"] as? String, cipherText.utf8.count <= 24_576,
+              let cipherText = options[(method == "crypto.aes.encrypt" ? "plainB64" : "cipherB64")] as? String,
+              cipherText.utf8.count <= 24_576,
               let cipher = Data(base64Encoded: cipherText), !cipher.isEmpty, cipher.count <= 16_384,
               cipher.count % kCCBlockSizeAES128 == 0 else { reply(nil, "invalid_crypto_request"); return }
         cryptoPending = true
         worker.async { [weak self] in
+            let encrypting = method == "crypto.aes.encrypt"
             var keyBytes = [UInt8](key), cipherBytes = [UInt8](cipher)
             var plain = [UInt8](repeating: 0, count: cipherBytes.count + kCCBlockSizeAES128)
             var written = 0
             let keyCount = keyBytes.count, cipherCount = cipherBytes.count, outputCount = plain.count
+            // JS 侧（unlockSecret）自己按 PKCS7 填充后逐 16 字节块独立加密、取每块前 16 字节，
+            // 等价于「无填充 ECB」；encrypt 不能再叠一层 PKCS7（会把输出撑长一块），
+            // decrypt 保持原 PKCS7 语义不变。
+            let options_: CCOptions = encrypting
+                ? CCOptions(kCCOptionECBMode)
+                : CCOptions(kCCOptionECBMode | kCCOptionPKCS7Padding)
             let status = keyBytes.withUnsafeBytes { keyPointer in
                 cipherBytes.withUnsafeBytes { cipherPointer in
                     plain.withUnsafeMutableBytes { outputPointer in
-                        CCCrypt(CCOperation(kCCDecrypt), CCAlgorithm(kCCAlgorithmAES),
-                                CCOptions(kCCOptionECBMode | kCCOptionPKCS7Padding),
+                        CCCrypt(encrypting ? CCOperation(kCCEncrypt) : CCOperation(kCCDecrypt), CCAlgorithm(kCCAlgorithmAES),
+                                options_,
                                 keyPointer.baseAddress, keyCount, nil,
                                 cipherPointer.baseAddress, cipherCount,
                                 outputPointer.baseAddress, outputCount, &written)
@@ -266,7 +277,7 @@ final class IOSNativeUtilityService: IOSBridgeCancellableService {
                     reply(["ok": false, "reason": "stale_session"], nil); return
                 }
                 guard let output = output else { reply(["ok": false, "reason": "crypto_failed"], nil); return }
-                reply(["ok": true, "plainB64": output], nil)
+                reply(["ok": true, encrypting ? "cipherB64" : "plainB64": output], nil)
             }
         }
     }
