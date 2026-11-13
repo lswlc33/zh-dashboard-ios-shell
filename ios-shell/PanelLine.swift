@@ -40,6 +40,27 @@ enum IOSPanelLine: String {
         PanelNavigation.base = baseURL(for: current)
     }
 
+    /// 是否已经由用户显式选过线路。网页据此决定「首次启动才让选一次」：
+    /// 没选过就弹一次选择页，选过之后每次手动检查直接用已保存的线路。
+    static var chosen: Bool {
+        UserDefaults.standard.string(forKey: defaultsKey) != nil
+    }
+
+    /// 记下「用户已经选过」，即使选中的正是当前默认值。
+    /// 只调用 `current` 的 setter 不够：它与当前值相同时直接 return，偏好键永远不会写，
+    /// 网页就会一直认为「还没选过」，每次检查都再弹一次选择页。
+    static func markChosen(_ line: IOSPanelLine) {
+        if current == line && chosen { return }
+        UserDefaults.standard.set(line.rawValue, forKey: defaultsKey)
+        if PanelNavigation.base != baseURL(for: line) {
+            PanelNavigation.base = baseURL(for: line)
+            NotificationCenter.default.post(name: didChangeNotification, object: nil)
+        }
+        lock.lock()
+        changeRevision &+= 1
+        lock.unlock()
+    }
+
     /// 面板主文档所在基址（以 `/` 结尾）。iOS 只从这两个 HTTPS 源加载。
     static func baseURL(for line: IOSPanelLine = current) -> URL {
         switch line {
@@ -67,7 +88,9 @@ enum IOSPanelLine: String {
             "line": line.rawValue,
             "logicalOrigin": baseURL(for: line).absoluteString,
             "busy": false,
-            "actualSource": line.rawValue
+            "actualSource": line.rawValue,
+            // 网页据此只在首次使用时弹一次线路选择；之后手动检查直接用已保存的线路。
+            "chosen": chosen
         ]
     }
 }

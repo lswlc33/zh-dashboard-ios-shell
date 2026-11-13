@@ -99,7 +99,7 @@ def main():
     assert 'CommonCrypto' not in inputs['systemFrameworks'], 'CommonCrypto 是 SDK module，不是 framework'
     assert not any('/InductiveCloud.swift' in r['path'] or '/InductiveSession.swift' in r['path'] for r in inputs['files'])
     # 新增更新业务源仍由 inventory 自动发现，不维护另一份硬编码上传表。
-    for name in ('UpdateService.swift', 'UpdateSourceViewController.swift'):
+    for name in ('UpdateService.swift', 'UpdateNoticeViewController.swift'):
         if (root / name).is_file():
             assert 'ios-shell/' + name in inputs['swiftSources'], name
     assert not any(r['path'].endswith('-test.swift') or '/commonTest/' in r['path'] or '/jvmTest/' in r['path'] for r in inputs['files'])
@@ -145,7 +145,7 @@ def main():
     assert helper.RELEASE_NOTES == '解决了一些已知问题。\n\n目前软件处于快速更新迭代中，请及时更新并反馈问题'
     # 源简介只保留事实描述：仓库地址与 ad-hoc 免责声明不再塞进客户端介绍。
     assert helper.SOURCE_DESCRIPTION == ('几何面板是独立的极核电动车数据面板，提供车况、电量、骑行记录和已适配车辆设置。'
-                                         'iOS 客户端使用 WKWebView 与原生桥，支持账号管理、面板资源更新和 iOS App 更新')
+                                         'iOS 客户端使用 WKWebView 与原生桥，支持账号管理、面板资源更新与 iOS App 版本提示')
     assert 'http' not in helper.SOURCE_DESCRIPTION, '客户端介绍里不放链接'
     # 公告位用可换行的 message（全能签读），不写 nsfw 冒充公告。
     assert helper.SOURCE_MESSAGE.count('\n') == 3

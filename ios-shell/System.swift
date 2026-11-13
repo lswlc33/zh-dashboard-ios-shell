@@ -559,7 +559,9 @@ final class IOSSystemService: NSObject, IOSBridgeCancellableService, IOSBridgeMe
             // 网页用它决定顶栏/底栏留白。WebView 已铺满整屏，env(safe-area-inset-*)
             // 在 WK 里可能给 0，所以必须由原生给出真实点值（pt 与 CSS px 1:1）。
             "safeArea": safeAreaJSON(),
-            "panelLine": IOSPanelLine.current.rawValue
+            "panelLine": IOSPanelLine.current.rawValue,
+            // 首帧就要能判断「是否已选过线路」，否则网页只能等 panelLineInfo 异步回执。
+            "panelLineChosen": IOSPanelLine.chosen
         ]
     }
 

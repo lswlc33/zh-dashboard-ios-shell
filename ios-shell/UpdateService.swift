@@ -81,16 +81,6 @@ final class IOSUpdateCenter {
         return result
     }
 
-    func confirmedRelease(version: String, build: String, line: IOSPanelLine) throws -> IOSRelease {
-        guard line == IOSPanelLine.current, let release = releases[line],
-              release.version == version, release.build == build,
-              appStates[line]?["state"] as? String == "update" else {
-            throw IOSBridgePolicy.Failure("update_check_required")
-        }
-        try release.requireSupportedSystem()
-        return release
-    }
-
     func checkPanel(current: String, line: IOSPanelLine, force: Bool = true) async throws -> [String: Any] {
         if !force, let at = panelCheckedAt[line], ProcessInfo.processInfo.systemUptime - at < Self.automaticInterval,
            let previous = panelStates[line] {
@@ -166,18 +156,12 @@ enum IOSUpdatePresentation {
                     return
                 }
                 guard owner.presentedViewController == nil else { return }
-                let alert = UIAlertController(title: IOSStrings.updateAppTitle,
-                    message: String(format: IOSStrings.updateNewVersionMessage, center.installedVersion,
-                                    center.installedBuild, release.version, release.build), preferredStyle: .alert)
-                alert.addAction(UIAlertAction(title: IOSStrings.updateLater, style: .cancel))
-                alert.addAction(UIAlertAction(title: IOSStrings.updateDownload, style: .default) { [weak owner] _ in
-                    guard let owner = owner, active(owner, line: line, revision: revision) else { return }
-                    let picker = UpdateSourceViewController(release: release, line: line)
-                    let navigation = UINavigationController(rootViewController: picker)
-                    navigation.modalPresentationStyle = .formSheet
-                    owner.present(navigation, animated: true)
-                })
-                owner.present(alert, animated: true)
+                // 全屏告知页，只有「我知道了」：App 内不提供下载，用户自行从外部获取新版本自签安装。
+                let notice = UpdateNoticeViewController(release: release,
+                                                        installedVersion: center.installedVersion,
+                                                        installedBuild: center.installedBuild)
+                notice.modalTransitionStyle = .coverVertical
+                owner.present(notice, animated: true)
             } catch {
                 guard manual, !Task.isCancelled, let owner = owner, active(owner, line: line, revision: revision) else { return }
                 message(from: owner, title: IOSStrings.updateCheckFailedTitle, text: error.localizedDescription)
@@ -222,9 +206,9 @@ enum IOSUpdatePresentation {
     }
 }
 
-// 这里只接受固定动作和已检查的版本；网页不能提供下载 URL 或待分享的本机路径。
+// 这里只接受固定动作和已检查的版本；网页不能提供下载 URL 或本机路径。
 final class IOSUpdateService: IOSBridgeCancellableService {
-    let methods = ["app.recovery", "update.status", "update.check", "update.download", "panel.check", "panel.update"]
+    let methods = ["app.recovery", "update.status", "update.check", "panel.check", "panel.update"]
     private final class Job {
         let id = UUID()
         let method: String
@@ -239,14 +223,13 @@ final class IOSUpdateService: IOSBridgeCancellableService {
             self.lineRevision = IOSPanelLine.revision; self.reply = reply
         }
     }
-    private let controller: () -> UIViewController?
     private let welcome: () -> Bool
     private let restart: () -> Void
     private var generation: UInt64 = 0
     private var jobs: [UUID: Job] = [:]
 
-    init(controller: @escaping () -> UIViewController?, welcome: @escaping () -> Bool, restart: @escaping () -> Void) {
-        self.controller = controller; self.welcome = welcome; self.restart = restart
+    init(welcome: @escaping () -> Bool, restart: @escaping () -> Void) {
+        self.welcome = welcome; self.restart = restart
     }
 
     func navigationChanged() {
@@ -292,22 +275,6 @@ final class IOSUpdateService: IOSBridgeCancellableService {
             }
             begin(method: method, args: args, line: line, reply: reply) {
                 try await IOSUpdateCenter.shared.checkPanel(current: current, line: line)
-            }
-        case "update.download":
-            guard Set(options.keys) == ["version", "build", "line"], let version = options["version"] as? String,
-                  let build = options["build"] as? String, options["line"] as? String == line.rawValue else {
-                reply(failure("invalid_args"), nil); return
-            }
-            begin(method: method, args: args, line: line, reply: reply) { [weak self] in
-                guard let self = self, let owner = self.controller(), owner.presentedViewController == nil else {
-                    throw IOSBridgePolicy.Failure("system_operation_busy")
-                }
-                let release = try IOSUpdateCenter.shared.confirmedRelease(version: version, build: build, line: line)
-                let picker = UpdateSourceViewController(release: release, line: line)
-                let navigation = UINavigationController(rootViewController: picker)
-                navigation.modalPresentationStyle = .formSheet
-                owner.present(navigation, animated: true)
-                return ["ok": true, "phase": "source_selection"]
             }
         case "panel.update":
             guard Set(options.keys) == ["line"], options["line"] as? String == line.rawValue,

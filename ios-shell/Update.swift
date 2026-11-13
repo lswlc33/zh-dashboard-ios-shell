@@ -128,7 +128,11 @@ struct IOSRelease: Decodable {
         _ = try Self.versionParts(version)
         _ = try Self.versionParts(minimumIOS)
         _ = try Self.safeBuild(build)
-        guard bundleIdentifier == Self.bundleID, architecture == "arm64", installer == "TrollStore",
+        // installer 只是清单里的随附说明字段，App 内既不展示也不安装：
+        // 不要求它等于某个具体安装器名字，只要是有界的 ASCII 文本即可。
+        let installText = installer.utf8
+        guard bundleIdentifier == Self.bundleID, architecture == "arm64",
+              !installText.isEmpty, installText.count <= 32, installText.allSatisfy({ (32...126).contains($0) }),
               file == "zeehowebnext.ipa", (1...Self.maximumSize).contains(size),
               Self.validHash(sha256) else { throw UpdateError.invalidRelease }
     }
@@ -325,47 +329,8 @@ enum IOSUpdater {
         return text
     }
 
-    static func download(_ release: IOSRelease, source: IOSUpdateSource) async throws -> URL {
-        try Task.checkCancellation()
-        try release.validate()
-        let url = try source.url(for: IOSUpdateSources.ipaPath, token: release.sha256)
-        let transfer = IOSUpdateTransfer(source: source, relative: IOSUpdateSources.ipaPath, limit: release.size)
-        let (bytes, _) = try await transfer.read(url: url, timeout: 45)
-        try Task.checkCancellation()
-        try release.verify(bytes)
-        try Task.checkCancellation()
-        let manager = FileManager.default
-        let directory = manager.temporaryDirectory.appendingPathComponent("ios-update-" + UUID().uuidString, isDirectory: true)
-        var handedOff = false
-        defer { if !handedOff { try? manager.removeItem(at: directory) } }
-        try Task.checkCancellation()
-        try manager.createDirectory(at: directory, withIntermediateDirectories: false)
-        let destination = directory.appendingPathComponent(release.file)
-        try Task.checkCancellation()
-        try bytes.write(to: destination, options: .atomic)
-        try Task.checkCancellation()
-        handedOff = true
-        return destination
-    }
-
-    static func latency(_ release: IOSRelease, source: IOSUpdateSource) async -> Int? {
-        let start = ProcessInfo.processInfo.systemUptime
-        do {
-            try Task.checkCancellation()
-            try release.validate()
-            let url = try source.url(for: IOSUpdateSources.ipaPath, token: release.sha256)
-            let transfer = IOSUpdateTransfer(source: source, relative: IOSUpdateSources.ipaPath, limit: 0, headersOnly: true)
-            let remaining = 6 - (ProcessInfo.processInfo.systemUptime - start)
-            guard remaining > 0 else { return nil }
-            _ = try await transfer.read(url: url, timeout: remaining)
-            try Task.checkCancellation()
-            let elapsed = ProcessInfo.processInfo.systemUptime - start
-            guard elapsed <= 6 else { return nil }
-            return max(0, Int(elapsed * 1000))
-        } catch { return nil }
-    }
-
     // 仅供旧版清单迁移；最新检查不调用 API，也不采用资产里的任意下载 URL。
+    // 旧清单的 installer 字段已不再使用（App 内不安装），这里只接受历史值以免旧数据被拒。
     static func releaseFromGitHubAPI(_ bytes: Data) throws -> IOSRelease {
         guard bytes.count <= maximumMetadataSize,
               let object = try JSONSerialization.jsonObject(with: bytes) as? [String: Any],

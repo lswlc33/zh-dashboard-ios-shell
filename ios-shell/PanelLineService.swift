@@ -53,7 +53,9 @@ final class IOSPanelLineService: IOSBridgeService {
             return
         }
         let previous = IOSPanelLine.current
-        IOSPanelLine.current = target
+        // markChosen 而不是直接赋 current：选中默认值（GitHub）时 setter 会直接 return，
+        // 偏好键不落盘 → 网页永远认为「还没选过」→ 每次检查都再弹选择页。
+        IOSPanelLine.markChosen(target)
         worker.async { [weak self] in
             guard let self = self else { return }
             self.generation &+= 1

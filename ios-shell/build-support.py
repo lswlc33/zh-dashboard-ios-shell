@@ -32,7 +32,7 @@ SOURCE_URL = 'https://zhb.xn--fiqz59cpva341l.top/app/version2.json'
 SOURCE_IDENTIFIER = 'io.github.lswlc33.dashboard.ios.source'
 # 源简介只保留一句事实描述；仓库地址与 ad-hoc 说明不进客户端介绍（详情见产物仓库 README）。
 SOURCE_DESCRIPTION = ('几何面板是独立的极核电动车数据面板，提供车况、电量、骑行记录和已适配车辆设置。'
-                      'iOS 客户端使用 WKWebView 与原生桥，支持账号管理、面板资源更新和 iOS App 更新')
+                      'iOS 客户端使用 WKWebView 与原生桥，支持账号管理、面板资源更新与 iOS App 版本提示')
 # 源顶层 message 是给全能签等工具展示的公告位（AltStore 忽略未知键），可换行。
 SOURCE_MESSAGE = ('本软件完全免费，请勿购买和付费。\n'
                   '不要从网盘等风险渠道获取该软件。\n'

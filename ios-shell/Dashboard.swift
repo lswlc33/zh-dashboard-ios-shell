@@ -305,8 +305,7 @@ final class PanelController: UIViewController, WKNavigationDelegate, WKUIDelegat
         let widgets = IOSWidgetCompatibilityService(systemSurfaces: surfaces)
         let compatibility = IOSCompatibilityService(ride: ride, gps: IOSLocationService.shared,
                                                    system: system, widget: widgets, utility: utility)
-        let updates = IOSUpdateService(controller: { [weak self] in self },
-            welcome: { [weak self] in self?.requestWelcome() ?? false },
+        let updates = IOSUpdateService(welcome: { [weak self] in self?.requestWelcome() ?? false },
             restart: { [weak self] in self?.restartAfterPanelUpdate() })
         let core = IOSBridge(webView: web, services: [IOSLocationService.shared, bluetooth, ride, history,
                              system, surfaces, line, utility, secrets, renewal, wifi, tcp, assets, blobs, cast, widgets, compatibility, updates])

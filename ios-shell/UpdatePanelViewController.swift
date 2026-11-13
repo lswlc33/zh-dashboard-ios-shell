@@ -353,7 +353,8 @@ final class UpdatePanelViewController: UIViewController,
                 self.presentMessage(IOSStrings.updateLineChangedTitle, IOSStrings.busy)
                 return
             }
-            IOSPanelLine.current = line
+            // markChosen：选中默认线路时也要落偏好键，否则网页会一直当成「还没选过」。
+            IOSPanelLine.markChosen(line)
             self.table.reloadData()
         })
         present(alert, animated: true)

@@ -35,9 +35,9 @@ Swift UIKit + WKWebView 面板壳，默认从 `https://lswlc33.github.io/zeeho-3
 
 ## iOS 软件更新与面板更新
 
-在面板或原生「版本与更新」检查软件更新，读取 `zeeho-3d-models/app/version2.json`；IPA 固定为 `app/zeehowebnext.ipa`，不请求 Android 的 `app/version.json` / APK。清单使用 [AltStore source 格式](https://faq.altstore.io/developers/make-a-source)，仅含本 App 最新版本；简介注明官方产物 / 公开 iOS 源码仓库与 TrollStore ad-hoc 现状，不表示 AltStore 重签安装已验收。GitHub 线路的下载来源有 GitHub Pages、ghfast、ghproxy、raw、jsDelivr、Cloudflare 六项；CF 专线仅有 Cloudflare。来源页显示 HEAD 响应头延迟，不是下载速率；用户点击才选定 source，下载失败明确报错，不暗中换源。清单查询的 GitHub 线路可依次尝试 Pages、raw、CF，CF 专线不串外源。
+在面板或原生「版本与更新」检查软件更新，读取 `zeeho-3d-models/app/version2.json`；IPA 固定为 `app/zeehowebnext.ipa`，不请求 Android 的 `app/version.json` / APK。清单使用 [AltStore source 格式](https://faq.altstore.io/developers/make-a-source)，仅含本 App 最新版本。**App 内只提示是否有新版，不提供下载或安装入口**：发现新版时弹全屏提示（版本对比 + 更新说明 + 「我知道了」），用户自行从外部获取安装包并自签覆盖安装。线路只在首次使用时选一次，之后每次检查直接用已保存的线路；「我的 → 面板线路」仍可手动改。清单查询的 GitHub 线路可依次尝试 Pages、raw、CF，CF 专线不串外源。
 
-进入面板时仅在前台自动检查，手动检查与自动检查共用按线路缓存的 `IOSUpdateCenter`；自动检查结果在 30 分钟内复用，网页状态刷新只读中心缓存，不是后台联网轮询。比较 iOS 版本与 build，只提供较新的、支持当前系统的包；IPA 最多 30 MiB，下载后核对大小与 SHA-256。通过后打开系统 `UIActivityViewController`，由用户选择 TrollStore 并确认覆盖安装；分享回执不是安装成功，也不是静默安装。HTTPS 与清单哈希不构成独立发布者签名。
+进入面板时仅在前台自动检查，手动检查与自动检查共用按线路缓存的 `IOSUpdateCenter`；自动检查结果在 30 分钟内复用，网页状态刷新只读中心缓存，不是后台联网轮询。比较 iOS 版本与 build，只采纳较新的、支持当前系统的版本；App 内不下载更新包，也不做任何安装动作，`update.download` 与来源选择页已移除。HTTPS 与清单哈希不构成独立发布者签名。
 
 「登录与账号 → 欢迎与恢复」通过 `app.recovery` 回到正常原生欢迎页，不记成启动失败、不删除账号。账号管理与面板资源分别处理：资源初始化、换线或软件检查不读写 token，快照与账号存储独立。首次、升级或启动失败可进入欢迎 / 恢复页；升级、换线、缺元数据或快照超过 24 小时会触发资源刷新，失败 / 取消保留旧快照。普通冷启动先用可用快照，过期刷新异步执行，新资源供下次进入使用；手动面板更新成功后重载当前页面，「版本与更新」也可重新初始化资源。未发布的工作树网页不会因此变成线上功能。
 
@@ -53,7 +53,7 @@ CI 经源码契约检查、KMP framework 构建、Swift host / Shared / Widget /
 
 主会话用当前可信 `tools/ios-release.mjs` / helper 复验下载的五文件、私有源码与公开 CI 双 SHA、白名单输入、包版本和高水位，再只将 `app/zeehowebnext.ipa`、`app/version2.json`、`app/icon-ios-1024.png` 移交到 `zeeho-3d-models`；图标直接取获批准源码的 `public/icons/icon-ios-1024.png`，不重新绘制。不动 Android 清单 / APK，不另建私有 IPA Release 备份；命令与失败恢复见 [iOS 发布规范](../docs/发布规范.md#ios-发布规范)。
 
-不恢复 Android CI，不出 Apple 分发签名 IPA；TrollStore 侧载是安装路线，兼容范围见 <https://github.com/opa334/TrollStore>。公开 App Group entitlement 模板不代表 Apple 授权已批准。
+不恢复 Android CI，不出 Apple 分发签名 IPA。分发的 IPA 是 ad-hoc 自签包，需要用户自行用自签工具安装；公开 App Group entitlement 模板不代表 Apple 授权已批准。
 
 ## 验证边界
 

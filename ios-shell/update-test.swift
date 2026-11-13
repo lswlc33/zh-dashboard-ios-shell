@@ -76,7 +76,8 @@ enum UpdateTest {
             ("file", "app/zeehowebnext.ipa"), ("file", "dashboard-trollstore.ipa"), ("file", "zeehowebnext.apk"),
             ("bundleIdentifier", "other.app"), ("sha256", String(repeating: "z", count: 64)),
             ("sha256", hash.uppercased()), ("sha256", String(hash.dropLast())),
-            ("architecture", "x86_64"), ("installer", "Other"), ("version", "1.bad"), ("minimumIOS", "15..4")
+            ("architecture", "x86_64"), ("installer", ""), ("installer", String(repeating: "x", count: 33)),
+            ("installer", "Troll\u{0000}Store"), ("version", "1.bad"), ("minimumIOS", "15..4")
         ] {
             var invalid = good; invalid[key] = value
             rejects { try decode(invalid).validate() }
