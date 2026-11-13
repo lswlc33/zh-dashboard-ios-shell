@@ -27,6 +27,9 @@ final class IOSHistoryService: IOSBridgeService {
         // 抬升时钟的上限。超过一年的「未来点」不像时钟偏快，更像字节损坏；
         // 若也拿来抬 now，restore 的 31 天窗口会把全部真实历史滤掉、下次保存就把文件写空。
         static let maxFutureSkewMs: Int64 = 366 * 24 * 60 * 60 * 1000
+        // KMP BatteryHistory.RETENTION_MS 的镜像（31 天）。抬钟后窗口下界必须仍覆盖最老的真实点，
+        // 否则真实历史会被整体滤空并在下一次保存时写回空档。两处必须同步改。
+        static let retentionMs: Int64 = 31 * 24 * 60 * 60 * 1000
     }
     private struct Failure: Error {
         let code: String
@@ -361,7 +364,7 @@ final class IOSHistoryService: IOSBridgeService {
             input["totalMile"] = freshVehicle ? integerValue(snapshot["odo"]) : NSNull()
             input["chargedMin"] = freshVehicle ? integerValue(snapshot["chargedMin"]) : NSNull()
             input["lock"] = freshVehicle ? integerValue(snapshot["lock"]) : NSNull()
-            evidence = rawEvidence(snapshot, sample, at: at)
+            evidence = rawEvidence(snapshot, sample, at: at, clock: clock)
             let candidate = SharedBattery()
             _ = try sharedObject(candidate.restoreJSON(json: previous.snapshot, now: clock))
             result = try sharedObject(candidate.acceptSampleJSON(json: try jsonString(input), now: clock))
@@ -407,6 +410,9 @@ final class IOSHistoryService: IOSBridgeService {
         do {
             durable = try save(candidate, request: request, expectedFingerprint: loaded.fingerprint, existed: loaded.exists)
             lastWriteError = nil; lastWriteOwner = request.owner.stableID
+            // lastError 原来只在失败时写、成功时永不清：一次 owner 撞上限之后，
+            // 即便用户清掉一辆车、后续写入全成功，status.lastError 仍然永远回「已达上限」。
+            lastError = ""
         } catch {
             lastWriteError = code(error); lastWriteOwner = request.owner.stableID
             // ⑨ owner 撞上限是本模块唯一「不是磁盘故障但用户必须知道」的失败：
@@ -461,7 +467,7 @@ final class IOSHistoryService: IOSBridgeService {
               !synthetic(sample) else { return nil }
         // 只有「本轮原始充电证据与上一条已接受采样完全相同」才敢推断状态/供电无边沿；
         // 只要有一个字段变了，就必须交给 KMP 重新判定。
-        guard let previous = known.raw, previous == rawEvidence(snapshot, sample, at: at) else { return nil }
+        guard let previous = known.raw, previous == rawEvidence(snapshot, sample, at: at, clock: now) else { return nil }
         if at <= known.pointAt {
             base["status"] = "out_of_order"; base["sampleAt"] = at
             return base
@@ -482,10 +488,17 @@ final class IOSHistoryService: IOSBridgeService {
     // vehicleOwned 是 BatterySample.parse 里唯一与时钟相关的门条件（本轮 fresh、两个 vehicleAt
     // 相等且都在本轮、与 batteryAt 相差 ≤90s）；把它算成布尔值纳入证据，
     // 这样「供电由未知变已知」也会让证据不相等，从而退回完整路径。
-    private func rawEvidence(_ snapshot: Object, _ sample: Object, at: Int64) -> RawEvidence {
+    //
+    // `clock` 必须是 KMP 实际拿到的那一个：完整路径用 restore/hydrate 的 now（可能被
+    // elevatedClock 抬高），廉价准入路径用墙钟。两者对「本轮」的上界不同，
+    // 混用会让同一份证据在两条路径上得出相反的 vehicleOwned，从而把真实边沿节流掉。
+    // 因此调用方各自传自己的 now，这里只做 `vehicleAt in 1...clock` 的判定。
+    private func rawEvidence(_ snapshot: Object, _ sample: Object, at: Int64, clock: Int64) -> RawEvidence {
         let vehicleAt = integer(snapshot["vehicleAt"]) ?? 0
         let sampleVehicleAt = integer(sample["vehicleAt"]) ?? 0
-        let vehicleOwned = snapshot["vehicleFresh"] as? Bool == true && vehicleAt > 0
+        // 与 KMP BatteryReading.kt 的 `vehicleAt in 1..now` 完全同口径：补上上界。
+        let vehicleOwned = snapshot["vehicleFresh"] as? Bool == true
+            && vehicleAt > 0 && vehicleAt <= clock
             && sampleVehicleAt == vehicleAt && abs(vehicleAt - at) <= 90_000
         // charging 字段在 RawEvidence 里是 Int（-1 表示未知），而 integer() 返回 Int64，
         // 必须显式收敛，否则 Int64 不能隐式转 Int。
@@ -656,16 +669,40 @@ final class IOSHistoryService: IOSBridgeService {
         try requireCurrent(request)
         let now = nowMillis()
         let actual = try load(request.owner, now: now)
-        guard actual.exists == clear.loaded.exists, actual.fingerprint == clear.loaded.fingerprint,
-              !actual.exists || actual.fingerprint != nil else {
-            throw Failure("history_clear_changed")         // 用户确认期间有新样本，不误清新记录。
+        // 「损坏的历史可确认后清除」原来在读取级错误上根本走不通：readFile 失败时
+        // load 返回 fingerprint == nil，而下面的 guard 要求「没有文件或 fingerprint 非空」，
+        // 于是 history_file_too_large / history_unsafe_file 一律抛 history_clear_changed，
+        // 界面却告诉用户「确认后就会删除损坏内容」。
+        //
+        // 两个额外约束（否则会伤到用户）：
+        // 1. 只允许 clear.target == "all"。弹窗时文件若可读，用户确认的可能是「只清充电记录、
+        //    电池采样保留」；提交时文件突然读不出，硬删会把被告知会保留的采样也清掉。
+        // 2. history_read_failed 不算「持久状态」：它完全可能是瞬时的 I/O / 文件保护未就绪，
+        //    先回一次可重试的错误，别把唯一一份数据隔离走。
+        let hardDelete: Bool
+        if !actual.exists && !clear.loaded.exists {
+            hardDelete = false
+        } else if clear.target == "all", actual.fingerprint == nil,
+                  let code = actual.readError, Self.isPermanentRead(code) {
+            hardDelete = true
+        } else {
+            guard actual.exists == clear.loaded.exists, actual.fingerprint == clear.loaded.fingerprint,
+                  !actual.exists || actual.fingerprint != nil else {
+                throw Failure("history_clear_changed")         // 用户确认期间有新样本，不误清新记录。
+            }
+            hardDelete = false
         }
         try checkExpectedWatermark(clear.arguments, actual)
         // 沿用本次读盘抬升过的时钟：文件里若有未来点，restore 会把它当合法数据保留，
         // 否则清 charge 的路径会先被 KMP 判成 invalid_history，清空反而失败。
         let clock = actual.effectiveNow
         let previous: StoreState
-        if let saved = actual.state { previous = saved }
+        if hardDelete {
+            // 读不出的原件先移到墓碑路径再写空档：绝不直接 unlink 用户唯一的数据，
+            // 万一之后发现是误判，文件还在（只是用户看不到）。
+            try quarantineUnreadable(request.owner, reason: actual.readError ?? "history_read_failed")
+            previous = try emptyState(request.owner, now: clock)
+        } else if let saved = actual.state { previous = saved }
         else { previous = try emptyState(request.owner, now: clock) }
         let ledger = try reduce(previous.ledger, event: ["type": "clear"], owner: request.owner, now: clock)
         let battery: SharedBattery
@@ -858,22 +895,35 @@ final class IOSHistoryService: IOSBridgeService {
     // 那比“读不出”更糟。所以超过一年的“未来”判定为损坏，不参与抬升，稍后按坏点丢弃并计入 dropped。
     private func elevatedClock(_ now: Int64, battery: Object, ledger: Object) -> Int64 {
         var maxT = now
+        var oldestT = Int64.max
         for point in (battery["records"] as? [Object]) ?? [] {
             // t 无法解析、非正数、或超前超过一年：都不参与抬升，由 sanitizeSnapshot 当坏点丢弃。
             guard let t = integer(point["t"]), t > 0, t - now <= Limit.maxFutureSkewMs else { continue }
             maxT = max(maxT, t)
+            oldestT = min(oldestT, t)
         }
         // 账本只含会话边界，同样可能落在未来；只取不超过上限的时间。
         for segment in (ledger["segments"] as? [Object]) ?? [] {
             for key in ["from", "to"] {
                 guard let t = integer(segment[key]), t > 0, t - now <= Limit.maxFutureSkewMs else { continue }
                 maxT = max(maxT, t)
+                oldestT = min(oldestT, t)
             }
         }
         if let current = ledger["current"] as? Object, let t = integer(current["from"]),
-           t > 0, t - now <= Limit.maxFutureSkewMs { maxT = max(maxT, t) }
+           t > 0, t - now <= Limit.maxFutureSkewMs { maxT = max(maxT, t); oldestT = min(oldestT, t) }
         // 只有真的存在超前点才加 1，避免普通文件把 now 抬到未来。
-        return maxT > now ? maxT + 1 : now
+        guard maxT > now else { return now }
+        let elevated = maxT + 1
+        // 抬升后窗口下界必须仍 <= 最老的真实点，否则这一抬就会把真实历史整体滤空：
+        // KMP restore 的窗口是 `t >= now - 31 天`，超前量超过 31 天（且仍小于一年）时，
+        // 真实点全部落在窗口外被静默丢弃，随后任一次成功保存（车况记录或用户清除）
+        // 就把空历史写回磁盘，而 droppedPoints 完全看不到这次丢失。
+        // 覆盖不了就不抬：宁可这一轮把未来点按坏点丢掉（计入 dropped，用户可见），
+        // 也绝不把真实历史读空写回。
+        // oldestT 缺失（没有可解析点）时没有东西会被滤掉，抬升是安全的。
+        if oldestT != Int64.max, oldestT < elevated - Limit.retentionMs { return now }
+        return elevated
     }
 
     private func ownerFileCount(_ directory: URL) -> Int {
@@ -884,6 +934,47 @@ final class IOSHistoryService: IOSBridgeService {
     // owner 文件名是 64 位 hex + .json；只有这种文件计入 12 个上限，临时文件/损坏副本不算。
     private func ownerFileCount(_ contents: [URL]) -> Int {
         contents.filter { $0.pathExtension == "json" && $0.deletingPathExtension().lastPathComponent.count == 64 }.count
+    }
+
+    /// 读取级错误里哪些是「持久状态」而不是「并发冲突」。
+    /// 只有 history_file_changed 表示读的时候文件刚被别人改过——那种要拒绝，让用户重试。
+    /// history_read_failed 刻意不在列表里：它可能是瞬时的 I/O / 文件保护未就绪，
+    /// 一旦当成持久损坏，就会把用户唯一一份数据隔离走。
+    private static func isPermanentRead(_ code: String) -> Bool {
+        ["history_file_too_large", "history_unsafe_file"].contains(code)
+    }
+
+    /// 把读不出的历史原文件移到同目录的墓碑名（`.corrupt-<stableID>`，点开头因此
+    /// 不会被 owner 计数、`files()`、清扫逻辑当成正常记录）。绝不直接删除：
+    /// 万一「读不出」是误判，原件还在，用户保住的是唯一一份数据。
+    ///
+    /// 同一 owner 只留最近一次：先删掉同 owner 的旧墓碑。文件名不再带时间戳——
+    /// 带时间戳时 `moveItem` 不会覆盖、每硬删一次就多一份最多 16MB 的墓碑，
+    /// 而 `save()` 的 diskBytes 统计会把它们算进 208MB 预算，攒够就永久 history_directory_full，
+    /// 正是这次要修的死锁形态。
+    private func quarantineUnreadable(_ owner: Owner, reason: String) throws {
+        dispatchPrecondition(condition: .onQueue(worker))
+        let directory = try historyDirectory()
+        let file = historyFile(owner, in: directory)
+        guard FileManager.default.fileExists(atPath: file.path) else { return }
+        let tombstone = directory.appendingPathComponent(".corrupt-\(owner.stableID)", isDirectory: false)
+        // 先清掉同 owner 的旧墓碑（含历史版本带时间戳的命名），保证总量只留一份。
+        if let entries = try? FileManager.default.contentsOfDirectory(
+            at: directory, includingPropertiesForKeys: nil, options: []) {
+            for entry in entries where entry.lastPathComponent.hasPrefix(".corrupt-\(owner.stableID)") {
+                try? FileManager.default.removeItem(at: entry)
+            }
+        }
+        do {
+            // 同卷 rename 是原子的：要么原名还在，要么已经完整改名，不会出现半份。
+            try FileManager.default.moveItem(at: file, to: tombstone)
+            IOSDiagnostics.shared.log("history: 读不出的历史已隔离到 \(tombstone.lastPathComponent)（\(reason)）")
+        } catch {
+            // 改名失败（跨卷/权限）时退回到「先删原文件」：用户已经确认过要清掉它，
+            // 停在这里只会让损坏历史永久卡住所有读写。
+            IOSDiagnostics.shared.log("history: 隔离失败（\(code(error))），按用户确认直接删除 \(file.lastPathComponent)")
+            try FileManager.default.removeItem(at: file)
+        }
     }
 
     private func emptyState(_ owner: Owner, now: Int64) throws -> StoreState {
@@ -917,6 +1008,11 @@ final class IOSHistoryService: IOSBridgeService {
         }
         var diskBytes: Int64 = 0
         for entry in contents {
+            // 损坏隔离墓碑（.corrupt-*）不计入预算：它是「读不出时保命的备份」，
+            // 若算进 208MB 就可能在攒了几份之后让所有正常写入永久 history_directory_full，
+            // 反而把这次要修的「损坏文件卡死读写」换了个形态复发。
+            // 每 owner 只留一份这类墓碑（见 quarantineUnreadable），总量本身就有上界。
+            if entry.lastPathComponent.hasPrefix(".corrupt-") { continue }
             var info = stat()
             guard entry.path.withCString({ Darwin.lstat($0, &info) }) == 0,
                   info.st_size >= 0, info.st_size <= Int64(Limit.diskBytes) - diskBytes else {

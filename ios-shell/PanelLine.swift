@@ -19,10 +19,20 @@ enum IOSPanelLine: String {
     /// 当前选中的线路。默认 GitHub Pages。
     /// 注意：用户一旦在更新面板里选过，就会持久化在 UserDefaults 里——
     /// 换版本后不会自动回到 GitHub，这是有意的（尊重用户选择）。
+    ///
+    /// 但「持久化的值坏掉」不能静默回默认：解析失败后 `chosen` 仍为 true（键还在），
+    /// 网页认为「用户已选过」既不提示也不弹选择页；而用户重新选 GitHub 时 `markChosen`
+    /// 又会因 `current == line && chosen` 提前 return——脏值永远留在盘上，表现为「设置丢了」。
+    /// 所以读取时顺手自愈：键存在但不是合法线路就重写成默认值，让 chosen 的语义重新可信。
     static var current: IOSPanelLine {
         get {
             let raw = UserDefaults.standard.string(forKey: defaultsKey) ?? ""
-            return IOSPanelLine(rawValue: raw) ?? .github
+            if let parsed = IOSPanelLine(rawValue: raw) { return parsed }
+            // 空串/缺失表示没选过，保持原样（chosen == false，网页会正常弹选择页）。
+            if !raw.isEmpty {
+                UserDefaults.standard.set(IOSPanelLine.github.rawValue, forKey: defaultsKey)
+            }
+            return .github
         }
         set {
             guard newValue != current else { return }

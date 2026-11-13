@@ -11,6 +11,13 @@ final class AppDelegate: UIResponder, UIApplicationDelegate {
         window.rootViewController = RootRouter()
         window.makeKeyAndVisible()
         self.window = window
+        // 临时文件清扫：Caches/native-blob-*、tmp/dashboard-system-*、tmp/native-asset-*
+        // 的唯一正常清理入口是「拿到 lease 的那一方主动释放」。复制/下载/分享途中 App 被
+        // 系统杀掉（大文件时最容易被 jetsam 选中）就留下整份目录，之后再没有任何代码看到它。
+        // IOSNativeFileStreamService.maxFileBytes 是 512MB，几次被杀的复制就能堆出上 GB。
+        // 系统虽然可以回收 Caches/tmp，但没有任何上界保证；启动时做一次有界清扫。
+        // 放在后台队列，不阻塞首帧。
+        DispatchQueue.global(qos: .utility).async { IOSTemporaryFileSweeper.sweepAtLaunch() }
         if let identifiers = launchOptions?[.bluetoothCentrals] as? [String] {
             IOSBluetoothService.shared.restoreIfRequested(identifiers)
         }

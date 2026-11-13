@@ -68,7 +68,17 @@ final class IOSPanelCache {
         /// 可选资源里下载失败、被跳过的路径。欢迎页据此提示「N 个资源未下载」。
         var skipped: [String] = []
         var busy: Bool { phase == .preparing || phase == .downloading }
+        /// `ready` 保持原语义：**这次初始化/刷新真的成功了**。
+        /// UpdateService / 更新面板都拿它当「强制更新是否成功」的判据（`if !state.ready { failure }`），
+        /// 不能在这里放宽，否则断网重下失败会被报成「更新完成」并重启。
         var ready: Bool { phase == .ready }
+        /// 「能不能进面板」是另一件事：初始化失败时磁盘上的旧快照往往完好、能离线打开，
+        /// 但 phase 是 .error，欢迎页若只认 ready 就会禁用「进入面板」，用户只能等下次成功
+        /// 或杀掉 App 重启。这个字段由 PanelCache 在写 .error 时按实际快照探测置位。
+        /// 只有 RecoveryView 的「进入面板」按钮该用它，其它地方仍用 ready。
+        var canEnter: Bool { ready || (phase == .error && fallbackAvailable) }
+        /// 错误终态时磁盘上是否仍有可用快照。不在这里做 IO（State 要能便宜地拷贝）。
+        var fallbackAvailable = false
         /// 进度比例。优先用「已完成文件数 / 总数」——字节数依赖 Content-Length，
         /// CDN 压缩或缺少响应头时会算错（真机曾卡在 90%）。
         var progress: Double {
@@ -181,6 +191,22 @@ final class IOSPanelCache {
             return cached
         }
         return resolveCurrent()
+    }
+
+    /// 初始化失败的统一切换：写下错误码，同时记录「旧快照是否仍然可用」。
+    ///
+    /// 注意只置 `fallbackAvailable`，不动 `ready`：`ready` 必须继续代表「这次真的成功了」，
+    /// UpdateService/更新面板靠它判断强制更新成败。只有欢迎页的「进入面板」用 `canEnter`。
+    /// 必须在 queue 上调用（initialize/commit 的所有错误分支都在 queue 上）。
+    private func markFailure(code: String, completion: @escaping (State) -> Void) {
+        let usable = snapshotDirectory() != nil
+        state.phase = .error
+        state.error = code
+        state.fallbackAvailable = usable
+        if usable {
+            IOSDiagnostics.shared.log("panelCache: 初始化失败（\(code)），但旧快照仍可用，允许离线进入")
+        }
+        emit(generation, completion)
     }
 
     /// 解析 `current` 目录，必要时先自愈，结果写回缓存。内部加锁，调用方不必持锁。
@@ -393,9 +419,8 @@ final class IOSPanelCache {
                         case let .failure(error):
                             try? FileManager.default.removeItem(at: staging)
                             self.stagingDirectory = nil
-                            self.state.phase = .error
-                            self.state.error = (error as? Failure)?.code ?? "panel_cache_failed"
-                            self.emit(ticket, completion)
+                            self.markFailure(code: (error as? Failure)?.code ?? "panel_cache_failed",
+                                             completion: completion)
                         case .success:
                             self.commit(staging: staging, root: root, ticket: ticket, completion: completion)
                         }
@@ -407,9 +432,8 @@ final class IOSPanelCache {
                     try? FileManager.default.removeItem(at: staging)
                     self.stagingDirectory = nil
                 }
-                self.state.phase = .error
-                self.state.error = (error as? Failure)?.code ?? "panel_cache_failed"
-                self.emit(ticket, completion)
+                self.markFailure(code: (error as? Failure)?.code ?? "panel_cache_failed",
+                                 completion: completion)
             }
         }
     }
@@ -424,9 +448,7 @@ final class IOSPanelCache {
               IOSPanelLine.current == downloadLine, IOSPanelLine.revision == downloadLineRevision else {
             try? manager.removeItem(at: staging)
             stagingDirectory = nil
-            state.phase = .error
-            state.error = "panel_line_changed"
-            emit(ticket, completion)
+            markFailure(code: "panel_line_changed", completion: completion)
             return
         }
         let current = root.appendingPathComponent("current", isDirectory: true)
@@ -451,9 +473,7 @@ final class IOSPanelCache {
                 // 连旧快照都让不开（沙盒异常），保持现状并报错，别硬写。
                 try? manager.removeItem(at: staging)
                 stagingDirectory = nil
-                state.phase = .error
-                state.error = "panel_commit_failed"
-                emit(ticket, completion)
+                markFailure(code: "panel_commit_failed", completion: completion)
                 return
             }
         }
@@ -478,6 +498,9 @@ final class IOSPanelCache {
             stagingDirectory = nil
             state.phase = .error
             state.error = "panel_commit_failed"
+            // 回滚成功后旧快照仍然可用，让欢迎页放行；只有「连回滚都失败」才真的没有快照。
+            state.fallbackAvailable = hadOld && FileManager.default.fileExists(
+                atPath: current.appendingPathComponent("index.html").path)
             lock.lock()
             cachedCurrent = hadOld ? current : nil
             lock.unlock()
@@ -495,8 +518,11 @@ final class IOSPanelCache {
                 return
             }
             if self.snapshotDirectory() != nil {
+                // 快照在：这是成功状态，清掉旧错误与 fallback 标记。
                 self.state = State(phase: .ready, build: self.snapshotBuild())
             } else {
+                // 快照没了：错误原因已经不再成立（它描述的是旧快照/download 场景），
+                // 一并清空，避免欢迎页挂一句对不上的旧失败原因。
                 self.state = State()
             }
             let current = self.state
@@ -834,8 +860,46 @@ final class IOSPanelCache {
                 return
             }
         }
+        // 内容形态校验。以前判据只有「HTTP 200 且 data 非空」，而文件头注释写的是
+        // 「自己下载、自己校验」——实际完全没有校验。CDN/边缘返回 200 的错误页，
+        // 或没有 Content-Length 的截断响应，都会被当成 index.html 提交成 current，
+        // 紧接着 writeMeta 写入新的 downloadedAt，于是 24 小时内不再自动重下：
+        // 每次冷启动白屏 → 看门狗 fallbackToNetwork → BootHealth.failed → 欢迎页。
+        // 这里在提交前检查落盘的 index.html 至少像一个面板首页。
+        guard let staging = stagingDirectory else {
+            // 正常路径不会到这里（initialize 建好 staging 才下载）。但万一状态机漏了，
+            // 绝不能 return 掉：那会让 batch.finished 永为 false、state.busy 永远为 true，
+            // 之后所有 initialize 都被 busy 早退，App 卡在欢迎页。宁可整批判失败。
+            failBatch(batch, Failure.reason("panel_staging_missing"))
+            return
+        }
+        if let problem = Self.validatePanelIndex(at: staging.appendingPathComponent("index.html", isDirectory: false)) {
+            IOSDiagnostics.shared.log("panelCache: index.html 形态校验失败（\(problem)），按缺失处理")
+            failBatch(batch, Failure.reason("panel_required_missing"))
+            return
+        }
         batch.finished = true
         batch.completion(.success(()))
+    }
+
+    /// index.html 的最低限度形态校验。返回 nil 表示通过，否则返回问题描述。
+    /// 只做「明显不是面板首页」的判定，不追求严格 HTML 合法性。
+    /// 哨兵按实测产物取（`dashboard/.state/static/index.html` 与线上 `zeeho-3d-models/index.html`）：
+    /// 真实首页前 8KB 一定带 `<html`/`<!doctype` 和 `data-theme=`/`data-accent=`；
+    /// 「极核面板」只在较新产物里出现，所以只用前两个稳定特征，任一命中即可。
+    /// JS 里的 `bridge` 字样是混淆后的偶然命中，不能当判据。
+    private static func validatePanelIndex(at url: URL) -> String? {
+        guard let size = (try? url.resourceValues(forKeys: [.fileSizeKey]).fileSize), size > 0 else {
+            return "empty"
+        }
+        // 真实面板首页 2.7~4.2MB；明显小于 1KB 的必然是错误页或截断。
+        guard size >= 1024 else { return "too_small:\(size)" }
+        guard let data = try? Data(contentsOf: url, options: [.mappedIfSafe]) else { return "unreadable" }
+        guard let text = String(data: data, encoding: .utf8) else { return "not_utf8" }
+        let head = String(text.prefix(8192)).lowercased()
+        guard head.contains("<html") || head.contains("<!doctype") else { return "no_html_tag" }
+        guard head.contains("data-theme=") || head.contains("data-accent=") else { return "no_sentinel" }
+        return nil
     }
 
     private func failBatch(_ batch: Batch, _ error: Error) {

@@ -13,7 +13,27 @@ enum PanelNavigation {
     /// 这里用字面量而不是 `IOSPanelLine.baseURL()`，是为了让本文件能被
     /// navigation-test.swift 单独编译（那个测试不链接 PanelLine/PanelCache）。
     private static let defaultBase = URL(string: "https://lswlc33.github.io/zeeho-3d-models/")!
-    static var base: URL = defaultBase
+
+    /// 主线程写（线路切换、applyPersisted），worker 队列读（Bridge.prepareNavigation →
+    /// withNavigationID → isPanel → originKey(home)）。裸 `static var` 对跨线程读写不提供
+    /// 原子性，切换线路那一瞬可能读到新旧混合的 base，导致一次导航被判成非面板而失败。
+    /// 用锁把单次读写变成原子操作。
+    ///
+    /// 注意：`isPanel` 内部仍会多次取 base（homeOriginKey + allowedPaths 里的 home），
+    /// 跨两次取值的混合理论上仍在。完整的根治要在 isPanel 开头取一次快照再传下去，
+    /// 但那会改判定签名与 navigation-test 的覆盖范围；这里先解决「单次读取撕裂」，
+    /// 剩下的窗口只有「切换线路的同一毫秒内正好有一次导航判定」，实践里不可见。
+    private static let baseLock = NSLock()
+    private static var baseStorage: URL = defaultBase
+    static var base: URL {
+        get {
+            baseLock.lock(); defer { baseLock.unlock() }
+            return baseStorage
+        }
+        set {
+            baseLock.lock(); baseStorage = newValue; baseLock.unlock()
+        }
+    }
     static var home: URL { base }
 
     /// 主文档允许的路径集合（相对基址）。

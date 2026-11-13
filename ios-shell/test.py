@@ -242,7 +242,12 @@ def main():
     assert 'IOSStrings.recoveryTitle' in recovery and 'IOSStrings.recoverySubtitle' in recovery
     assert 'initializeButton.isHidden = cancellable' in recovery
     assert 'cancelButton.isHidden = !cancellable' in recovery
-    assert 'enterButton.isEnabled = ready && !busy' in recovery
+    assert 'enterButton.isEnabled = state.canEnter && !busy' in recovery
+    # 上面这条用 canEnter 而非 ready：ready 代表「这次初始化成功了」，UpdateService 与
+    # 更新面板靠它判断强制更新成败，不能放宽；而初始化失败时磁盘上的旧快照往往仍可用
+    # （State.fallbackAvailable），此时欢迎页应当允许离线进入。
+    assert 'var canEnter: Bool { ready || (phase == .error && fallbackAvailable) }' in \
+        (root / 'PanelCache.swift').read_text(encoding='utf-8')
     # 初始化进度走推送而不是轮询。
     assert 'IOSPanelCache.shared.onState' in recovery
     # 「版本与更新」打开独立面板，不再是 Alert。

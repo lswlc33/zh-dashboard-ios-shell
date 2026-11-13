@@ -424,6 +424,9 @@ final class RecoveryViewController: UIViewController {
         cacheState = state
         let busy = state.busy
         let ready = state.ready
+        // 文案/按钮的「可以用」语义统一走 canEnter（含「失败但旧快照可用」），
+        // 而 ready 只用于「这次初始化成功了」相关的判断（如按钮文案「重新初始化」）。
+        let usable = state.canEnter
 
         // 百分比一律走 state.progress（以「已完成文件数」为主），
         // 不再自己拿 done/total 算——Content-Length 在 CDN 压缩时不可信，
@@ -431,7 +434,7 @@ final class RecoveryViewController: UIViewController {
         if state.phase == .downloading {
             let percent = max(0, min(100, Int(state.progress * 100)))
             statusLabel.text = String(format: IOSStrings.recoveryStatusProgress, percent)
-        } else if ready {
+        } else if usable {
             statusLabel.text = IOSStrings.recoveryStatusDone
         } else {
             statusLabel.text = IOSStrings.recoveryStatusPending
@@ -449,7 +452,13 @@ final class RecoveryViewController: UIViewController {
             bytesLabel.text = String(format: IOSStrings.recoveryResourceProgress,
                                      state.completedFiles, max(1, state.resourceCount), detail)
         } else {
-            bytesLabel.text = ready ? IOSStrings.recoveryReadyHint : ""
+            // ready 时把「缺了 N 个可选资源」说出来：State.skipped 的注释一直承诺这条提示，
+            // 但之前没有任何界面读它，用户只看到「已就绪」，缺图标/清单时毫无线索。
+            if usable, !state.skipped.isEmpty {
+                bytesLabel.text = IOSStrings.recoverySkippedHint(state.skipped.count)
+            } else {
+                bytesLabel.text = usable ? IOSStrings.recoveryReadyHint : ""
+            }
         }
         bytesLabel.isHidden = (bytesLabel.text ?? "").isEmpty
 
@@ -475,10 +484,15 @@ final class RecoveryViewController: UIViewController {
         cancelButton.isHidden = !cancellable
         initializeButton.isEnabled = !busy
         var config = initializeButton.configuration
-        config?.title = ready ? IOSStrings.recoveryReinitialize : IOSStrings.recoveryInitialize
+        // 「重新初始化」看的是磁盘上有没有快照（usable），而不是这次初始化成不成功：
+        // 失败但有旧快照时，用户要做的正是「再初始化一次」。
+        config?.title = usable ? IOSStrings.recoveryReinitialize : IOSStrings.recoveryInitialize
         initializeButton.configuration = config
 
-        enterButton.isEnabled = ready && !busy
+        // 按钮只认「能不能进」，不认「这次初始化是否成功」：
+        // 初始化失败时磁盘上的旧快照往往完好、能离线打开，此时仍应允许进入；
+        // 而 `state.ready` 被 UpdateService/更新面板用来判断强制更新成败，不能在这里放宽。
+        enterButton.isEnabled = state.canEnter && !busy
     }
 
     private func reasonMessage() -> String {

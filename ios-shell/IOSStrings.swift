@@ -64,10 +64,11 @@ enum IOSStrings {
     static let rideRecordMessage = "骑行记录会保存真实手机位置和当前可见的蓝牙车辆状态，仅保存在本机。不会自动连接或认证车辆；后台继续记录仍取决于你允许的位置权限和 iOS 调度，取消后不启动。"
     static let rideDeleteTitle = "删除所选骑行记录"
     static let rideDeleteMessage = "只删除你选中的本机骑行记录，不删除其他车辆的记录。删除后无法恢复，请确认这些记录不再需要。"
-    static let systemSnapshotTitle = "在系统表面显示车辆快照"
-    static let systemSnapshotMessage = "只把当前车辆的简单名称、车架号尾号、已知电量和充电状态，以及你主动录制的骑行速度与时长，保存到本机共享区供小组件和实时活动显示。不会保存登录凭据、车主身份或精确位置；锁屏可能显示这些状态，过期数据会标出最后更新时间。不会偷偷查询车辆，切换账号或车辆会清理旧快照。"
+    // 小组件默认共享，不再有首次启用确认框；这条文案保留给设置页说明用途。
+    static let systemSnapshotTitle = "系统表面显示车辆快照"
+    static let systemSnapshotMessage = "只把当前主页车辆的简单名称、车架号尾号、已知电量和充电状态，以及你主动录制的骑行速度与时长，保存到本机共享区供小组件和实时活动显示。不会保存登录凭据、车主身份或精确位置；锁屏可能显示这些状态，过期数据会标出最后更新时间。不会偷偷查询车辆，切换账号或车辆会清理旧快照。"
     static let systemSnapshotDisableTitle = "关闭 iOS 系统显示"
-    static let systemSnapshotDisableMessage = "结束当前车辆的实时活动，并清除小组件共享快照。后续前台同步和骑行记录不会继续发布系统快照，直到你再次主动启用；不会停止骑行记录、删除历史或执行车控。"
+    static let systemSnapshotDisableMessage = "结束当前车辆的实时活动，并清除小组件共享快照。之后前台同步和骑行记录不再发布系统快照，桌面小组件会显示暂无数据，直到你再次开启；不会停止骑行记录、删除历史或执行车控。"
     static let liveActivityStartTitle = "开启 iOS 实时活动"
     static let liveActivityStartMessage = "在锁屏显示当前车辆的已知状态或你主动开始的骑行记录，只使用已同步的数据。支持的设备是否显示灵动岛由 iOS 决定；这不是普通通知，不申请推送权限，也不保证后台持续更新。只有你点击继续后才开启，同时允许为此车辆保存不含凭据和精确位置的共享快照。"
     static let liveActivityEndTitle = "结束 iOS 实时活动"
@@ -89,6 +90,11 @@ enum IOSStrings {
     static let recoveryCancel = "取消本次任务"
     static let recoveryEnter = "进入面板"
     static let recoveryReadyHint = "面板资源已就绪，可以进入。"
+    /// 可选资源缺了 N 个。原来 `State.skipped` 的注释承诺欢迎页会提示，但没有任何界面读它，
+    /// 用户只看到「已完成/已就绪」，缺的图标或清单 404 时毫无线索。
+    static func recoverySkippedHint(_ count: Int) -> String {
+        "面板资源已就绪，但有 \(count) 个可选资源未下载（缺图标或清单时个别页面可能显示不全）。"
+    }
     static let recoveryVersionTitle = "版本与更新"
     static let recoveryBackupTitle = "备份与迁移"
     static let recoveryAppVersionLabel = "iOS App 版本"
@@ -181,6 +187,9 @@ enum IOSStrings {
     static let diagnosticsCopied = "已复制"
     static let diagnosticsLoading = "日志还在读取，请稍候再试。"
     static let diagnosticsEmpty = "（暂无日志）"
+    /// 日志文件不存在：说明日志通道坏了（用户可能在文件 App 里删过或替换过），
+    /// 与「这次真的没写」必须区分，否则会把故障伪装成正常。
+    static let diagnosticsMissing = "（日志文件不存在，可能已被删除或替换；之后的新日志会自动重建文件）"
 
 
     static let invalidArguments = "原生操作参数不正确，请重新打开页面后再试。"

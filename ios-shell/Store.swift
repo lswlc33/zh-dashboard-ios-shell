@@ -118,10 +118,20 @@ final class IOSStore {
             var excluded = URLResourceValues()
             excluded.isExcludedFromBackup = true
             var privateDirectory = directory
-            try privateDirectory.setResourceValues(excluded)
+            // 「排除 iCloud 备份」只是备份策略，与能不能解密无关。原来这一步抛错会直接
+            // 掉进下面的 catch，把整个加密存储判成 readError —— key 和档都完好，用户却
+            // 所有读写被禁。失败只记日志，继续加载。
+            do {
+                try privateDirectory.setResourceValues(excluded)
+            } catch {
+                IOSDiagnostics.shared.log("store: 目录排除备份属性设置失败（\(error.localizedDescription)），继续加载")
+            }
             self.directory = directory
             let file = directory.appendingPathComponent("store-v1.aesgcm", isDirectory: false)
             archiveURL = file
+            // 崩溃遗留的 .store-*.tmp（rename 前被杀）会一直占着沙盒体积：
+            // 每次最多约 16MB，反复崩溃就无界累积。加载时顺手清掉，只动这个前缀。
+            sweepTemporaryFiles(in: directory)
             let exists = manager.fileExists(atPath: file.path)
             // 未确认无原档时绝不生成新密钥，否则原档会永远无法解密。
             key = try loadKey(archiveExists: exists)
@@ -152,6 +162,28 @@ final class IOSStore {
         } catch {
             values = [:]
             readError = (error as? Failure)?.code ?? "store_corrupt_or_locked"
+        }
+    }
+
+    /// 清理崩溃遗留的临时档（`.store-<uuid>.tmp`）。
+    /// 正常路径的 defer 会删自己那一份，但进程在 rename 前被杀就没人收尾：
+    /// 每次最多约 maxPlainBytes + GCM 头（≈16MB），反复崩溃会无界累积。
+    /// 只删这个前缀 + 非目录 + 非符号链接，绝不碰 store-v1.aesgcm 本身。
+    private func sweepTemporaryFiles(in directory: URL) {
+        let manager = FileManager.default
+        guard let entries = try? manager.contentsOfDirectory(
+            at: directory,
+            includingPropertiesForKeys: [.isRegularFileKey, .isSymbolicLinkKey],
+            // 不能跳过隐藏文件：临时档名是 `.store-<uuid>.tmp`，本身就是点开头的。
+            // 按常规过滤隐藏文件等于把要清的东西全滤掉，永远清不到。
+            options: []) else { return }
+        for entry in entries {
+            let name = entry.lastPathComponent
+            guard name.hasPrefix(".store-"), name.hasSuffix(".tmp") else { continue }
+            guard let values = try? entry.resourceValues(forKeys: [.isRegularFileKey, .isSymbolicLinkKey]),
+                  values.isRegularFile == true, values.isSymbolicLink != true else { continue }
+            guard (try? manager.removeItem(at: entry)) != nil else { continue }
+            IOSDiagnostics.shared.log("store: 清理崩溃遗留临时档 \(name)")
         }
     }
 

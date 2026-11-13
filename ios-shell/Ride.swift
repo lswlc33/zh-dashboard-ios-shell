@@ -223,18 +223,22 @@ private enum IOSRideDisk {
         guard data.count <= maxFileBytes else { throw Failure("record_limit_reached") }
         let target = try url(owner: owner, id: id, create: true)
         let siblings = try files(owner: owner)
-        guard siblings.contains(target) || siblings.count < maxFiles else { throw Failure("storage_limit_reached") }
+        // 分档错误码：只有「删掉本 owner 的旧记录就能腾出空间」的那几种才允许回收。
+        // 原来它们都叫 storage_limit_reached，回收器不分青红皂白删 8 条，
+        // 撞到 owner 数上限（64 个目录）时删再多也修不好，白删真实历史。
+        guard siblings.contains(target) || siblings.count < maxFiles else { throw Failure("owner_storage_full") }
         var bytes = 0
         for item in siblings where item != target {
             bytes += try item.resourceValues(forKeys: [.fileSizeKey]).fileSize ?? 0
         }
-        guard bytes + data.count <= maxOwnerBytes else { throw Failure("storage_limit_reached") }
+        guard bytes + data.count <= maxOwnerBytes else { throw Failure("owner_storage_full") }
         let root = target.deletingLastPathComponent().deletingLastPathComponent()
         let targetDirectory = target.deletingLastPathComponent().path
         let targetSize = (try? target.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0
         let stamp = Date()
         var total = 0
         let scopes = try FileManager.default.contentsOfDirectory(at: root, includingPropertiesForKeys: [.isDirectoryKey, .isSymbolicLinkKey], options: [.skipsHiddenFiles])
+        // 目录数触顶：这是全局身份数量上限，删本 owner 的记录毫无帮助。
         guard scopes.count <= maxOwners else { throw Failure("storage_limit_reached") }
         for scope in scopes {
             let attributes = try scope.resourceValues(forKeys: [.isDirectoryKey, .isSymbolicLinkKey])
@@ -247,6 +251,7 @@ private enum IOSRideDisk {
                 scopeBytes = cached
             } else {
                 let entries = try FileManager.default.contentsOfDirectory(at: scope, includingPropertiesForKeys: [.fileSizeKey], options: [.skipsHiddenFiles])
+                // 别的 owner 目录塞满文件：删本 owner 的记录也修不好。
                 guard entries.count <= maxFiles + 1 else { throw Failure("storage_limit_reached") }
                 var sum = 0
                 for item in entries { sum += try item.resourceValues(forKeys: [.fileSizeKey]).fileSize ?? 0 }
@@ -256,7 +261,8 @@ private enum IOSRideDisk {
             total += max(0, scopeBytes - (key == targetDirectory ? targetSize : 0))
         }
         // 之前是边加边判，现在按目录聚合后再判：同等拒绝能力，但少了一堆 syscall。
-        guard total + data.count <= maxTotalBytes else { throw Failure("storage_limit_reached") }
+        // 全库总量触顶同样是「删本 owner 的旧记录可以缓解」，所以也归 owner_storage_full。
+        guard total + data.count <= maxTotalBytes else { throw Failure("owner_storage_full") }
         if FileManager.default.fileExists(atPath: target.path) {
             let attributes = try target.resourceValues(forKeys: [.isRegularFileKey, .isSymbolicLinkKey])
             guard attributes.isRegularFile == true, attributes.isSymbolicLink != true else { throw Failure("unsafe_storage_path") }
@@ -394,7 +400,8 @@ private enum IOSRideDisk {
     }
 
     static func list(owner: String) throws -> [String: Any] {
-        let entries = try files(owner: owner).sorted { a, b in
+        let allFiles = try files(owner: owner)
+        let entries = allFiles.sorted { a, b in
             let aDate = (try? a.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate) ?? .distantPast
             let bDate = (try? b.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate) ?? .distantPast
             return aDate > bDate
@@ -404,10 +411,15 @@ private enum IOSRideDisk {
         var error = ""
         var used = 0
         var failed = 0
+        // 列表上限（30 条）曾完全不对外标注：第 31 条及更旧的记录在 App 内既看不见也删不掉，
+        // 却继续占预算；`storage.files` 报真实文件数，用户会看到「50 files 却只列出 30 条」。
+        // 现在显式回报被截断的条数与总数，网页才能提示「还有 N 条更旧记录」并给删除入口。
+        let listLimit = 30
+        var truncated = 0
         for item in entries {
             let size = try item.resourceValues(forKeys: [.fileSizeKey]).fileSize ?? 0
             used += size
-            guard summaries.count < 30 else { continue }
+            guard summaries.count < listLimit else { truncated += 1; continue }
             guard size <= remaining else { if error.isEmpty { error = "records_parse_limit" }; failed += 1; continue }
             remaining -= size
             guard let id = UUID(uuidString: item.deletingPathExtension().lastPathComponent) else { continue }
@@ -419,17 +431,30 @@ private enum IOSRideDisk {
         // 只有目录里确实有文件、却一条都读不出来时才判失败——否则网页会当成「记录被清空」。
         let nothingReadable = used > 0 && summaries.isEmpty && failed > 0
         return ["ok": !nothingReadable, "records": summaries, "recordsReady": true, "recordsError": error,
-                "storage": ["files": entries.count, "bytes": used, "maxFiles": maxFiles,
-                            "maxOwnerBytes": maxOwnerBytes, "maxFileBytes": maxFileBytes, "maxSamples": maxSamples],
+                // truncated：因为 30 条展示上限而没出现在 records 里的条数。
+                "truncated": truncated, "totalRecords": entries.count, "listLimit": listLimit,
+                "storage": ["files": allFiles.count, "bytes": used, "maxFiles": maxFiles,
+                            "maxOwnerBytes": maxOwnerBytes, "maxTotalBytes": maxTotalBytes,
+                            "maxFileBytes": maxFileBytes, "maxSamples": maxSamples],
                 "partial": !nothingReadable && !error.isEmpty]
     }
 
     /// 启动扫盘：找出本 owner 目录里 endedAt 为空的历史文件（上次录制被系统杀掉/崩溃）。
     /// 只做提示，不自动续记——没有活跃的 Location/Bluetooth 上下文，续记会写出假样本。
     /// 这里刻意只做浅解析：init 阶段不该为几十个文件跑完整样本校验。
+    ///
+    /// 限制用「条数」而不是按字节 break：`files()` 是目录原始顺序，按字节 break 时
+    /// 每次都在同一批文件上耗尽预算，后面的孤儿永远看不到，「剩下的下次再扫」也就不成立。
+    /// 现在只扫最近修改的 scanEntries 条——录制中被杀留下的孤儿通常就是最近这几条。
     static func orphans(owner: String) throws -> [Orphan] {
         var result: [Orphan] = []
-        for item in try files(owner: owner) {
+        let scanEntries = 40
+        let sorted = try files(owner: owner).sorted { a, b in
+            let aDate = (try? a.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate) ?? .distantPast
+            let bDate = (try? b.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate) ?? .distantPast
+            return aDate > bDate
+        }
+        for item in sorted.prefix(scanEntries) {
             guard result.count < maxFiles else { break }
             guard let size = try item.resourceValues(forKeys: [.fileSizeKey]).fileSize, size > 0, size <= maxFileBytes,
                   let data = try? Data(contentsOf: item),
@@ -448,6 +473,58 @@ private enum IOSRideDisk {
         let attributes = try target.resourceValues(forKeys: [.isRegularFileKey, .isSymbolicLinkKey])
         guard attributes.isRegularFile == true, attributes.isSymbolicLink != true else { throw Failure("unsafe_storage_path") }
         try FileManager.default.removeItem(at: target)
+        // 删完立刻作废用量缓存：否则 60 秒内的旧值仍按「删之前」的偏大体积拒绝下一次写入。
+        usagesInvalidate(target.deletingLastPathComponent().path)
+    }
+
+    /// 预算/文件数触顶时的回收：删本 owner 目录里最旧的「已完成」记录，给当前这趟腾地方。
+    ///
+    /// 为什么需要它：这批上限（64MB/owner、256MB/全库、100 文件）都是硬墙，而原来全库
+    /// 唯一删除入口只有用户手动 `ride.delete`。按 1 小时 ≈ 3MB 算，同一账号累计约 20 小时
+    /// 骑行就撞到 64MB，此后每一趟都从第一条 checkpoint 就写不进去，
+    /// 整趟只活在内存里、进程一死全丢。自动回收最旧的已完成记录是唯一能保住当前这趟的做法。
+    ///
+    /// 只删 `endedAt` 非空的文件（真正收尾过）。`endedAt` 为空的是崩溃/被杀留下的，
+    /// 还要靠 `orphans()` 提示用户处理，绝不能在这里悄悄删掉。
+    /// 目标文件自身永远不动（那就是正在录的这趟）。单次最多删 8 条，避免一次失败把历史清空。
+    @discardableResult
+    static func evictOldestFinished(owner: String, protecting id: UUID) -> Int {
+        let manager = FileManager.default
+        guard let target = try? directory(owner: owner, create: false),
+              manager.fileExists(atPath: target.path),
+              // files() 在条目超上限时会自己抛错，回收本身必须绕过那道闸，所以这里单独列目录。
+              let entries = try? manager.contentsOfDirectory(
+                at: target,
+                includingPropertiesForKeys: [.isRegularFileKey, .isSymbolicLinkKey, .contentModificationDateKey],
+                options: [.skipsHiddenFiles]) else { return 0 }
+        let protectedName = id.uuidString.lowercased() + ".json"
+        // 函数内声明无捕获的局部结构：不走命名空间，也不会影响文件里其他类型。
+        var candidates: [(url: URL, modified: Date)] = []
+        for item in entries {
+            guard item.lastPathComponent != protectedName, item.pathExtension == "json",
+                  let uuid = UUID(uuidString: item.deletingPathExtension().lastPathComponent),
+                  item.lastPathComponent == uuid.uuidString.lowercased() + ".json",
+                  let values = try? item.resourceValues(forKeys: [.isRegularFileKey, .isSymbolicLinkKey, .contentModificationDateKey]),
+                  values.isRegularFile == true, values.isSymbolicLink != true else { continue }
+            // 浅解析只为确认「这趟确实收尾过」，与 orphans() 同口径；不为几十个文件跑完整校验。
+            guard let data = try? Data(contentsOf: item),
+                  let record = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                  record["endedAt"] != nil, !(record["endedAt"] is NSNull) else { continue }
+            candidates.append((url: item, modified: values.contentModificationDate ?? .distantPast))
+        }
+        // 最旧的先删：用户最先忘掉的那趟，损失最小。
+        candidates.sort { $0.modified < $1.modified }
+        var removed = 0
+        for candidate in candidates {
+            guard (try? manager.removeItem(at: candidate.url)) != nil else { continue }
+            removed += 1
+            if removed >= 8 { break }
+        }
+        if removed > 0 {
+            // 删完统一作废一次：回收后仍按旧的偏大值拒绝下一趟就白删了。
+            usagesInvalidate(target.path)
+        }
+        return removed
     }
 }
 
@@ -546,6 +623,12 @@ final class IOSRideService: NSObject, IOSBridgeService, IOSBridgeCancellableServ
         var bleSamples = 0
         var lastGPSSequence: Int64 = 0
         var lastBLESequence: Int64 = 0
+        /// 已接受样本的最大 at（GPS/BLE 各自一条）。写入侧把时间戳夹成不减：
+        /// 读取侧 `read()` 要求每个数组内 `at` 单调不减，而墙钟被 NTP/手动回拨时新样本会带更小的 at，
+        /// 一旦写进文件，这条记录就永远 `invalid_record`、被 list 静默跳过且 orphans 也不认它。
+        /// 宁可把回拨期间的样本压到上一条的时间点，也不能让整份记录隐身。
+        var lastGPSPointAt: Int64 = 0
+        var lastBLEPointAt: Int64 = 0
         var lastGPSUptime: TimeInterval?
         var lastBLEUptime: TimeInterval?
         var gapReasons: [String: String] = [:]
@@ -566,6 +649,16 @@ final class IOSRideService: NSObject, IOSBridgeService, IOSBridgeCancellableServ
         var saveFailed = false
         /// 结束保存已经自动重试过一次；再失败才真正置 save_failed。
         var saveRetried = false
+        /// checkpoint 连续失败次数。以前任意一次失败就永久置 saveFailed、之后所有 checkpoint 全跳过，
+        /// 一次瞬时故障（磁盘压力、文件保护未就绪）就把「最多丢 15 秒」变成「从失败点起全部不落盘」。
+        /// 现在按次数退避重试：失败后保留 dirty，下一次 tick 再试；只有连续失败到上限才真的放弃。
+        var checkpointFailures = 0
+        /// 下一次允许重试 checkpoint 的时刻（systemUptime）。退避 15s → 30s → 60s，封顶 60s。
+        var checkpointRetryAt: TimeInterval = 0
+        /// 本趟是否已经尝试过「回收最旧记录腾地方」。只允许一次：
+        /// 撞的是 owner 数上限（64 个目录）或别的 owner 目录文件数墙时，删自己的记录根本修不好，
+        /// 每 15s 删 8 条就会把真实历史删空而保存依旧失败。一次回收后仍失败就交给退避/判死。
+        var evictionAttempted = false
         var savedBytes = 0
         /// 0 采样的终态标记：没有文件可写，但这条记录已经收尾（saved 必须为 true）。
         var empty = false
@@ -877,6 +970,11 @@ final class IOSRideService: NSObject, IOSBridgeService, IOSBridgeCancellableServ
         guard admit(run, bytes: 480) else { return }
         run.lastGPSSequence = fix.sequence
         var point = fix.json(includeCoordinates: true)
+        // 写入侧夹紧：读取侧要求数组内 at 单调不减，墙钟回拨时不能让更小的时间戳进文件。
+        // 距离计算仍用原始 fix（accumulateDistance 读 run.lastRoute），不受夹紧影响。
+        let gpsAt = max(fix.at, run.lastGPSPointAt)
+        point["at"] = gpsAt
+        run.lastGPSPointAt = gpsAt
         point["elapsedMs"] = Int64(max(0, fix.receivedUptime - run.startedUptime - fix.ageAtReceipt) * 1000)
         run.rawGPS.append(point)
         run.gpsSamples += 1
@@ -945,8 +1043,12 @@ final class IOSRideService: NSObject, IOSBridgeService, IOSBridgeCancellableServ
             run.latestBLEUptimes[key] = sample.receivedUptime
         }
         run.latestBLEFields = IOSRideJSON.fields(sample.fields)
-        let times = Dictionary(uniqueKeysWithValues: clean.keys.map { ($0, sample.at) })
-        run.telemetry.append(["at": sample.at, "seq": sample.sequence,
+        // 与 GPS 同理：读取侧要求数组内 at 单调不减。实时读数仍用真实 sample.at 判新鲜度
+        // （latestBLETimes 见上），只有落盘样本夹紧，避免墙钟回拨把整条记录写成 invalid_record。
+        let bleAt = max(sample.at, run.lastBLEPointAt)
+        run.lastBLEPointAt = bleAt
+        let times = Dictionary(uniqueKeysWithValues: clean.keys.map { ($0, bleAt) })
+        run.telemetry.append(["at": bleAt, "seq": sample.sequence,
             "elapsedMs": Int64(max(0, sample.receivedUptime - run.startedUptime) * 1000),
             "source": sample.source, "connectionGeneration": sample.connectionGeneration.uuidString.lowercased(),
             "values": clean, "times": times, "fields": IOSRideJSON.fields(sample.fields)])
@@ -1283,31 +1385,54 @@ final class IOSRideService: NSObject, IOSBridgeService, IOSBridgeCancellableServ
     }
 
     private func checkpoint(_ run: Run, force: Bool) {
-        guard active === run, !run.ending, run.samples > 0, run.checkpointDirty, !run.checkpointing, !run.saveFailed else { return }
+        guard active === run, !run.ending, run.samples > 0, run.checkpointDirty, !run.checkpointing else { return }
         let now = ProcessInfo.processInfo.systemUptime
+        // 只有连续失败到上限才真的停掉这条线；单次失败走下面的退避重试。
+        guard !run.saveFailed else { return }
         guard force || now - run.lastCheckpoint >= 15 else { return }
+        // 退避窗口内不重试：瞬时磁盘压力通常几秒就恢复，盲目每秒重试只会继续压队列。
+        guard force || now >= run.checkpointRetryAt else { return }
         run.checkpointing = true
         run.checkpointDirty = false
         run.lastCheckpoint = now
+        // evictionAttempted 归主线程所有：在这里取快照，worker 里只读这个 Bool。
+        let allowEviction = !run.evictionAttempted
         let value = record(run, final: false)
         let owner = run.scope.ownerHash
         worker.async { [weak self, weak run] in
             guard let run = run else { return }
             let result: Result<Saved, Error>
-            do { result = .success(try Self.persist(value, owner: owner, id: run.id)) }
+            do { result = .success(try Self.persist(value, owner: owner, id: run.id, allowEviction: allowEviction)) }
             catch { result = .failure(error) }
             DispatchQueue.main.async {
                 guard let self = self else { return }
                 run.checkpointing = false
                 switch result {
                 case .success(let saved):
+                    run.checkpointFailures = 0
+                    run.checkpointRetryAt = 0
+                    // 已经回收过就钉住：同一趟不再删第二次历史（撞的是修不好的上限时尤其重要）。
+                    if saved.evicted > 0 { run.evictionAttempted = true }
                     self.observeSaved(run, saved)
                     if let kept = saved.keptSamples { self.applyTrim(run, kept: kept) }
                 case .failure(let error):
-                    run.saveFailed = true
-                    run.recordState = "save_failed"
-                    run.reason = (error as? IOSRideDisk.Failure)?.code ?? "save_write_failed"
-                    if !run.ending { self.markGap(run, source: "storage", reason: "source_unavailable") }
+                    run.checkpointFailures += 1
+                    let code = (error as? IOSRideDisk.Failure)?.code ?? "save_write_failed"
+                    // 数据已经变了却没写进去：把 dirty 放回去，下一次 tick 才有机会重试。
+                    run.checkpointDirty = true
+                    // 失败 3 次以上才判死；之前任何一次瞬时失败都会永久钉住 saveFailed。
+                    if run.checkpointFailures >= 3 {
+                        run.saveFailed = true
+                        run.recordState = "save_failed"
+                        run.reason = code
+                        if !run.ending { self.markGap(run, source: "storage", reason: "source_unavailable") }
+                    } else {
+                        // 15s → 30s → 60s 退避，封顶 60s。
+                        let delay = min(60, 15 * Double(1 << (run.checkpointFailures - 1)))
+                        run.checkpointRetryAt = ProcessInfo.processInfo.systemUptime + delay
+                        run.reason = code
+                        IOSDiagnostics.shared.log("ride: checkpoint 第 \(run.checkpointFailures) 次失败（\(code)），\(Int(delay))s 后重试")
+                    }
                 }
             }
         }
@@ -1364,24 +1489,47 @@ final class IOSRideService: NSObject, IOSBridgeService, IOSBridgeCancellableServ
     }
 
     /// 落盘结果。keptSamples 非空表示这次保存为压到 8 MiB 以内截断过尾部。
+    /// evicted 表示这次为腾地方删过旧记录（调用方据此避免反复回收）。
     private struct Saved {
         let bytes: Int
         let samples: Int
         let keptSamples: Int?
+        let evicted: Int
     }
 
     /// 统一的落盘入口：先正常写；单文件超 8 MiB 时截断尾部（保留最早样本）再写一次，
     /// 并把 trimmed_for_size 记进 gaps。整条记录因为超限永远存不下会把 saveFailed 永久钉住，
     /// 之后所有 checkpoint 都被跳过，所以这里必须兜住，而不是把 record_limit_reached 抛出去。
-    private static func persist(_ record: [String: Any], owner: String, id: UUID) throws -> Saved {
+    ///
+    /// owner_storage_full 是「删掉本 owner 的旧记录就能腾出空间」的那一类（本 owner 字节/文件数、
+    /// 全库总字节）。允许回收一次；`allowEviction=false` 时直接抛出，防止同一条 run 反复删历史。
+    /// 纯 recycle 的错误码（owner 数上限、别的目录塞满）仍然直接抛，删自己的记录修不好。
+    private static func persist(_ record: [String: Any], owner: String, id: UUID,
+                                allowEviction: Bool) throws -> Saved {
         let samples = Int(IOSRideJSON.integer(record["samples"]) ?? 0)
         do {
-            return Saved(bytes: try IOSRideDisk.save(record, owner: owner, id: id), samples: samples, keptSamples: nil)
+            return Saved(bytes: try IOSRideDisk.save(record, owner: owner, id: id),
+                         samples: samples, keptSamples: nil, evicted: 0)
         } catch let failure as IOSRideDisk.Failure where failure.code == "record_limit_reached" {
             guard let trimmed = IOSRideDisk.trimmed(record) else { throw failure }
             let bytes = try IOSRideDisk.save(trimmed, owner: owner, id: id)
             let kept = Int(IOSRideJSON.integer(trimmed["samples"]) ?? 0)
-            return Saved(bytes: bytes, samples: max(kept, 1), keptSamples: kept)
+            return Saved(bytes: bytes, samples: max(kept, 1), keptSamples: kept, evicted: 0)
+        } catch let failure as IOSRideDisk.Failure where failure.code == "owner_storage_full" {
+            guard allowEviction else { throw failure }
+            let removed = IOSRideDisk.evictOldestFinished(owner: owner, protecting: id)
+            guard removed > 0 else { throw failure }
+            IOSDiagnostics.shared.log("ride: 本 owner 存储触顶，回收 \(removed) 条最旧已完成记录后重试")
+            do {
+                return Saved(bytes: try IOSRideDisk.save(record, owner: owner, id: id),
+                             samples: samples, keptSamples: nil, evicted: removed)
+            } catch let retryFailure as IOSRideDisk.Failure where retryFailure.code == "record_limit_reached" {
+                // 回收后仍超单文件上限：和普通路径一样走截断。
+                guard let trimmed = IOSRideDisk.trimmed(record) else { throw retryFailure }
+                let bytes = try IOSRideDisk.save(trimmed, owner: owner, id: id)
+                let kept = Int(IOSRideJSON.integer(trimmed["samples"]) ?? 0)
+                return Saved(bytes: bytes, samples: max(kept, 1), keptSamples: kept, evicted: removed)
+            }
         }
     }
 
@@ -1406,12 +1554,14 @@ final class IOSRideService: NSObject, IOSBridgeService, IOSBridgeCancellableServ
     private func saveFinal(_ run: Run) {
         guard !run.saveInFlight else { return }
         run.saveInFlight = true
+        // 同 checkpoint：evictionAttempted 归主线程，进 worker 前取快照。
+        let allowEviction = !run.evictionAttempted
         let value = record(run, final: true)
         let owner = run.scope.ownerHash
         worker.async { [weak self, weak run] in
             guard let run = run else { return }
             var result: Result<Saved, Error>
-            do { result = .success(try Self.persist(value, owner: owner, id: run.id)) }
+            do { result = .success(try Self.persist(value, owner: owner, id: run.id, allowEviction: allowEviction)) }
             catch { result = .failure(error) }
             // iOS 侧原来没有 save_failed 的出口：网页从不发 ride.action{retry}，
             // 用户看到「保存失败」就再也回不到 completed。这里在同一个 worker 上
@@ -1428,7 +1578,8 @@ final class IOSRideService: NSObject, IOSBridgeService, IOSBridgeCancellableServ
                 }
                 if !alreadyRetried {
                     Thread.sleep(forTimeInterval: 0.3)
-                    do { result = .success(try Self.persist(value, owner: owner, id: run.id)) }
+                    // 第一次可能是回收腾地方失败后的重试，第二次不再删历史。
+                    do { result = .success(try Self.persist(value, owner: owner, id: run.id, allowEviction: false)) }
                     catch { result = .failure(error) }
                 }
             }
@@ -1437,6 +1588,7 @@ final class IOSRideService: NSObject, IOSBridgeService, IOSBridgeCancellableServ
                 run.saveInFlight = false
                 switch result {
                 case .success(let saved):
+                    if saved.evicted > 0 { run.evictionAttempted = true }
                     self.observeSaved(run, saved)
                     if let kept = saved.keptSamples { self.applyTrim(run, kept: kept) }
                     run.saveFailed = false
