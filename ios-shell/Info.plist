@@ -31,6 +31,9 @@
     <key>NSLocalNetworkUsageDescription</key><string>仅在你确认后连接指定的局域网设备，发送所选文件或屏幕画面，并检查连接状态。</string>
     <key>NSLocationWhenInUseUsageDescription</key><string>仅在你开启骑行记录时获取位置，用于绘制路线和记录距离。</string>
     <key>NSLocationAlwaysAndWhenInUseUsageDescription</key><string>仅在你明确开启骑行记录后，允许切到后台继续记录路线；结束记录后停止获取位置。</string>
+    <!-- 孪生仪表按手机姿态做轻微反方向位移与晃动。iOS 13+ WKWebView 的 DeviceMotion 必须
+         有这条描述才可能授权；网页侧只在仪表页第一次触摸时请求，不进页面不申请，姿态数据不上传。 -->
+    <key>NSMotionUsageDescription</key><string>仅在孪生仪表页面根据手机倾斜与晃动让仪表轻微摆动；不会记录或上传运动数据。</string>
     <key>UIBackgroundModes</key><array>
         <string>bluetooth-central</string>
         <string>location</string>
