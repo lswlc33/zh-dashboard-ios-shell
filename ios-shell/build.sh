@@ -192,10 +192,11 @@ link_args+=(-Xlinker -weak_framework -Xlinker AppIntents)
 # 手写 swiftc 不会自动生成索引，必须自己导出 const values（见下方 metadata 段）。
 host_const_values="$build_dir/Dashboard.swiftconstvalues"
 host_const_list="$build_dir/host-const-values.txt"
-# host 不加 -wmo：它的编译参数与优化行为是既有已验证配置，不动。
-# -emit-const-values-path 指一个具体文件时，swiftc 会把整个模块的 const values
-# 汇总写到该路径（不需要非 wmo 的「每 primary 一份」那种用法）。
-xcrun --sdk iphoneos swiftc -O -swift-version 5 -parse-as-library \
+# host 必须加 -wmo 才能产出一份汇总的 const-values：非 wmo 下 swiftc 不给
+# 单个模块级文件（CI 实测：编译成功但文件不存在，后面 python 读不出直接 BLOCKED）。
+# widget 侧本来就是 -wmo，这里与它对齐；host 的源码集合不变，-wmo 只影响代码生成
+# 的组织方式，不改变链接结果。
+xcrun --sdk iphoneos swiftc -O -wmo -swift-version 5 -parse-as-library \
     -target arm64-apple-ios15.4 -sdk "$sdk_path" -module-name Dashboard \
     -emit-const-values -emit-const-values-path "$host_const_values" \
     -Xfrontend -const-gather-protocols-file -Xfrontend "$const_protocols" \
