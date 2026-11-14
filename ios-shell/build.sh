@@ -285,25 +285,35 @@ done < <(find "$app_dir/Frameworks" "$widget_dir/Frameworks" "$broadcast_dir/Fra
 #
 # 手写 swiftc 流程不会自动生成，必须自己跑 Xcode 内的 appintentsmetadataprocessor。
 # 缺了索引的真机表现是「按钮点了毫无反应」，日志里是 linkd Missing: <bundle>:<Type>，
-# 不崩溃也不报错，所以这里是硬闸门：工具不存在或产出为空都直接 BLOCKED。
-# 必须对 appex 与 app 各跑一次（按钮 intent 归属扩展，但系统也会查主 App 的索引）。
-if [[ -f "${widget_const_values:-}" ]]; then
-    metadata_tool="$(xcrun --find appintentsmetadataprocessor 2>/dev/null || true)"
-    [[ -n "$metadata_tool" && -x "$metadata_tool" ]] || {
-        printf 'BLOCKED: appintentsmetadataprocessor 不可用（需要完整 Xcode，不是只有 CLT）\n' >&2; exit 2; }
-    for bundle in "$widget_dir" "$app_dir"; do
-        module_name=DashboardWidgets
-        [[ "$bundle" == "$app_dir" ]] && module_name=Dashboard
-        "$metadata_tool" --toolchain-dir "$(dirname -- "$(dirname -- "$(xcrun --find swiftc)")")" \
-            --module-name "$module_name" --sdk-root "$sdk_path" \
-            --platform-family iOS --deployment-target 15.4 \
-            --target-triple arm64-apple-ios15.4 --output "$bundle" \
-            --swift-const-vals-list "$widget_const_values" --force 2>&1 | sed 's/^/[appintents] /'
-        # 索引必须真的落地，否则按钮会静默失效。
-        [[ -f "$bundle/Metadata.appintents/extract.actionsdata" ]] || {
-            printf 'BLOCKED: %s 缺少 AppIntents 索引（按钮会静默无效）\n' "$bundle" >&2; exit 2; }
-    done
-fi
+# 不崩溃也不报错，所以这里是硬闸门：工具缺失或索引没落地都直接 BLOCKED。
+#
+# 不给 --swift-const-vals-list：那需要 Xcode 自己的协议清单，手写流程拿不到，
+# 传空文件反而可能产出结构合法但 actions 为空的索引。改让 processor 扫源码。
+metadata_tool="$(xcrun --find appintentsmetadataprocessor 2>/dev/null || true)"
+[[ -n "$metadata_tool" && -x "$metadata_tool" ]] || {
+    printf 'BLOCKED: appintentsmetadataprocessor 不可用（需要完整 Xcode，不是只有 CLT）
+' >&2; exit 2; }
+toolchain_dir="$(xcode-select -p 2>/dev/null)/Toolchains/XcodeDefault.xctoolchain"
+[[ -d "$toolchain_dir" ]] || toolchain_dir="$(xcode-select -p 2>/dev/null)"
+# 按钮 intent 归属扩展，但系统也会查主 App 的索引，所以两份都要生成。
+for bundle in "$widget_dir" "$app_dir"; do
+    if [[ "$bundle" == "$app_dir" ]]; then
+        module_name=Dashboard; source_list="$build_dir/swift-sources.txt"
+    else
+        module_name=DashboardWidgets; source_list="$build_dir/widget-sources.txt"
+    fi
+    metadata_log="$build_dir/appintents-$module_name.log"
+    "$metadata_tool" --toolchain-dir "$toolchain_dir"         --module-name "$module_name" --sdk-root "$sdk_path"         --platform-family iOS --deployment-target 15.4         --target-triple arm64-apple-ios15.4 --output "$bundle"         --source-file-list "$source_list" --force >"$metadata_log" 2>&1 || true
+    printf '[appintents] %s: ' "$module_name"
+    tail -3 "$metadata_log" | tr '
+' ' '; printf '
+'
+    [[ -f "$bundle/Metadata.appintents/extract.actionsdata" ]] || {
+        printf 'BLOCKED: %s 缺少 AppIntents 索引（按钮会静默无效）；processor 输出：
+' "$bundle" >&2
+        cat "$metadata_log" >&2
+        exit 2; }
+done
 # 三个真实 bundle 内到外签名。模板不是 Apple 授权，不保证普通安装/TrollStore能力。
 # 注意：签名必须在 metadata 生成之后，否则索引不会进签名封条。
 codesign --force --sign - --timestamp=none --entitlements "$script_dir/Entitlements/Broadcast.entitlements" --identifier io.github.lswlc33.dashboard.ios.broadcast "$broadcast_dir"

@@ -206,7 +206,7 @@ def main():
     assert 'AppIntentConfiguration(' not in widget_bundle, '仍只用 StaticConfiguration 承载控件'
     assert 'appintentsmetadataprocessor' in build_sh, '交互按钮必须生成 AppIntents metadata，否则点击无效'
     assert 'extract.actionsdata' in build_sh, 'metadata 段必须校验索引真的落地'
-    assert '-emit-const-values-path' in build_sh, 'swiftc 必须导出 const-values 供 processor 使用'
+    assert '--source-file-list' in build_sh, 'metadata 生成必须给 processor 源码清单'
     assert '-weak_framework -Xlinker AppIntents' in build_sh, \
         'AppIntents 必须链接但用 weak（deployment target 15.4，强链接会让老系统 dyld 崩）'
     # 索引必须在签名之前生成，否则不会进签名封条。
