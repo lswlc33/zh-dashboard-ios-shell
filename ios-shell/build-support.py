@@ -1217,6 +1217,7 @@ def write_release(ipa, inputs_path, framework, app):
                 'ipaSha256': digest, 'ipaSize': ipa.stat().st_size, 'bridgeSha256': report['bridgeSha256'],
                 'executableSha256': report['executableSha256'],
                 'widgetAppIntentsMetadata': report['widgetAppIntentsMetadata'],
+                'appAppIntentsMetadata': report['appAppIntentsMetadata'],
                 'machO': report['machO'], 'tools': tools}
     metadata = release_metadata(ipa, info)
     write_json(ipa.parent / VERSION_NAME, source_json(ipa, report, manifest['releaseDate']))
