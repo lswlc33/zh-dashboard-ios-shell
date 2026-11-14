@@ -207,8 +207,11 @@ xcrun --sdk iphoneos swiftc -O -wmo -swift-version 5 -parse-as-library -applicat
     -emit-const-values -emit-const-values-path "$widget_const_values" \
     -Xfrontend -const-gather-protocols-file -Xfrontend "$const_protocols" \
     "${widget_args[@]}" "${widget_sources[@]}" -o "$widget_dir/DashboardWidgets"
-# 空 const-values 必须当场报错：否则一路走到 processor 才失败，日志里只有一句
-# "No swift const values found"，看不出是协议清单没生效。
+# processor 的 --swift-const-vals-list 要的是「一份列出 const-values 文件路径的清单」，
+# 不是那个 JSON 本身（直接传 JSON 会被按行当成路径，报
+# "couldn't be opened because there is no such file"）。
+widget_const_list="$build_dir/widget-const-values.txt"
+printf '%s\n' "$widget_const_values" > "$widget_const_list"
 python3 -I - "$widget_const_values" <<'ZEEHO_CHECKCV'
 import json, sys
 try:
@@ -311,8 +314,8 @@ done < <(find "$app_dir/Frameworks" "$widget_dir/Frameworks" "$broadcast_dir/Fra
 # 缺了索引的真机表现是「按钮点了毫无反应」，日志里是 linkd Missing: <bundle>:<Type>，
 # 不崩溃也不报错，所以这里是硬闸门：工具缺失或索引没落地都直接 BLOCKED。
 #
-# 不给 --swift-const-vals-list：那需要 Xcode 自己的协议清单，手写流程拿不到，
-# 传空文件反而可能产出结构合法但 actions 为空的索引。改让 processor 扫源码。
+# --swift-const-vals-list 指向上面生成的「清单文件」（每行一个 const-values 路径），
+# 不是 JSON 本身；--compile-time-extraction 让 processor 走编译期提取路径。
 metadata_tool="$(xcrun --find appintentsmetadataprocessor 2>/dev/null || true)"
 if [ -z "$metadata_tool" ] || [ ! -x "$metadata_tool" ]; then
     echo 'BLOCKED: appintentsmetadataprocessor 不可用（需要完整 Xcode，不是只有 CLT）' >&2
@@ -339,7 +342,7 @@ for bundle in "$widget_dir" "$app_dir"; do
         --xcode-version "$xcode_version" \
         --target-triple arm64-apple-ios15.4 --output "$bundle" \
         --source-file-list "$source_list" \
-        --swift-const-vals-list "$widget_const_values" \
+        --swift-const-vals-list "$widget_const_list" \
         --compile-time-extraction --force >"$metadata_log" 2>&1 || true
     echo "[appintents] $module_name: xcode=$xcode_version"
     tail -5 "$metadata_log" | sed 's/^/[appintents]   /'
