@@ -488,8 +488,13 @@ final class IOSSystemSurfacesService: NSObject, IOSBridgeService, IOSBridgeCance
         let plugin = Bundle.main.bundleURL.appendingPathComponent("PlugIns/DashboardWidgets.appex", isDirectory: true)
         let bundle = Bundle(url: plugin)
         let extensionInfo = bundle?.object(forInfoDictionaryKey: "NSExtension") as? [String: Any]
-        let executable = plugin.appendingPathComponent("DashboardWidgets", isDirectory: false)
-        let embedded = bundle?.bundleIdentifier == "io.github.lswlc33.dashboard.ios.widgets"
+        // 全能签等重签工具会改主 App 包名（扩展 bundle ID 跟着变），所以不能比对写死的
+        // io.github.lswlc33.dashboard.ios.widgets；本 App bundle ID + ".widgets" 才是重签后
+        // 的真实值。签名工具不会改 NSExtensionPointIdentifier 与可执行文件名。
+        let expectedExtensionID = (Bundle.main.bundleIdentifier ?? "io.github.lswlc33.dashboard.ios") + ".widgets"
+        let executableName = bundle?.object(forInfoDictionaryKey: kCFBundleExecutableKey as String) as? String ?? "DashboardWidgets"
+        let executable = plugin.appendingPathComponent(executableName, isDirectory: false)
+        let embedded = bundle?.bundleIdentifier == expectedExtensionID
             && extensionInfo?["NSExtensionPointIdentifier"] as? String == "com.apple.widgetkit-extension"
             && FileManager.default.isExecutableFile(atPath: executable.path)
         let group = SystemSnapshotStore.isAvailable()
@@ -981,6 +986,8 @@ final class IOSSystemSurfacesService: NSObject, IOSBridgeService, IOSBridgeCance
         if cancel { job.lease.cancel() }
         jobs.removeValue(forKey: job.id)
         if interactiveJob === job { interactiveJob = nil }
+        // 清 delegate 再 dismiss：服务对象可能先于弹窗释放，残留 delegate 会断言。
+        job.alert?.presentationController?.delegate = nil
         job.alert?.dismiss(animated: false); job.alert = nil
         reply(value, nil)
     }
@@ -1000,14 +1007,19 @@ final class IOSSystemSurfacesService: NSObject, IOSBridgeService, IOSBridgeCance
         })
         alert.addAction(UIAlertAction(title: IOSStrings.continueButton, style: .default) { [weak self, weak job] _ in
             guard let self = self, let job = job, self.current(job), UIApplication.shared.applicationState == .active else { return }
+            job.alert?.presentationController?.delegate = nil
             job.alert = nil
             action()
         })
         job.alert = alert
         presenter.present(alert, animated: true)
+        // delegate 是弱引用且指向本服务（非 VC 对象）；弹窗被系统收走后残留 delegate
+        // 会在 setDelegate/释放时触发断言（真机崩溃栈在 confirm 的 setDelegate）。
+        // NativeFileStream 同款手法：消失即清，不留悬空引用。
         alert.presentationController?.delegate = self
     }
     func presentationControllerDidDismiss(_ presentationController: UIPresentationController) {
+        presentationController.delegate = nil
         guard let job = interactiveJob else { return }
         finish(job, failure("user_cancelled"), cancel: true)
     }

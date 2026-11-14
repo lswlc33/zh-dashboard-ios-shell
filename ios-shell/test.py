@@ -229,8 +229,15 @@ def main():
     assert 'AppGroup.current()' in store, 'SystemSnapshotStore 必须走可覆盖的 AppGroup 解析'
     assert 'static let appGroupIdentifier = "group.' not in store, '组名不能再写死'
     assert 'groupID: String = IOSCastMailbox.groupID' in cast, 'Cast mailbox 默认参数必须跟随解析结果'
-    assert widget_id in (root / 'SystemSurfaces.swift').read_text(encoding='utf-8'), \
-        'SystemSurfaces 的运行时 Widget 探测必须用 build-support.WIDGET_ID 同一个 Bundle ID'
+    surfaces_src = (root / 'SystemSurfaces.swift').read_text(encoding='utf-8')
+    # 重签工具会改主 App 包名（扩展 bundle ID 跟着变），探测必须动态拼而不是比对写死 ID。
+    assert '+ ".widgets"' in surfaces_src and 'bundleIdentifier ??' in surfaces_src, \
+        'SystemSurfaces 的扩展探测必须按「本 App bundle ID + .widgets」动态拼'
+    assert '== "io.github.lswlc33.dashboard.ios.widgets"' not in surfaces_src, '扩展 ID 不能写死'
+    # 非 VC 服务对象挂 presentationController delegate，消失/结束/取消三条路径都要清，
+    # 否则残留弱引用在系统 setDelegate 时触发断言（真机崩溃栈在 confirm）。
+    assert surfaces_src.count('presentationController?.delegate = nil') >= 2, 'confirm 的 delegate 必须在结束与 dismiss 两条路径清理'
+    assert 'presentationController.delegate = nil' in surfaces_src, 'dismiss 回调里也要清 delegate'
     assert 'UIBackgroundModes' in info, 'UIBackgroundModes 缺失：后台蓝牙/定位会静默降级'
     background = info.get('UIBackgroundModes') or []
     assert 'bluetooth-central' in background and 'location' in background, 'UIBackgroundModes 缺后台蓝牙/定位'
