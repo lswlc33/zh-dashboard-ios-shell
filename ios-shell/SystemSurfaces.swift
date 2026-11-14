@@ -485,23 +485,49 @@ final class IOSSystemSurfacesService: NSObject, IOSBridgeService, IOSBridgeCance
     // runtime 元数据与容器检查不等于本会话已经做过 Apple 编译/真机验收；绝不请求系统权限来探测。
     func runtimeAvailability() -> [String: Any] {
         precondition(Thread.isMainThread)
-        let plugin = Bundle.main.bundleURL.appendingPathComponent("PlugIns/DashboardWidgets.appex", isDirectory: true)
-        let bundle = Bundle(url: plugin)
-        let extensionInfo = bundle?.object(forInfoDictionaryKey: "NSExtension") as? [String: Any]
-        // 全能签等重签工具会改主 App 包名（扩展 bundle ID 跟着变），所以不能比对写死的
-        // io.github.lswlc33.dashboard.ios.widgets；本 App bundle ID + ".widgets" 才是重签后
-        // 的真实值。签名工具不会改 NSExtensionPointIdentifier 与可执行文件名。
-        let expectedExtensionID = (Bundle.main.bundleIdentifier ?? "io.github.lswlc33.dashboard.ios") + ".widgets"
-        let executableName = bundle?.object(forInfoDictionaryKey: kCFBundleExecutableKey as String) as? String ?? "DashboardWidgets"
-        let executable = plugin.appendingPathComponent(executableName, isDirectory: false)
-        let embedded = bundle?.bundleIdentifier == expectedExtensionID
-            && extensionInfo?["NSExtensionPointIdentifier"] as? String == "com.apple.widgetkit-extension"
-            && FileManager.default.isExecutableFile(atPath: executable.path)
+        // 重签工具改扩展 bundle ID 的规则不止一种（原样保留 / 主ID+.widgets /
+        // 主ID.原组件名 都见过），任何写死或按后缀推断的比对都会误报
+        // widget_extension_missing。改为按 WidgetKit 的 NSExtensionPointIdentifier
+        // 在 PlugIns 里认出真正的扩展，并把每项检查结果回传，便于侧载场景定位。
+        let plugins = Bundle.main.bundleURL.appendingPathComponent("PlugIns", isDirectory: true)
+        var widgetPlugin: (url: URL, info: [String: Any])?
+        var appexNames: [String] = []
+        for name in (try? FileManager.default.contentsOfDirectory(atPath: plugins.path))?.sorted() ?? [] {
+            guard name.hasSuffix(".appex") else { continue }
+            appexNames.append(name)
+            let url = plugins.appendingPathComponent(name, isDirectory: true)
+            guard let info = Bundle(url: url)?.infoDictionary else { continue }
+            let extensionInfo = info["NSExtension"] as? [String: Any]
+            guard extensionInfo?["NSExtensionPointIdentifier"] as? String == "com.apple.widgetkit-extension" else { continue }
+            if widgetPlugin == nil { widgetPlugin = (url, info) }
+        }
+        var executableName: String?
+        var executableExists = false
+        var executableIsExecutable = false
+        if let plugin = widgetPlugin {
+            let name = plugin.info[kCFBundleExecutableKey as String] as? String ?? ""
+            executableName = name.isEmpty ? nil : name
+            if !name.isEmpty {
+                let path = plugin.url.appendingPathComponent(name, isDirectory: false).path
+                executableExists = FileManager.default.fileExists(atPath: path)
+                executableIsExecutable = FileManager.default.isExecutableFile(atPath: path)
+            }
+        }
+        // 扩展可执行文件必须真的在；bundle ID 只作诊断，不作判据。
+        let embedded = widgetPlugin != nil && executableIsExecutable
         let group = SystemSnapshotStore.isAvailable()
         let supported = embedded && group
         // 侧载诊断：全能签等 P12 工具会把组名换成证书团队的，原始码 app_group_unavailable
         // 看不出签成了什么。把解析结果与来源一起回给设置页，便于用户截图定位。
         let groupInfo = AppGroup.resolution()
+        let widgetInfo: [String: Any] = [
+            "found": embedded,
+            "appexNames": appexNames,
+            "bundleIdentifier": widgetPlugin?.info[kCFBundleIdentifierKey as String] as? String ?? NSNull(),
+            "hostBundleIdentifier": Bundle.main.bundleIdentifier ?? NSNull(),
+            "executableName": executableName ?? NSNull(),
+            "executableExists": executableExists,
+            "executableIsExecutable": executableIsExecutable]
         let declaredLive = Bundle.main.object(forInfoDictionaryKey: "NSSupportsLiveActivities") as? Bool == true
         var liveSupported = false
         var authorization = false
@@ -514,7 +540,7 @@ final class IOSSystemSurfacesService: NSObject, IOSBridgeService, IOSBridgeCance
         let reason: String? = !group ? "app_group_unavailable" : (!embedded ? "widget_extension_missing" : nil)
         let liveReason = reason ?? (!declaredLive ? "live_activities_not_declared" : (!liveSupported ? "ios_16_1_required" : (!authorization ? "live_activities_disabled" : "available")))
         return ["supported": supported, "embedded": embedded, "appGroupAvailable": group,
-                "appGroup": groupInfo,
+                "appGroup": groupInfo, "widgetExtension": widgetInfo,
                 "liveActivitiesSupported": liveSupported, "authorizationEnabled": authorization,
                 "reason": reason as Any? ?? NSNull(), "liveActivitiesReason": liveReason,
                 "verification": "runtime_bundle_check", "minimumLiveActivitiesIOS": "16.1",
@@ -576,6 +602,7 @@ final class IOSSystemSurfacesService: NSObject, IOSBridgeService, IOSBridgeCance
             "liveActivities": live, "widgets": ["supported": supported, "enabled": supported && approved && persistedSnapshot != nil,
                 "appGroupAvailable": availability["appGroupAvailable"] ?? false, "embedded": availability["embedded"] ?? false,
                 "appGroup": availability["appGroup"] ?? NSNull(),
+                "widgetExtension": availability["widgetExtension"] ?? NSNull(),
                 "kind": Self.widgetKind, "placement": "os_managed", "reason": availability["reason"] ?? NSNull(),
                 "perInstanceVehicleSelection": configurable, "perInstanceMinimumIOS": NSNull(),
                 "supportedFamilies": ["systemSmall", "systemMedium", "systemLarge"], "refreshBudget": "os_managed", "displayed": false],

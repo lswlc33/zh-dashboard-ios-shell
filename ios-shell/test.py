@@ -230,10 +230,15 @@ def main():
     assert 'static let appGroupIdentifier = "group.' not in store, '组名不能再写死'
     assert 'groupID: String = IOSCastMailbox.groupID' in cast, 'Cast mailbox 默认参数必须跟随解析结果'
     surfaces_src = (root / 'SystemSurfaces.swift').read_text(encoding='utf-8')
-    # 重签工具会改主 App 包名（扩展 bundle ID 跟着变），探测必须动态拼而不是比对写死 ID。
-    assert '+ ".widgets"' in surfaces_src and 'bundleIdentifier ??' in surfaces_src, \
-        'SystemSurfaces 的扩展探测必须按「本 App bundle ID + .widgets」动态拼'
-    assert '== "io.github.lswlc33.dashboard.ios.widgets"' not in surfaces_src, '扩展 ID 不能写死'
+    # 重签工具改扩展 bundle ID 的规则不止一种（原样/主ID+.widgets/主ID.组件名），
+    # 任何写死或按后缀推断的比对都会误报 widget_extension_missing。
+    # 判据只能是 WidgetKit 的 NSExtensionPointIdentifier + 可执行文件真的在。
+    assert 'com.apple.widgetkit-extension' in surfaces_src, '扩展识别必须按 WidgetKit extension point'
+    assert 'hasSuffix(".appex")' in surfaces_src, '必须枚举 PlugIns 下的 appex 而不是固定路径'
+    assert 'executableIsExecutable' in surfaces_src, '可执行文件存在性要单独判定'
+    assert 'widgetExtension' in surfaces_src, '诊断必须回传扩展探测明细'
+    for banned in ('== "io.github.lswlc33.dashboard.ios.widgets"', '+ ".widgets"'):
+        assert banned not in surfaces_src, '扩展判据不能再依赖 bundle ID 推断: ' + banned
     # 非 VC 服务对象挂 presentationController delegate，消失/结束/取消三条路径都要清，
     # 否则残留弱引用在系统 setDelegate 时触发断言（真机崩溃栈在 confirm）。
     assert surfaces_src.count('presentationController?.delegate = nil') >= 2, 'confirm 的 delegate 必须在结束与 dismiss 两条路径清理'
