@@ -12,13 +12,11 @@ import UIKit
 //
 // 两条用法：
 // 1. `ZeehoRunBackgroundTaskIntent`：在自动化里直接调用，跑一次签到/采样；
-//    `supportedModes` 含 `.background`，所以不必把 App 拉到前台。
+//    `openAppWhenRun = false` 保证不把 App 拉到前台。
 // 2. `ZeehoOpenPanelIntent`：如果用户想要「打开面板顺便补跑」，用这条更直观。
 
 /// 后台任务的动作类型。
 ///
-/// `AppEnum` 是 iOS 16.0 的协议，但 `AppShortcutsProvider` 与 `IntentModes`
-/// 的可用性在 16.x 各小版本间漂移过（AppIntents 在 16.0 首发后连着补了几个版本）。
 /// 统一标 17.0 是为了**不在低版本上踩半实现**：这些 intent 的用途是给用户配
 /// 「个人自动化」，而个人自动化的「无需确认自动运行」在 17 上才稳定。
 /// 16.x 用户仍然可以用 App 内的设置页手动触发同一套后台逻辑。
@@ -38,17 +36,20 @@ enum IOSBackgroundIntentAction: String, AppEnum {
 
 /// 在快捷指令/自动化里执行一次后台任务。
 ///
-/// **注意平台限制**：`supportedModes: .background` 让它在自动化里不必起前台 UI，
-/// 但任务体本身仍受 iOS 后台时间预算约束（约 30 秒）。签到是一次 HTTP，
-/// 采样也是一次 HTTP，都远在预算内。
+/// **注意平台限制**：任务体受 iOS 后台时间预算约束（约 30 秒）。
+/// 签到是一次 HTTP，采样也是一次 HTTP，都远在预算内。
+///
+/// 只用 `openAppWhenRun = false` 表达「不要拉起 App」：它是 AppIntents 首发就有
+/// 的属性，全版本可用。`supportedModes` / `IntentModes` 是 iOS 26 的新 API，
+/// 在 17/18 的 SDK 里根本不存在（CI 实测 `cannot find type 'IntentModes'`），
+/// 不能用在这里——deployment target 是 15.4，编译用的是当前 Xcode 的 SDK。
+/// 「自动化里不需要确认就运行」由用户在快捷指令里勾选，与本 intent 无关。
 @available(iOS 17.0, *)
 struct ZeehoRunBackgroundTaskIntent: AppIntent {
     static var title: LocalizedStringResource = "运行几何面板后台任务"
     static var description = IntentDescription("在你的快捷指令自动化里补跑一次签到或车况采样。iOS 不允许 App 自己定时唤醒，所以这是唯一可靠的定时方式。")
     /// 不拉起 App：自动化里应该静默完成。
     static var openAppWhenRun: Bool = false
-    /// iOS 16+ 的替代属性：明确允许在后台执行。
-    static var supportedModes: IntentModes { [.background] }
 
     @Parameter(title: "动作", default: .both)
     var action: IOSBackgroundIntentAction
@@ -92,9 +93,9 @@ struct ZeehoRunBackgroundTaskIntent: AppIntent {
 struct ZeehoOpenPanelIntent: AppIntent {
     static var title: LocalizedStringResource = "打开几何面板"
     static var description = IntentDescription("在自动化里打开几何面板。面板每次进入前台都会立刻刷新车况并合并后台补采的电量点。")
-    /// 这条必须在前台：它的目的就是让面板可见。
+    /// 这条必须在前台：它的目的就是让面板可见。`openAppWhenRun` 是唯一跨版本的
+    /// 表达方式（`supportedModes` 是 iOS 26 API，见上面 ZeehoRunBackgroundTaskIntent 的注释）。
     static var openAppWhenRun: Bool = true
-    static var supportedModes: IntentModes { [.foreground] }
 
     init() {}
 

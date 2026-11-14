@@ -344,6 +344,17 @@ def main():
     assert 'gaugeInterval: TimeInterval = 5' in surfaces_src, \
         '车速 Live Activity 节流应为 5 秒（对齐 iOS 18 的本地更新限制）'
 
+    # AppIntent 只能用 openAppWhenRun 表达前后台：`supportedModes` / `IntentModes`
+    # 是 iOS 26 的 API，在 17/18 的 SDK 里根本不存在（CI 实测
+    # "cannot find type 'IntentModes' in scope"）。这条断言防它再被加回来。
+    intents = strip_comments((root / 'BackgroundIntents.swift').read_text(encoding='utf-8'))
+    assert 'IntentModes' not in intents, \
+        'AppIntent 不能用 supportedModes/IntentModes（iOS 26 API，CI 编不过）'
+    assert 'openAppWhenRun' in intents, '前后台行为要用 openAppWhenRun 表达'
+    # 不注册 AppShortcutsProvider 的话，快捷指令里根本看不到这些 intent。
+    assert 'AppShortcutsProvider' in intents and 'appShortcuts' in intents, \
+        '必须提供 AppShortcutsProvider 才能出现在快捷指令里'
+
     # 主界面完全沉浸：WebView 四边贴 view（不是 safeAreaLayoutGuide），
     # 安全区改由 app.info.safeArea 交给网页，避免 WK 的 env() 给 0 或含导航栏高度。
     raw_controller = (root / 'Dashboard.swift').read_text(encoding='utf-8')
