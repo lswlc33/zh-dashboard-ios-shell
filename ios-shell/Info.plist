@@ -11,8 +11,8 @@
     <key>CFBundleDisplayName</key><string>Jeeho Panel</string>
     <key>CFBundleExecutable</key><string>Dashboard</string>
     <key>CFBundlePackageType</key><string>APPL</string>
-    <key>CFBundleShortVersionString</key><string>1.1.8</string>
-    <key>CFBundleVersion</key><string>55</string>
+    <key>CFBundleShortVersionString</key><string>1.1.9</string>
+    <key>CFBundleVersion</key><string>56</string>
     <key>MinimumOSVersion</key><string>15.4</string>
     <key>LSRequiresIPhoneOS</key><true/>
     <key>UIDeviceFamily</key><array><integer>1</integer><integer>2</integer></array>

@@ -538,7 +538,29 @@ struct IOSCastHeartbeat: Codable {
 }
 
 final class IOSCastMailbox {
-    static let groupID = "group.io.github.lswlc33.dashboard.ios"
+    // 与 Shared/AppGroup.swift 同一契约（test.py 逐键断言）：未签名 IPA 交用户自签后，
+    // 描述文件里的 App Group 会被换成签名团队的组；AltStore/SideStore 重签时会把
+    // profile 的 app groups 回写进每个 bundle 的 Info.plist 的 ALTAppGroups。
+    // 本文件同时编进 Host 与 Broadcast 两个 module，不能 import ZeehoSystemShared，
+    // 所以这里自带同一套解析；三处进程必须解析出同一个组名。
+    static var groupID: String {
+        let info = Bundle.main.infoDictionary ?? [:]
+        if let explicit = info["ZeehoAppGroupID"] as? String, isValidGroup(explicit) { return explicit }
+        if let groups = info["ALTAppGroups"] as? [String], let first = groups.first(where: { isValidGroup($0) }) { return first }
+        if let single = info["ALTAppGroups"] as? String, isValidGroup(single) { return single }
+        return "group.io.github.lswlc33.dashboard.ios"
+    }
+    private static func isValidGroup(_ value: String) -> Bool {
+        guard value.hasPrefix("group."), value.utf8.count <= 256,
+              value.utf8.allSatisfy({ $0 >= 0x21 && $0 <= 0x7E }) else { return false }
+        let name = String(value.dropFirst("group.".count))
+        return name.split(separator: ".", omittingEmptySubsequences: false).allSatisfy { part in
+            !part.isEmpty && part.utf8.allSatisfy { byte in
+                (byte >= 0x41 && byte <= 0x5A) || (byte >= 0x61 && byte <= 0x7A) ||
+                (byte >= 0x30 && byte <= 0x39) || byte == 0x2D
+            }
+        }
+    }
     static let extensionID = "io.github.lswlc33.dashboard.ios.broadcast"
     static let changedNotification = "io.github.lswlc33.dashboard.ios.cast-grant-changed"
     private let directory: URL

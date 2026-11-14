@@ -5,7 +5,10 @@ import Darwin
 
 // 共享同账号最多 8 辆已批准车辆的有界摘要；无 App Group 权益明确失败，Broadcast 使用独立目录。
 public enum SystemSnapshotStore {
-    public static let appGroupIdentifier = "group.io.github.lswlc33.dashboard.ios"
+    // 不能写死模板组名：未签名 IPA 交用户自签后，描述文件里的 App Group 会被
+    // AltStore/SideStore 等工具换成签名团队自己的组（并回写进各 bundle 的 Info.plist）。
+    // 三个进程都从 AppGroup.current 解析，保证主 App 与扩展读到同一个共享容器。
+    public static var appGroupIdentifier: String { AppGroup.current() }
     public static let maxSnapshotBytes = 8 * 1024
     public static let maxVehicles = 8
     private static let markerName = "active-owner.json"

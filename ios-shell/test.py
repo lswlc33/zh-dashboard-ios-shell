@@ -207,8 +207,18 @@ def main():
     assert build_sh.index('--entitlements "$script_dir/Entitlements/Broadcast.entitlements"') < \
         build_sh.index('--entitlements "$script_dir/Entitlements/Widgets.entitlements"') < \
         build_sh.index('--entitlements "$script_dir/Entitlements/App.entitlements"'), '签名必须 Broadcast/Widget/App 由内到外'
-    assert app_group in (root / 'Shared/SystemSnapshotStore.swift').read_text(encoding='utf-8'), \
-        'Shared/SystemSnapshotStore 必须用 build-support.APP_GROUP 同一个 App Group'
+    # 未签名 IPA 交用户自签时，第三方 profile 的 App Group 会被换成签名团队的组，
+    # 三个进程（Host/Widget/Broadcast）必须按同一契约解析，不能写死模板值。
+    # ad-hoc 产物仍按 APP_GROUP 模板签名（build-support.py 常量不变）；运行时只是允许覆盖。
+    shared_app_group = (root / 'Shared/AppGroup.swift').read_text(encoding='utf-8')
+    cast = (root / 'CastProtocol.swift').read_text(encoding='utf-8')
+    for token in ('ZeehoAppGroupID', 'ALTAppGroups', 'group.io.github.lswlc33.dashboard.ios'):
+        assert token in shared_app_group, 'AppGroup.swift 缺少解析键: ' + token
+        assert token in cast, 'CastProtocol.swift 必须与 Shared 同一组名契约: ' + token
+    store = (root / 'Shared/SystemSnapshotStore.swift').read_text(encoding='utf-8')
+    assert 'AppGroup.current()' in store, 'SystemSnapshotStore 必须走可覆盖的 AppGroup 解析'
+    assert 'static let appGroupIdentifier = "group.' not in store, '组名不能再写死'
+    assert 'groupID: String = IOSCastMailbox.groupID' in cast, 'Cast mailbox 默认参数必须跟随解析结果'
     assert widget_id in (root / 'SystemSurfaces.swift').read_text(encoding='utf-8'), \
         'SystemSurfaces 的运行时 Widget 探测必须用 build-support.WIDGET_ID 同一个 Bundle ID'
     assert 'UIBackgroundModes' in info, 'UIBackgroundModes 缺失：后台蓝牙/定位会静默降级'
