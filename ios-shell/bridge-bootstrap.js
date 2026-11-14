@@ -89,6 +89,15 @@
   }
   // 只有脚本/样式表加载失败值得上屏；图片、字体、图标的 404 交给 diag 日志，
   // 否则一个缺图就能把画好的页面盖成黑色。
+  // 跨域可选资源（如 MiSans 字体的 CDN CSS）一律静默：它们本来就在 try/catch 与
+  // link.onerror 里降级到系统字体，加载失败不应盖住已经画好的页面。
+  function sameOrigin(url) {
+    try {
+      if (!url) return false;
+      var base = new URL('.', location.href), target = new URL(url, location.href);
+      return target.origin === base.origin;
+    } catch (e) { return false; }
+  }
   w.addEventListener('error', function (event) {
     // 资源加载失败（img/script/link）没有 message，只有 target。
     var target = event && event.target;
@@ -96,6 +105,7 @@
       var tag = String(target.tagName).toUpperCase();
       if (tag !== 'SCRIPT' && tag !== 'LINK') return;
       var url = String(target.src || target.href || '');
+      if (!sameOrigin(url)) return;
       reportOnce('resource:' + tag + ':' + url, '资源加载失败', tag + '\n' + url);
       return;
     }
