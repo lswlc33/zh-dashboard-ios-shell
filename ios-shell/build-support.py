@@ -961,9 +961,18 @@ def validate_ipa(path, expected_info=None):
         else:
             require(main['sharedClassSymbolCount'] > 0, 'KMP_FRAMEWORK_MISSING: no real ZeehoShared classes linked into app')
         resolve_imports(reports, names, app_prefix)
+        # 索引「内容」指纹而不是文件名列表：文件名随 Xcode 版本变化
+        # （extract.actionsdata / version.json / nlu/、root.ssu.yaml 有无不定），
+        # 且 CodeResources 会在签名时重写文件集合，拿文件名当 checksum 会误报 mismatch。
+        def metadata_digest(entries):
+            digest = hashlib.sha256()
+            for entry in sorted(entries):
+                digest.update(entry.encode('utf-8'))
+                digest.update(archive.read(entry))
+            return digest.hexdigest() if entries else None
         return {'info': info, 'linkage': linkage, 'machO': reports, 'artifactKind': 'full-app',
-                'widgetAppIntentsMetadata': widget_metadata,
-                'appAppIntentsMetadata': app_metadata,
+                'widgetAppIntentsMetadata': metadata_digest(widget_metadata),
+                'appAppIntentsMetadata': metadata_digest(app_metadata),
                 'bridgeSha256': hashlib.sha256(bridge).hexdigest(),
                 'executableSha256': hashlib.sha256(archive.read(binary_name)).hexdigest()}
 
