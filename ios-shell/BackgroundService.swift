@@ -1,8 +1,14 @@
 import Foundation
 import UIKit
 
+/// 桥参数校验失败。
+///
+/// 必须在**文件级**、且不是 private：`handle(method:args:reply:)` 是协议要求的
+/// internal 方法，它 throws 的类型若是 private，Swift 会报
+/// "method must be declared private because its parameter uses a private type"。
+enum BackgroundArgumentError: Error { let code: String; init(_ code: String) { self.code = code } }
+
 // 后台能力对网页暴露的桥。
-//
 // 网页侧只能做三件事：
 //   1) `background.status` 读真实状态（含「系统是否真的会跑」的诚实说明）；
 //   2) `background.credential` 授权后台凭据（网页把当前账号的 token 与签名密钥交出去）；
@@ -231,8 +237,6 @@ final class IOSBackgroundService: NSObject, IOSBridgeService, IOSBridgeCancellab
     }
 
     // MARK: - 参数校验
-
-    private struct BackgroundArgumentError: Error { let code: String; init(_ code: String) { self.code = code } }
 
     private func requireEmpty(_ args: [Any]) throws {
         guard args.isEmpty else { throw BackgroundArgumentError("invalid_args") }
