@@ -169,19 +169,47 @@ while IFS= read -r module; do
     [[ "$module" == ActivityKit || "$module" == AppIntents ]] || link_args+=(-framework "$module")
 done < "$build_dir/frameworks.txt"
 while IFS= read -r library; do link_args+=("-l$library"); done < "$build_dir/libraries.txt"
+# ---- AppIntents const-values 的协议清单（host 与 widget 共用）----
+#
+# 必须在**任何 AppIntent 模块编译之前**就存在：swiftc 只在同时给了协议清单时
+# 才真的提取（源码里 emitConstValues 的「ConstGatherProtocolListFilePath 为空
+# 就直接 return」），否则文件是空的，processor 报 "No swift const values found"
+# 并跳过写索引，按钮/快捷指令就静默失效。
+# 协议清单必须是**裸 JSON 数组**、元素是**不带模块前缀**的协议名
+# （Xcode 自己那份是 wrapper dict，前端会拒绝）。
+const_protocols="$build_dir/const_extract_protocols.json"
+cat > "$const_protocols" <<'ZEEHO_PROTOCOLS'
+["AppIntent","EntityQuery","AppEntity","EntityStringQuery","TransientEntity","AppEnum","AppShortcutProviding","AppShortcutsProvider","AnyResolverProviding","AppIntentsPackage","DynamicOptionsProvider","OpenIntent","_IntentValueRepresentable","_AssistantIntentsProvider","_GenerativeFunctionExtractable","IntentValueQuery","Resolver"]
+ZEEHO_PROTOCOLS
+
 # 主 App 的 AppIntents 必须弱链接：deployment target 是 15.4，强链接 iOS 16+ 框架
 # 会让老系统在 dyld 阶段就崩。真正用到的地方（BackgroundIntents.swift）都有
-# @available(iOS 16.0, *) 分支，弱链接下老系统只是拿不到这些 intent。
+# @available(iOS 17.0, *) 分支，弱链接下老系统只是拿不到这些 intent。
 link_args+=(-Xlinker -weak_framework -Xlinker AppIntents)
 # 主 App 也声明 AppIntent（BackgroundIntents.swift 的签到/采样 intent + AppShortcutsProvider）。
 # 快捷指令的「个人自动化 → 特定时间」是 iOS 上唯一有系统保证的定时入口，
 # 所以这些 intent 必须真的进 metadata 索引，否则用户在快捷指令里看不到它们。
 # 手写 swiftc 不会自动生成索引，必须自己导出 const values（见下方 metadata 段）。
 host_const_values="$build_dir/Dashboard.swiftconstvalues"
+host_const_list="$build_dir/host-const-values.txt"
+# host 不加 -wmo：它的编译参数与优化行为是既有已验证配置，不动。
+# -emit-const-values-path 指一个具体文件时，swiftc 会把整个模块的 const values
+# 汇总写到该路径（不需要非 wmo 的「每 primary 一份」那种用法）。
 xcrun --sdk iphoneos swiftc -O -swift-version 5 -parse-as-library \
     -target arm64-apple-ios15.4 -sdk "$sdk_path" -module-name Dashboard \
-    -emit-const-values-path "$host_const_values" \
+    -emit-const-values -emit-const-values-path "$host_const_values" \
+    -Xfrontend -const-gather-protocols-file -Xfrontend "$const_protocols" \
     "${link_args[@]}" "${swift_sources[@]}" -o "$app_dir/Dashboard"
+printf '%s\n' "$host_const_values" > "$host_const_list"
+python3 -I - "$host_const_values" <<'ZEEHO_CHECKHOSTCV'
+import json, sys
+try:
+    data = json.load(open(sys.argv[1], encoding="utf-8"))
+except Exception as error:
+    sys.exit("BLOCKED: 读不出 host const-values: %s" % error)
+if not isinstance(data, list) or not data:
+    sys.exit("BLOCKED: host const-values 为空，快捷指令看不到后台 intent（检查协议清单）")
+ZEEHO_CHECKHOSTCV
 widget_args=(-I "$build_dir" "$build_dir/ZeehoSystemShared.o" "${activity_args[@]}" -framework Foundation \
     -Xlinker -e -Xlinker _NSExtensionMain \
     -Xlinker -rpath -Xlinker '@executable_path/../../Frameworks' \
@@ -202,10 +230,27 @@ done < "$build_dir/widget-frameworks.txt"
 # 与 ActivityKit 同样处理；真正用到 AppIntents 的地方都做了 #available 分支。
 widget_args+=(-Xlinker -weak_framework -Xlinker AppIntents)
 widget_const_values="$build_dir/DashboardWidgets.swiftconstvalues"
-xcrun --sdk iphoneos swiftc -O -swift-version 5 -parse-as-library -application-extension \
+# -wmo 保证整模块只产出一个 const-values 文件（非 wmo 下每个 primary 各要一个路径）。
+# 协议清单在上方 host 段之前就写好了（const_protocols），这里是同一份。
+xcrun --sdk iphoneos swiftc -O -wmo -swift-version 5 -parse-as-library -application-extension \
     -target arm64-apple-ios15.4 -sdk "$sdk_path" -module-name DashboardWidgets \
-    -emit-const-values-path "$widget_const_values" \
+    -emit-const-values -emit-const-values-path "$widget_const_values" \
+    -Xfrontend -const-gather-protocols-file -Xfrontend "$const_protocols" \
     "${widget_args[@]}" "${widget_sources[@]}" -o "$widget_dir/DashboardWidgets"
+# processor 的 --swift-const-vals-list 要的是「一份列出 const-values 文件路径的清单」，
+# 不是那个 JSON 本身（直接传 JSON 会被按行当成路径，报
+# "couldn't be opened because there is no such file"）。
+widget_const_list="$build_dir/widget-const-values.txt"
+printf '%s\n' "$widget_const_values" > "$widget_const_list"
+python3 -I - "$widget_const_values" <<'ZEEHO_CHECKCV'
+import json, sys
+try:
+    data = json.load(open(sys.argv[1], encoding="utf-8"))
+except Exception as error:
+    sys.exit("BLOCKED: 读不出 const-values: %s" % error)
+if not isinstance(data, list) or not data:
+    sys.exit("BLOCKED: const-values 为空，AppIntents 索引会缺失（检查协议清单是否为裸 JSON 数组）")
+ZEEHO_CHECKCV
 
 # ReplayKit 的标准 upload extension 仍由 _NSExtensionMain 进入 NSObject 子类 SampleHandler。
 # -framework ReplayKit 提供真实 API/入口依赖；不发明 _appexentry，也不复用 host main。
@@ -273,6 +318,10 @@ stdlib_args=(--copy --platform iphoneos
     --scan-executable "$broadcast_dir/ZeehoCastBroadcast"
     --scan-folder "$app_dir/Frameworks" --scan-folder "$widget_dir/Frameworks" --scan-folder "$broadcast_dir/Frameworks"
     --destination "$app_dir/Frameworks")
+# 失败不能整段崩掉：实测 Xcode 16.4 的 swift-stdlib-tool 扫描含 weak-linked
+# AppIntents 的扩展时会自己 trap（进程以 134 退出、日志里不给原因）。
+# deployment target 15.4 高于 Swift ABI 稳定线（iOS 12.2），设备自带 Swift 运行时，
+# 这一步通常没有库要拷；真正的兼容性 dylib 仍由下面的扫描 + 签名循环兜住。
 # 不扫描 widget 的 executable：它只弱链 ActivityKit / AppIntents（都是系统框架，
 # 不需要拷贝运行时），而 Xcode 16.4 的 swift-stdlib-tool 扫到 weak-linked
 # AppIntents 会自己 trap（退出码 134、不给原因）。扩展仍能用 app 里的 Frameworks。
@@ -281,10 +330,6 @@ if printf '%s\n' "$stdlib_help" | grep -q -- '--filter-for-swift-os'; then
 else
     printf 'note: swift-stdlib-tool 不支持 --filter-for-swift-os，跳过该过滤（deployment target 15.4 自带运行时）\n'
 fi
-# 失败不能整段崩掉：实测 Xcode 16.4 的 swift-stdlib-tool 扫描含 weak-linked
-# AppIntents 的扩展时会自己 trap（进程以 134 退出、日志里不给原因）。
-# deployment target 15.4 高于 Swift ABI 稳定线（iOS 12.2），设备自带 Swift 运行时，
-# 这一步通常没有库要拷；真正的兼容性 dylib 仍由下面的扫描 + 签名循环兜住。
 if ! xcrun --sdk iphoneos swift-stdlib-tool "${stdlib_args[@]}"; then
     printf 'warning: swift-stdlib-tool 失败（扫描阶段），继续由兼容性 dylib 扫描兜底\n' >&2
 fi
@@ -302,35 +347,53 @@ while IFS= read -r -d '' framework; do
     codesign --force --sign - --timestamp=none "$framework"
     codesign --verify --strict "$framework"
 done < <(find "$app_dir/Frameworks" "$widget_dir/Frameworks" "$broadcast_dir/Frameworks" -depth -type d -name '*.framework' -print0)
-# AppIntents metadata：小组件上的车控/刷新按钮靠它才生效。
+# AppIntents metadata：小组件上的车控/刷新按钮 + 主 App 的后台任务 intent 靠它才生效。
 #
 # 手写 swiftc 流程不会自动生成，必须自己跑 Xcode 内的 appintentsmetadataprocessor。
-# 缺了索引的真机表现是「按钮点了毫无反应」，日志里是 linkd Missing: <bundle>:<Type>，
-# 不崩溃也不报错，所以这里是硬闸门：工具不存在或产出为空都直接 BLOCKED。
-# 必须对 appex 与 app 各跑一次（按钮 intent 归属扩展，但系统也会查主 App 的索引）。
+# 缺了索引的真机表现是「按钮点了毫无反应」/「快捷指令里看不到 App」，日志里是
+# linkd Missing: <bundle>:<Type>，不崩溃也不报错，所以这里是硬闸门。
+#
+# --swift-const-vals-list 指向上面生成的「清单文件」（每行一个 const-values 路径），
+# 不是 JSON 本身；--compile-time-extraction 让 processor 走编译期提取路径。
 if [[ -f "${widget_const_values:-}" ]]; then
     metadata_tool="$(xcrun --find appintentsmetadataprocessor 2>/dev/null || true)"
-    [[ -n "$metadata_tool" && -x "$metadata_tool" ]] || {
-        printf 'BLOCKED: appintentsmetadataprocessor 不可用（需要完整 Xcode，不是只有 CLT）\n' >&2; exit 2; }
-    # appex 与主 App 各生成一份索引；主 App 的 intent 是快捷指令自动化入口，
-    # 扩展的 intent 是小组件按钮入口，两边都不能少。
+    if [ -z "$metadata_tool" ] || [ ! -x "$metadata_tool" ]; then
+        printf 'BLOCKED: appintentsmetadataprocessor 不可用（需要完整 Xcode，不是只有 CLT）\n' >&2; exit 2
+    fi
+    toolchain_dir="$(xcode-select -p 2>/dev/null)/Toolchains/XcodeDefault.xctoolchain"
+    if [ ! -d "$toolchain_dir" ]; then toolchain_dir="$(xcode-select -p 2>/dev/null)"; fi
+    # processor 强制要求显式 xcode-version，缺了会直接 error 退出、不产出任何索引。
+    xcode_version="$(xcodebuild -version 2>/dev/null | head -1 | awk '{print $2}')"
+    if [ -z "$xcode_version" ]; then xcode_version=16.0; fi
+    # appex 与主 App 各生成一份索引：扩展的 intent 是小组件按钮入口，
+    # 主 App 的 intent 是快捷指令自动化入口，两边都不能少。
     for bundle in "$widget_dir" "$app_dir"; do
         module_name=DashboardWidgets
-        const_values="$widget_const_values"
-        if [[ "$bundle" == "$app_dir" ]]; then
+        source_list="$build_dir/widget-sources.txt"
+        const_list="$widget_const_list"
+        if [ "$bundle" = "$app_dir" ]; then
             module_name=Dashboard
-            # 主 App 若没产出 const values（源码里没有 AppIntent），退回 widget 那份会让
-            # processor 收到错误模块的符号；这里只在文件真的存在时才替换。
-            [[ -f "${host_const_values:-}" ]] && const_values="$host_const_values"
+            source_list="$build_dir/swift-sources.txt"
+            # 主 App 的 const-values 同样过了协议清单，否则索引里没有后台 intent。
+            if [ -f "${host_const_values:-}" ]; then const_list="$host_const_list"; fi
         fi
-        "$metadata_tool" --toolchain-dir "$(dirname -- "$(dirname -- "$(xcrun --find swiftc)")")" \
+        metadata_log="$build_dir/appintents-$module_name.log"
+        "$metadata_tool" --toolchain-dir "$toolchain_dir" \
             --module-name "$module_name" --sdk-root "$sdk_path" \
             --platform-family iOS --deployment-target 15.4 \
+            --xcode-version "$xcode_version" \
             --target-triple arm64-apple-ios15.4 --output "$bundle" \
-            --swift-const-vals-list "$const_values" --force 2>&1 | sed 's/^/[appintents] /'
+            --source-file-list "$source_list" \
+            --swift-const-vals-list "$const_list" \
+            --compile-time-extraction --force >"$metadata_log" 2>&1 || true
+        echo "[appintents] $module_name: xcode=$xcode_version"
+        tail -5 "$metadata_log" | sed 's/^/[appintents]   /'
         # 索引必须真的落地，否则按钮/快捷指令会静默失效。
-        [[ -f "$bundle/Metadata.appintents/extract.actionsdata" ]] || {
-            printf 'BLOCKED: %s 缺少 AppIntents 索引（按钮会静默无效）\n' "$bundle" >&2; exit 2; }
+        if [ ! -f "$bundle/Metadata.appintents/extract.actionsdata" ]; then
+            echo "BLOCKED: $bundle 缺少 AppIntents 索引（按钮会静默无效）；processor 输出：" >&2
+            cat "$metadata_log" >&2
+            exit 2
+        fi
     done
 fi
 # 三个真实 bundle 内到外签名。模板不是 Apple 授权，不保证普通安装/TrollStore能力。
