@@ -177,7 +177,8 @@ private struct RefreshPill: View {
             .font(.system(size: fontSize))
             .foregroundColor(colors.accent)
             .lineLimit(1)
-            .frame(width: width, maxHeight: .infinity)
+            .frame(width: width)
+            .frame(maxHeight: .infinity)
             .background(RoundedRectangle(cornerRadius: WidgetMetrics.refreshCorner, style: .continuous)
                 .fill(colors.refreshBg))
     }
@@ -447,7 +448,7 @@ struct ZeehoVehicleWidgetView: View {
                         .padding(.leading, 4)
                 }
                 Spacer(minLength: 0)
-                if WidgetStatusText.outageDot(v, date: now) {
+                if WidgetStatusText.outageDot(vehicle: v, date: now) {
                     Circle()
                         .fill(colors.dot)
                         .frame(width: 4, height: 4)
