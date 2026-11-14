@@ -191,7 +191,7 @@ private actor IOSLiveActivityManager {
 }
 
 final class IOSSystemSurfacesService: NSObject, IOSBridgeService, IOSBridgeCancellableService,
-                                      IOSSystemSurfacePublisher, UIAdaptivePresentationControllerDelegate {
+                                      IOSSystemSurfacePublisher {
     let methods = ["system.surfaces.status", "system.snapshot", "liveActivity.start", "liveActivity.update", "liveActivity.end", "widgets.reload"]
     static let widgetKind = "ZeehoVehicleWidget"
     private let worker = DispatchQueue(label: "io.github.lswlc33.dashboard.system-surfaces", qos: .utility)
@@ -1047,8 +1047,6 @@ final class IOSSystemSurfacesService: NSObject, IOSBridgeService, IOSBridgeCance
         if cancel { job.lease.cancel() }
         jobs.removeValue(forKey: job.id)
         if interactiveJob === job { interactiveJob = nil }
-        // 清 delegate 再 dismiss：服务对象可能先于弹窗释放，残留 delegate 会断言。
-        job.alert?.presentationController?.delegate = nil
         job.alert?.dismiss(animated: false); job.alert = nil
         reply(value, nil)
     }
@@ -1068,21 +1066,11 @@ final class IOSSystemSurfacesService: NSObject, IOSBridgeService, IOSBridgeCance
         })
         alert.addAction(UIAlertAction(title: IOSStrings.continueButton, style: .default) { [weak self, weak job] _ in
             guard let self = self, let job = job, self.current(job), UIApplication.shared.applicationState == .active else { return }
-            job.alert?.presentationController?.delegate = nil
             job.alert = nil
             action()
         })
         job.alert = alert
         presenter.present(alert, animated: true)
-        // delegate 是弱引用且指向本服务（非 VC 对象）；弹窗被系统收走后残留 delegate
-        // 会在 setDelegate/释放时触发断言（真机崩溃栈在 confirm 的 setDelegate）。
-        // NativeFileStream 同款手法：消失即清，不留悬空引用。
-        alert.presentationController?.delegate = self
-    }
-    func presentationControllerDidDismiss(_ presentationController: UIPresentationController) {
-        presentationController.delegate = nil
-        guard let job = interactiveJob else { return }
-        finish(job, failure("user_cancelled"), cancel: true)
     }
     // MARK: - 统一 Widget / Android 方法适配出口
 

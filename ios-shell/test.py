@@ -253,10 +253,13 @@ def main():
         '扩展扫描结果只保留在诊断字段'
     assert '(!embedded ? "widget_extension_missing" : nil)' not in surfaces_src, \
         'reason 不能再由扩展扫描结果推导'
-    # 非 VC 服务对象挂 presentationController delegate，消失/结束/取消三条路径都要清，
-    # 否则残留弱引用在系统 setDelegate 时触发断言（真机崩溃栈在 confirm）。
-    assert surfaces_src.count('presentationController?.delegate = nil') >= 2, 'confirm 的 delegate 必须在结束与 dismiss 两条路径清理'
-    assert 'presentationController.delegate = nil' in surfaces_src, 'dismiss 回调里也要清 delegate'
+    # UIAlertController(.alert) 不能被手势滑走，presentationControllerDidDismiss 永远不会触发。
+    # 给非 VC 服务对象挂 delegate 只会在系统 setDelegate 时断言（真机崩溃栈就在 confirm），
+    # 所以这条链路彻底不挂 delegate；弹窗生命周期只由 action 回调与 finish 管理。
+    assert 'UIAdaptivePresentationControllerDelegate' not in surfaces_src, \
+        '系统展示服务不能再声明 presentation delegate'
+    assert 'presentationController' not in surfaces_src, \
+        'confirm 的 alert 不需要 presentationController delegate'
     assert 'UIBackgroundModes' in info, 'UIBackgroundModes 缺失：后台蓝牙/定位会静默降级'
     background = info.get('UIBackgroundModes') or []
     assert 'bluetooth-central' in background and 'location' in background, 'UIBackgroundModes 缺后台蓝牙/定位'
