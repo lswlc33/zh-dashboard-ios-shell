@@ -530,10 +530,15 @@ final class IOSSystemSurfacesService: NSObject, IOSBridgeService, IOSBridgeCance
                 executableSize = (try? target.resourceValues(forKeys: [.fileSizeKey]).fileSize).map(Int64.init) ?? 0
             }
         }
-        // 扩展可执行文件必须真的在且非空；bundle ID 只作诊断，不作判据。
+        // 扩展可执行文件必须真的在且非空；仅用于诊断，不再作为 supported 的判据。
         let embedded = widgetPlugin != nil && executableExists && executableIsExecutable && executableSize > 0
         let group = SystemSnapshotStore.isAvailable()
-        let supported = embedded && group
+        // supported 只认 App Group。真机实测：桌面小组件已经在出数据（说明扩展确实被
+        // 系统注册并在运行），但沙盒内扫描 PlugIns 仍可能因为重签改名/权限/plist 形态
+        // 而探测不到，于是设置页误报 widget_extension_missing，并把 Live Activity 与
+        // 刷新按钮一起封死——用户看到「按钮点不动」。扩展是否真的可用由系统注册状态决定，
+        // 沙盒内的文件扫描证明不了「不在」，所以这里不再用它做闸门，只保留诊断。
+        let supported = group
         // 侧载诊断：全能签等 P12 工具会把组名换成证书团队的，原始码 app_group_unavailable
         // 看不出签成了什么。把解析结果与来源一起回给设置页，便于用户截图定位。
         let groupInfo = AppGroup.resolution()
@@ -554,12 +559,17 @@ final class IOSSystemSurfacesService: NSObject, IOSBridgeService, IOSBridgeCance
         var liveSupported = false
         var authorization = false
         if #available(iOS 16.1, *) {
+            // Live Activity 与桌面小组件同属这个扩展，但同样以 App Group 为准：
+            // 沙盒扫描不到扩展不代表系统没注册它（真机小组件已在出数据）。
             liveSupported = supported && declaredLive
             authorization = liveSupported && ActivityAuthorizationInfo().areActivitiesEnabled
         }
         // 当前只用 StaticConfiguration：不再暴露「每实例选车」能力，避免声称一个没有注册的配置。
         let configurable = false
-        let reason: String? = !group ? "app_group_unavailable" : (!embedded ? "widget_extension_missing" : nil)
+        // 只把 App Group 缺失当作硬失败。扩展扫描结果只进诊断（widgetExtension.found）：
+        // 之前用它算 reason，会让「系统里明明正常的小组件」在设置页显示成 missing，
+        // 连带把 Live Activity 与刷新按钮一起封死。
+        let reason: String? = !group ? "app_group_unavailable" : nil
         let liveReason = reason ?? (!declaredLive ? "live_activities_not_declared" : (!liveSupported ? "ios_16_1_required" : (!authorization ? "live_activities_disabled" : "available")))
         return ["supported": supported, "embedded": embedded, "appGroupAvailable": group,
                 "appGroup": groupInfo, "widgetExtension": widgetInfo,
