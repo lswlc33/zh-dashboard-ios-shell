@@ -269,16 +269,25 @@ fi
 # 所以把输出先收进变量，再用 `|| true` 兜住 grep 的退出码。
 stdlib_help="$(xcrun --sdk iphoneos swift-stdlib-tool --help 2>&1 || true)"
 stdlib_args=(--copy --platform iphoneos
-    --scan-executable "$app_dir/Dashboard" --scan-executable "$widget_dir/DashboardWidgets"
+    --scan-executable "$app_dir/Dashboard"
     --scan-executable "$broadcast_dir/ZeehoCastBroadcast"
     --scan-folder "$app_dir/Frameworks" --scan-folder "$widget_dir/Frameworks" --scan-folder "$broadcast_dir/Frameworks"
     --destination "$app_dir/Frameworks")
+# 不扫描 widget 的 executable：它只弱链 ActivityKit / AppIntents（都是系统框架，
+# 不需要拷贝运行时），而 Xcode 16.4 的 swift-stdlib-tool 扫到 weak-linked
+# AppIntents 会自己 trap（退出码 134、不给原因）。扩展仍能用 app 里的 Frameworks。
 if printf '%s\n' "$stdlib_help" | grep -q -- '--filter-for-swift-os'; then
     stdlib_args+=(--filter-for-swift-os)
 else
     printf 'note: swift-stdlib-tool 不支持 --filter-for-swift-os，跳过该过滤（deployment target 15.4 自带运行时）\n'
 fi
-xcrun --sdk iphoneos swift-stdlib-tool "${stdlib_args[@]}"
+# 失败不能整段崩掉：实测 Xcode 16.4 的 swift-stdlib-tool 扫描含 weak-linked
+# AppIntents 的扩展时会自己 trap（进程以 134 退出、日志里不给原因）。
+# deployment target 15.4 高于 Swift ABI 稳定线（iOS 12.2），设备自带 Swift 运行时，
+# 这一步通常没有库要拷；真正的兼容性 dylib 仍由下面的扫描 + 签名循环兜住。
+if ! xcrun --sdk iphoneos swift-stdlib-tool "${stdlib_args[@]}"; then
+    printf 'warning: swift-stdlib-tool 失败（扫描阶段），继续由兼容性 dylib 扫描兜底\n' >&2
+fi
 while IFS= read -r -d '' dylib; do
     architectures="$(xcrun lipo -archs "$dylib")"
     if [[ "$architectures" != arm64 ]]; then
