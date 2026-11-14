@@ -541,10 +541,10 @@ struct ZeehoVehicleWidgetView: View {
         let line = WidgetStatusText.chargeLine(vehicle: presentation.vehicle, hasData: presentation.hasData, date: entry.date)
         let text = appendVoltage.map { "\(line.text) · \($0)" } ?? line.text
         let color: Color = {
-            switch line.color {
+            switch line.tone {
             case .warn: return colors.warn
             case .accent: return colors.accent
-            default: return colors.muted
+            case .normal: return colors.muted
             }
         }()
         return Text(text)
