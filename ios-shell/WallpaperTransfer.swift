@@ -17,6 +17,9 @@ private final class IOSWallpaperDownload: NSObject, URLSessionDataDelegate {
     private var task: URLSessionDataTask?
     private var file: FileHandle?
     private var received = 0, expected = -1, redirects = 0
+    // didReceive 分块的闸门节流游标（单调 uptime 秒，-1 = 尚未检查过）：与 received 等一样
+    // 只在 io 串行队列（URLSession delegate 回调队列）读写，无并发访问。
+    private var lastGuardAt: TimeInterval = -1
     private var failure: Error?
     private var completion: ((Result<IOSWallpaperPreparedPackage, Error>) -> Void)?
     private let lock = NSLock()
@@ -136,7 +139,13 @@ private final class IOSWallpaperDownload: NSObject, URLSessionDataDelegate {
     }
     func urlSession(_ session: URLSession, dataTask: URLSessionDataTask, didReceive data: Data) {
         do {
-            try guardDownload()
+            // 分块（约 64KB 一拍）不再逐块全量跑 guardDownload：它含主线程 sync 与最长 5s
+            // 的信号量等待，逐块检查会把传输拖成一拍一停。改为节流——首块必查，之后距上次
+            // 全量检查 ≥2 秒才再跑。guardDownload 本身语义不动：beginRequest/响应头/重定向/
+            // complete 与包校验仍逐次全量检查，安全闸门不被削弱；检查失败时不推进游标，
+            // 下一分块立即重查并走原有失败路径。
+            let now = ProcessInfo.processInfo.systemUptime
+            if lastGuardAt < 0 || now - lastGuardAt >= 2 { try guardDownload(); lastGuardAt = now }
             guard !data.isEmpty, data.count <= IOSWallpaperPackage.maxFile - received,
                   spec.fileSize == nil || received + data.count <= spec.fileSize!, let file = file else { throw IOSWallpaperError("download_size") }
             try file.write(contentsOf: data); received += data.count

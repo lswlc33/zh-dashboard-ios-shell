@@ -61,6 +61,15 @@ final class IOSSessionRenewalService: IOSBridgeCancellableService {
     private var authorizationExpired: ((UUID, IOSRideScope, String, String) -> Void)?
     private var materialChanged: MaterialChangedProvider?
     private var run: Run?
+    // deinit 兜底登记表：deinit 可能在任意线程，而 run 及其 timer 槽位是主线程专属状态
+    // （全文件 precondition(Thread.isMainThread)），deinit 里直接读是数据竞争；且 Swift
+    // 对象一旦进入析构就不能再被安全引用（在 deinit 里捕获 self 留待稍后使用是未定义
+    // 行为）。改为只在主线程的唯一赋值点（prepare 的 run = held）把 Run 登记到这张类级
+    // 表（NSLock 保护，任意线程可存取），deinit 从表里取走再派发主队列取消。表项生命
+    // 周期与 run 属性一致：被 stop() 收尾过的 Run 三个槽位已清空，再取消是空操作，
+    // 不改变任何语义。
+    private static let abandonedRunsLock = NSLock()
+    private static var abandonedRuns: [ObjectIdentifier: Run] = [:]
     private var page = 0
 
     private final class Run {
@@ -95,12 +104,17 @@ final class IOSSessionRenewalService: IOSBridgeCancellableService {
     }
     init(secrets: IOSSecretHandleService) { self.secrets = secrets }
     deinit {
-        // run/timeout 属性是主线程专属状态（全文件 precondition(Thread.isMainThread)），
-        // Swift 不保证 deinit 落在主线程——跨线程读它们是数据竞争。DispatchWorkItem.cancel()
-        // 本身线程安全，把读取与取消挪回主队列（参照 Bridge.deinit 的收尾写法）。
-        let fetch = run?.fetch, prepare = run?.prepareTimeout, operation = run?.operationTimeout
+        // run 与三个 timer 槽位是主线程专属状态（全文件 precondition(Thread.isMainThread)），
+        // 而 Swift 不保证 deinit 落在主线程——deinit 本体不再读任何实例属性（析构中的
+        // 对象也不能被闭包安全捕获）。改从类级登记表（锁保护，任意线程可取）拿走最后一次
+        // 登记的 Run；DispatchWorkItem.cancel / IOSRenewalFetch.cancel 本身线程安全，
+        // 派发回主队列执行，与槽位的全部历史写入（都在主线程）建立先后关系。
+        let token = ObjectIdentifier(self)
+        IOSSessionRenewalService.abandonedRunsLock.lock()
+        let abandoned = IOSSessionRenewalService.abandonedRuns.removeValue(forKey: token)
+        IOSSessionRenewalService.abandonedRunsLock.unlock()
         DispatchQueue.main.async {
-            fetch?.cancel(); prepare?.cancel(); operation?.cancel()
+            abandoned?.fetch?.cancel(); abandoned?.prepareTimeout?.cancel(); abandoned?.operationTimeout?.cancel()
         }
     }
     func configureScopeProvider(_ provider: @escaping () -> IOSRideScope?) { precondition(Thread.isMainThread); scopeProvider = provider }
@@ -142,6 +156,12 @@ final class IOSSessionRenewalService: IOSBridgeCancellableService {
             let recipe = try IOSRenewalRecipe.parse(options, secrets: secrets, scope: scope)
             let held = Run(lease: lease, recipe: recipe, page: page, reply: reply)
             run = held
+            // 同步登记到 deinit 兜底表（见 abandonedRuns 注释）。旧 run 若存在，必然已经
+            // stop()（只有 phase 为 cancelled/expired 才允许重新 prepare），槽位已清空，
+            // 直接覆盖登记即可。
+            IOSSessionRenewalService.abandonedRunsLock.lock()
+            IOSSessionRenewalService.abandonedRuns[ObjectIdentifier(self)] = held
+            IOSSessionRenewalService.abandonedRunsLock.unlock()
             let timeout = DispatchWorkItem { [weak self, weak held] in
                 guard let self = self, let held = held, self.run === held, held.prepareReply != nil else { return }
                 self.stop(held, reason: "prepare_timeout")

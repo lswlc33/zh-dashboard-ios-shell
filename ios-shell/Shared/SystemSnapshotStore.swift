@@ -328,7 +328,10 @@ public enum SystemSnapshotStore {
         try protected.setResourceValues(resource)
     }
 
-    // 仅清本匿名 summary 命名空间；保留同账号车辆，未知文件 fail closed，绝不触碰 Broadcast。
+    // 仅清本匿名 summary 命名空间；保留同账号车辆，绝不触碰 Broadcast。
+    // 非 .json 的完全未知条目（无名临时残留）跳过不删也不失败：清理若让整个 write/activate
+    // 卡死在 snapshot_storage_invalid，反而拖垮正常发布；.json 但 owner 名非法仍 fail closed
+    // （数据完整性闸门，不是残留），与 revokeAccount 对未知条目的跳过写法保持一致。
     private static func removeOrphans(_ root: URL, keepingOwner active: SystemSnapshotOwner) throws {
         let entries = try FileManager.default.contentsOfDirectory(at: root, includingPropertiesForKeys: [.isRegularFileKey], options: [])
         for entry in entries {
@@ -339,7 +342,10 @@ public enum SystemSnapshotStore {
                 try FileManager.default.removeItem(at: entry)
                 continue
             }
-            guard name.hasSuffix(".json"), ownerIdentifier(String(name.dropLast(5))) != nil else {
+            // 完全未知条目（非 .json）跳过：不属于本命名空间，不删不改、也不因此失败。
+            guard name.hasSuffix(".json") else { continue }
+            // .json 但 owner 名非法保持 fail closed：可能是被篡改/损坏的摘要名，不能放过。
+            guard ownerIdentifier(String(name.dropLast(5))) != nil else {
                 throw SystemSnapshotError("snapshot_storage_invalid")
             }
             guard let selected = try selectedOwner(String(name.dropLast(5)), at: root) else { continue }
@@ -348,8 +354,12 @@ public enum SystemSnapshotStore {
                 try FileManager.default.removeItem(at: entry)
             }
         }
-        let remaining = try FileManager.default.contentsOfDirectory(atPath: root.path).count
-        guard remaining <= maxVehicles + 3 else { throw SystemSnapshotError("snapshot_storage_limit") }
+        // 容量只按本命名空间的已知条目计（marker/lock/settings + 车辆 .json）：上面跳过的
+        // 无名残留不计数也不阻塞发布，其总量仍由 coordinated 入口的 64 上限兜住。
+        let known = try FileManager.default.contentsOfDirectory(atPath: root.path).filter { name in
+            [markerName, lockName, settingsName].contains(name) || name.hasSuffix(".json")
+        }
+        guard known.count <= maxVehicles + 3 else { throw SystemSnapshotError("snapshot_storage_limit") }
     }
 
     private static func coordinated<T>(create: Bool, revoking: Bool = false, action: (URL) throws -> T) throws -> T {

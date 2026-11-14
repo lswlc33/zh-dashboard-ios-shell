@@ -202,7 +202,10 @@ final class IOSVehicleNetworkService: IOSBridgeCancellableService {
     /// 重启后 wifi.leave 会永远 configuration_not_owned（配置删不掉，只能去系统设置手动删）。
     /// 持久化到 UserDefaults，与配置的生命周期对齐；join 用「系统里已存在」的判断兜住一致性。
     private var configuredOwners: [String: String]
-    private var vehicleProfiles: [String: Set<String>] = [:]
+    /// ownerHash → 该账号已确认过的车辆 AP SSID。internetRouteAllowed 的互联网闸门靠它
+    /// 区分车机 AP 与普通家庭路由（192.168.0/24 也常见于家用网段）；只存内存的话重启后
+    /// 闸门失忆，会把「已连着车机 AP」误判成可走互联网，与 configuredOwners 一并持久化。
+    private var vehicleProfiles: [String: Set<String>]
     // apply 没有撤销 API；迟到回调清理完前不允许同 SSID 的下一次 apply 竞争。
     private var applyingSSID: String?
     private var liveSockets: [UUID: IOSVehicleSocket] = [:]
@@ -210,6 +213,7 @@ final class IOSVehicleNetworkService: IOSBridgeCancellableService {
 
     private static let ownerStore = UserDefaults.standard
     private static let ownerStoreKey = "zeeho.wifi.configuredOwners.v1"
+    private static let profileStoreKey = "zeeho.wifi.vehicleProfiles.v1"
 
     init(allowedPorts: Set<UInt16> = []) {
         self.allowedPorts = Set(allowedPorts.filter { $0 > 0 }.sorted().prefix(8))
@@ -218,11 +222,22 @@ final class IOSVehicleNetworkService: IOSBridgeCancellableService {
         self.configuredOwners = stored.reduce(into: [:]) { map, item in
             if let hash = item.value as? String { map[item.key] = hash }
         }
+        // 只认 [String] 值的条目，脏数据直接丢弃而不是崩（与 configuredOwners 同一套写法）。
+        let storedProfiles = Self.ownerStore.dictionary(forKey: Self.profileStoreKey) ?? [:]
+        self.vehicleProfiles = storedProfiles.reduce(into: [:]) { map, item in
+            if let list = item.value as? [String] { map[item.key] = Set(list) }
+        }
     }
 
     /// 归属映射落盘：内存与 UserDefaults 一起更新，调用点都在主线程（join/leave 的桥入口）。
     private func persistOwners() {
         Self.ownerStore.set(configuredOwners, forKey: Self.ownerStoreKey)
+    }
+
+    /// 车辆 AP 学习记录落盘：内存与 UserDefaults 一起更新，写入/读取点都在主线程
+    /// （join/open 的回调与 internetRouteAllowed 的闸门）；存 [String: [String]]。
+    private func persistVehicleProfiles() {
+        Self.ownerStore.set(vehicleProfiles.mapValues { Array($0) }, forKey: Self.profileStoreKey)
     }
 
     func setScopeProvider(_ provider: @escaping () -> IOSRideScope?) {
@@ -389,7 +404,9 @@ final class IOSVehicleNetworkService: IOSBridgeCancellableService {
                             self.configuredOwners[profile.ssid] = scope.ownerHash
                             self.persistOwners()
                         }
-                        self.vehicleProfiles[scope.ownerHash, default: []].insert(profile.ssid)
+                        if self.vehicleProfiles[scope.ownerHash, default: []].insert(profile.ssid).inserted {
+                            self.persistVehicleProfiles()
+                        }
                         // 系统接受配置不等于已加入；先核对系统实际 SSID，再由 status 核验私网路径。
                         self.waitForRoute(profile: profile, scope: scope, token: token, completion: finish)
                     }
@@ -523,7 +540,9 @@ final class IOSVehicleNetworkService: IOSBridgeCancellableService {
                                 guard let self = self, self.page == revision else { reply(false); return }
                                 self.validate(route: route, scope: scope, cancellation: token, completion: reply)
                             }
-                            self.vehicleProfiles[scope.ownerHash, default: []].insert(profile.ssid)
+                            if self.vehicleProfiles[scope.ownerHash, default: []].insert(profile.ssid).inserted {
+                                self.persistVehicleProfiles()
+                            }
                             self.liveSockets[id] = socket
                             socket.onClosed = { [weak self] in self?.liveSockets.removeValue(forKey: id) }
                             DispatchQueue.main.asyncAfter(deadline: .now() + max(0.01, token.deadline - ProcessInfo.processInfo.systemUptime)) { [weak socket] in
