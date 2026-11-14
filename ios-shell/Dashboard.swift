@@ -321,7 +321,8 @@ final class PanelController: UIViewController, WKNavigationDelegate, WKUIDelegat
         let blobs = IOSNativeFileStreamService()
         let cast = IOSCastService()
         let widgets = IOSWidgetCompatibilityService(systemSurfaces: surfaces)
-        let background = IOSBackgroundService(presenter: { [weak self] in self })        let compatibility = IOSCompatibilityService(ride: ride, gps: IOSLocationService.shared,
+        let background = IOSBackgroundService(presenter: { [weak self] in self })
+        let compatibility = IOSCompatibilityService(ride: ride, gps: IOSLocationService.shared,
                                                    system: system, widget: widgets, utility: utility)
         let updates = IOSUpdateService(welcome: { [weak self] in self?.requestWelcome() ?? false },
             restart: { [weak self] in self?.restartAfterPanelUpdate() })
