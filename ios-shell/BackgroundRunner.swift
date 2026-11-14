@@ -1,6 +1,7 @@
 import Foundation
 import UserNotifications
 import UIKit
+import ZeehoSystemShared
 
 // 后台任务的实际执行体：签到、电量采样、充电状态变化通知。
 //

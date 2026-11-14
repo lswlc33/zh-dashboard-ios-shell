@@ -38,32 +38,9 @@ enum IOSBackgroundTaskID {
     /// 现在不注册也不提交，避免占掉 10 个 processing 槽位。
 }
 
-/// 后台任务可用的凭据。
+/// 后台任务可用的凭据定义在 BackgroundSigning.swift（那里也管 Keychain 存取）：
+/// 签名密钥与 token 必须成对存在，分开两个文件会让「谁能读密钥」变得模糊。
 ///
-/// 只保存「已经能在后台独立发请求」的最小集合：
-/// - `token`：用户登录态的 Bearer token；
-/// - `accountID` / `vin`：请求路径与 owner 隔离必需；
-/// - `signinToken`：h5 签到的 Bearer（与 app token 不是同一个域，官方接口对混用返回 401）。
-///
-/// 刻意不存 APP_SECRET：签名密钥是编译进 App 的常量（与 Android 侧 SignUtil 同源），
-/// 落盘只会平白多一份可被读取的密钥副本。
-struct IOSBackgroundCredential: Codable, Equatable, Sendable {
-    var accountID: String
-    var vin: String
-    /// app 域 token（tapi.zeehoev.com）。
-    var token: String
-    /// h5 签到域 token。空表示这条账号还没拿到可用的签到凭据。
-    var signinToken: String
-    var updatedAt: Int64
-
-    var isValid: Bool {
-        [accountID, vin, token].allSatisfy { value in
-            !value.isEmpty && value.utf8.count <= 512
-                && !value.unicodeScalars.contains { CharacterSet.controlCharacters.contains($0) }
-        }
-    }
-}
-
 /// 后台任务的状态回执，写进 App Group 给网页读。
 struct IOSBackgroundTaskReport: Codable, Equatable, Sendable {
     /// 最后一次跑完的绝对时间（Unix 毫秒）。从没跑过是 nil。

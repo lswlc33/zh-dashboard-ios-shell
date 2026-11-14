@@ -354,6 +354,16 @@ def main():
     # 不注册 AppShortcutsProvider 的话，快捷指令里根本看不到这些 intent。
     assert 'AppShortcutsProvider' in intents and 'appShortcuts' in intents, \
         '必须提供 AppShortcutsProvider 才能出现在快捷指令里'
+    # 同名类型只能定义一次：CI 实测重写文件时漏删旧定义，报
+    # "'X' is ambiguous for type lookup in this context"。
+    declarations = {}
+    for name in ('BackgroundTasks.swift', 'BackgroundSigning.swift', 'BackgroundRunner.swift',
+                 'BackgroundService.swift', 'BackgroundIntents.swift'):
+        source = strip_comments((root / name).read_text(encoding='utf-8'))
+        for declared in re.findall(r'^(?:public )?(?:struct|enum|final class|class) (\w+)', source, re.M):
+            declarations.setdefault(declared, []).append(name)
+    duplicates = {k: v for k, v in declarations.items() if len(v) > 1}
+    assert not duplicates, f'后台任务类型重复定义（会 ambiguous）：{duplicates}'
 
     # 主界面完全沉浸：WebView 四边贴 view（不是 safeAreaLayoutGuide），
     # 安全区改由 app.info.safeArea 交给网页，避免 WK 的 env() 给 0 或含导航栏高度。
