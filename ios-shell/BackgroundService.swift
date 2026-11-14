@@ -6,7 +6,7 @@ import UIKit
 /// 必须在**文件级**、且不是 private：`handle(method:args:reply:)` 是协议要求的
 /// internal 方法，它 throws 的类型若是 private，Swift 会报
 /// "method must be declared private because its parameter uses a private type"。
-enum BackgroundArgumentError: Error { let code: String; init(_ code: String) { self.code = code } }
+struct BackgroundArgumentError: Error { let code: String; init(_ code: String) { self.code = code } }
 
 // 后台能力对网页暴露的桥。
 // 网页侧只能做三件事：
@@ -24,7 +24,10 @@ final class IOSBackgroundService: NSObject, IOSBridgeService, IOSBridgeCancellab
     let methods = ["background.status", "background.credential", "background.credential.clear",
                    "background.samples.take", "background.schedule", "background.notify"]
 
-    private typealias Reply = (Any?, String?) -> Void
+    // 不能用 `private typealias`：handle(method:args:reply:) 是协议要求的 internal
+    // 方法，签名里出现 private 类型会被拒（CI 实测 "method must be declared private
+    // because its parameter uses a private type"）。
+    typealias Reply = (Any?, String?) -> Void
     private let presenterProvider: () -> UIViewController?
     private var pendingConfirmation: (() -> Void)?
     private var jobID = UUID()
