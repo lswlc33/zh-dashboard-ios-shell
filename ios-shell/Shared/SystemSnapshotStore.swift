@@ -126,11 +126,12 @@ public enum SystemSnapshotStore {
 
     private static func settings(at root: URL, active: SystemSnapshotOwner) throws -> SystemWidgetSettings {
         let account = active.accountHash ?? active.accountVINHash
-        guard let data = try boundedRead(root.appendingPathComponent(settingsName), limit: 1024) else {
+        guard let data = try boundedRead(root.appendingPathComponent(settingsName), limit: 2048) else {
             return SystemWidgetSettings(accountHash: account)
         }
         let shape = try object(data)
-        guard Set(shape.keys).isSubset(of: ["accountHash", "vehicleID", "showName", "showTime"]) else {
+        guard Set(shape.keys).isSubset(of: ["accountHash", "vehicleID", "showName", "showTime",
+                                          "darkMode", "stats"]) else {
             throw SystemSnapshotError("invalid_widget_settings")
         }
         let value = try JSONDecoder().decode(SystemWidgetSettings.self, from: data).validated()
@@ -282,8 +283,13 @@ public enum SystemSnapshotStore {
         try keys(selected, allowed: ["scopeID", "accountVINHash", "accountHash"], required: ["scopeID", "accountVINHash"])
         if let source = value["vehicle"], !(source is NSNull) {
             guard let source = source as? [String: Any] else { throw SystemSnapshotError("invalid_vehicle_snapshot") }
+            // 展示类统计字段与 Android 小组件 1:1 对齐；全部可选，缺测合法。
             try keys(source, allowed: ["name", "vinDisplaySuffix", "socPercent", "socUpdatedAt", "charging",
-                                      "chargingUpdatedAt", "chargeProgressPercent", "chargeProgressUpdatedAt", "updatedAt"],
+                                      "chargingUpdatedAt", "chargeProgressPercent", "chargeProgressUpdatedAt", "updatedAt",
+                                      "voltage", "current", "power", "lockState", "seatState", "online",
+                                      "todayMileKm", "lastMileKm", "lastRideMinutes", "totalMileKm", "rangeKm",
+                                      "integral", "unread", "tireFrontBar", "tireRearBar",
+                                      "tireFrontTemp", "tireRearTemp", "statsUpdatedAt"],
                      required: ["updatedAt"])
         }
         if let source = value["gauge"], !(source is NSNull) {

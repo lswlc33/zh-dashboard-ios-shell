@@ -197,13 +197,29 @@ def main():
                   '--scan-executable "$broadcast_dir/ZeehoCastBroadcast"',
                   '--scan-folder "$broadcast_dir/Frameworks"', 'Entitlements/Broadcast.entitlements'):
         assert token in build_sh, token
-    # Widget 统一 StaticConfiguration：bundle 只注册 StaticConfiguration 控件与 Live Activity，
-    # 不再有条件注册的 AppIntentConfiguration，也不调用 metadata 处理器。
+    # Widget 用 StaticConfiguration + AppIntent（车控/刷新按钮）。
+    # 交互按钮需要 AppIntents metadata 索引：缺了它点按钮会静默无效
+    # （真机日志 linkd Missing: <bundle>:<Type>），所以构建脚本必须
+    # 导出 const-values、跑 appintentsmetadataprocessor、并在签名之前生成索引。
     widget_bundle = (root / 'Widgets/ZeehoWidgets.swift').read_text(encoding='utf-8')
     assert 'ZeehoVehicleWidget()' in widget_bundle, 'Widget bundle 必须注册 StaticConfiguration 控件'
-    assert 'AppIntentConfiguration(' not in widget_bundle, 'StaticConfiguration 之外不应再有 AppIntent 控件'
-    assert 'appintentsmetadataprocessor' not in build_sh and 'Metadata.appintents' not in build_sh, \
-        'StaticConfiguration 不需要 AppIntents metadata，构建脚本不应再依赖它'
+    assert 'AppIntentConfiguration(' not in widget_bundle, '仍只用 StaticConfiguration 承载控件'
+    assert 'appintentsmetadataprocessor' in build_sh, '交互按钮必须生成 AppIntents metadata，否则点击无效'
+    assert 'extract.actionsdata' in build_sh, 'metadata 段必须校验索引真的落地'
+    assert '-emit-const-values-path' in build_sh, 'swiftc 必须导出 const-values 供 processor 使用'
+    assert '-weak_framework -Xlinker AppIntents' in build_sh, \
+        'AppIntents 必须链接但用 weak（deployment target 15.4，强链接会让老系统 dyld 崩）'
+    # 索引必须在签名之前生成，否则不会进签名封条。
+    assert build_sh.index('appintentsmetadataprocessor') < build_sh.index(
+        '--entitlements "$script_dir/Entitlements/Widgets.entitlements"'), 'metadata 必须在签名之前生成'
+    widget_commands = (root / 'Widgets/WidgetCommands.swift').read_text(encoding='utf-8')
+    assert 'ZeehoWidgetCommandIntent' in widget_commands and 'Button(intent:' in widget_commands, \
+        '车控按钮必须走 AppIntent'
+    assert 'ZeehoWidgetCommandMailbox.post' in widget_commands, '按钮必须投递命令给主 App 执行'
+    host_bridge = (root / 'Bridge.swift').read_text(encoding='utf-8')
+    assert 'ZeehoWidgetCommandMailbox.consume()' in host_bridge, '主 App 必须消费小组件命令'
+    assert '__zeehoWidgetCommand' in (root / 'bridge-bootstrap.js').read_text(encoding='utf-8'), \
+        '网页必须有接收小组件命令的入口'
     assert build_sh.index('--entitlements "$script_dir/Entitlements/Broadcast.entitlements"') < \
         build_sh.index('--entitlements "$script_dir/Entitlements/Widgets.entitlements"') < \
         build_sh.index('--entitlements "$script_dir/Entitlements/App.entitlements"'), '签名必须 Broadcast/Widget/App 由内到外'

@@ -36,6 +36,12 @@ enum WidgetStrings {
     static let elapsed = "已记录时长"
     static let activityUnavailable = "暂无数据"
     static let nativeGauge = "原生仪表"
+    // 车控按钮与刷新（与 Android 4×2/4×4 底部同一套文案）
+    static let refreshAction = "刷新"
+    static let controlUnlock = "解锁"
+    static let controlLock = "锁车"
+    static let controlHorn = "鸣笛"
+    static let controlSeat = "坐垫"
 }
 
 enum WidgetValueText {
@@ -106,6 +112,19 @@ struct WidgetVehiclePresentation {
 
     var vehicle: SystemVehicleSnapshot? { snapshot?.vehicle }
     var name: String { vehicle?.name ?? WidgetStrings.vehicle }
+    /// 当前快照的匿名 owner id（accountVINHash.scopeID），车控按钮投递命令时带它核对，
+    /// 避免旧小组件指向另一辆车。空串表示还没拿到快照。
+    var ownerID: String { snapshot?.owner.ownerIdentifierString ?? "" }
+    /// 车模：3D 车模与静态立绘都走 App Group 里的共享素材；缺图时不占位（同 Android w_car_box GONE）。
+    var hasVehicleArt: Bool { vehicle != nil }
+    /// 电量数字（未知 "—"）。
+    var socText: String { WidgetValueText.percent(soc) }
+    /// 是否「有数据」：任一状态字段已知（对齐 Android hasData）。
+    var hasData: Bool {
+        guard let vehicle = vehicle else { return false }
+        return vehicle.socPercent != nil || vehicle.charging != nil || vehicle.lockState != nil
+            || vehicle.seatState != nil || vehicle.online != nil
+    }
     /// 数值本身是否已过 freshWindow 新鲜窗口。
     var isStale: Bool {
         guard let snapshot = snapshot else { return false }
@@ -166,13 +185,19 @@ struct WidgetUpdatedAt: View {
 }
 
 struct WidgetSurface: ViewModifier {
+    var colors: WidgetPalette.Colors? = nil
+
     @ViewBuilder
     func body(content: Content) -> some View {
         if #available(iOS 17.0, *) {
             // 使用 WidgetKit 的系统背景约定，允许系统决定背景及边距的展示。
-            content.containerBackground(for: .widget) { Color(uiColor: .systemBackground) }
+            // 颜色用 Android WidgetTheme.bg，深浅由实例偏好决定。
+            content
+                .containerBackground(for: .widget) { colors?.bg ?? Color(uiColor: .systemBackground) }
         } else {
-            content.padding(16).background(Color(uiColor: .systemBackground))
+            content
+                .padding(16)
+                .background(colors?.bg ?? Color(uiColor: .systemBackground))
         }
     }
 }

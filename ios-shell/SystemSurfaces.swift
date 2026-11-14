@@ -661,8 +661,14 @@ final class IOSSystemSurfacesService: NSObject, IOSBridgeService, IOSBridgeCance
         guard Set(options.keys).isSubset(of: allowed.union(extras)) else { throw SystemSnapshotError("invalid_args") }
     }
     private func validateSnapshotKeys(_ options: [String: Any]) throws {
+        // 展示类统计字段（电压/电流/功率/锁车/坐垫/在线/里程/续航/骑行统计/胎压）与
+        // Android 小组件 1:1 对齐；全部可选，缺测合法。
         let allowed: Set<String> = ["accountId", "vin", "generation", "source", "capturedAt", "enable", "name",
-            "socPercent", "socUpdatedAt", "charging", "chargingUpdatedAt", "chargeProgressPercent", "chargeProgressUpdatedAt"]
+            "socPercent", "socUpdatedAt", "charging", "chargingUpdatedAt", "chargeProgressPercent", "chargeProgressUpdatedAt",
+            "voltage", "current", "power", "lockState", "seatState", "online",
+            "todayMileKm", "lastMileKm", "lastRideMinutes", "totalMileKm", "rangeKm",
+            "integral", "unread", "tireFrontBar", "tireRearBar",
+            "tireFrontTemp", "tireRearTemp", "statsUpdatedAt"]
         guard Set(options.keys).isSubset(of: allowed) else { throw SystemSnapshotError("invalid_args") }
     }
     private func vehicleSnapshot(_ options: [String: Any], scope: IOSRideScope) throws -> SystemVehicleSnapshot {
@@ -694,13 +700,47 @@ final class IOSSystemSurfacesService: NSObject, IOSBridgeService, IOSBridgeCance
                   clean.range(of: scope.vin, options: .caseInsensitive) == nil else { throw SystemSnapshotError("invalid_vehicle_name") }
             name = clean
         }
-        guard soc != nil || charging != nil || progress != nil || name != nil else { throw SystemSnapshotError("snapshot_data_required") }
-        let updated = [socAt, chargingAt, progressAt].compactMap { $0 }.max() ?? captured
+        // 展示类统计字段：统一一个采样时间，允许彼此独立缺失。
+        let voltage = try number(options["voltage"], range: 0...200)
+        let current = try number(options["current"], range: -500...500)
+        let power = try number(options["power"], range: -30_000...30_000)
+        let lockState = try intState(options["lockState"])
+        let seatState = try intState(options["seatState"])
+        let online = try intState(options["online"])
+        let todayMile = try number(options["todayMileKm"], range: 0...10_000)
+        let lastMile = try number(options["lastMileKm"], range: 0...10_000)
+        let lastMinutes = try number(options["lastRideMinutes"], range: 0...10_000)
+        let totalMile = try number(options["totalMileKm"], range: 0...2_000_000)
+        let rangeKm = try number(options["rangeKm"], range: 0...2_000)
+        let integral = try number(options["integral"], range: 0...100_000_000)
+        let unread = try intState(options["unread"], range: 0...100_000)
+        let tireFront = try number(options["tireFrontBar"], range: 0...20)
+        let tireRear = try number(options["tireRearBar"], range: 0...20)
+        let tireFrontTemp = try number(options["tireFrontTemp"], range: -60...200)
+        let tireRearTemp = try number(options["tireRearTemp"], range: -60...200)
+        // 统计时间用宽窗口：这些量本来就不是秒级刷新，按 180 秒判会整块恒为空。
+        let statsAt = try statsTimestamp(options["statsUpdatedAt"])
+        guard (statsAt == nil) == (voltage == nil && current == nil && power == nil && lockState == nil
+                                   && seatState == nil && online == nil && todayMile == nil && lastMile == nil
+                                   && lastMinutes == nil && totalMile == nil && rangeKm == nil && integral == nil
+                                   && unread == nil && tireFront == nil && tireRear == nil
+                                   && tireFrontTemp == nil && tireRearTemp == nil) else {
+            throw SystemSnapshotError("snapshot_timestamp_required")
+        }
+        guard let updated = [socAt, chargingAt, progressAt, statsAt].compactMap({ $0 }).max()
+                ?? (soc != nil || charging != nil || progress != nil || name != nil ? captured : nil) else {
+            throw SystemSnapshotError("snapshot_data_required")
+        }
         // 顶层时间跟真实字段同步时间走；不能靠页面刷新时间把旧车况变新。
         let suffix = scope.vin.utf8.count > 6 ? String(scope.vin.suffix(4)) : nil
         return SystemVehicleSnapshot(name: name, vinDisplaySuffix: suffix, socPercent: soc, socUpdatedAt: socAt,
             charging: charging, chargingUpdatedAt: chargingAt, chargeProgressPercent: progress,
-            chargeProgressUpdatedAt: progressAt, updatedAt: updated)
+            chargeProgressUpdatedAt: progressAt, updatedAt: updated,
+            voltage: voltage, current: current, power: power, lockState: lockState, seatState: seatState,
+            online: online, todayMileKm: todayMile, lastMileKm: lastMile, lastRideMinutes: lastMinutes,
+            totalMileKm: totalMile, rangeKm: rangeKm, integral: integral, unread: unread,
+            tireFrontBar: tireFront, tireRearBar: tireRear,
+            tireFrontTemp: tireFrontTemp, tireRearTemp: tireRearTemp, statsUpdatedAt: statsAt)
     }
     private func timestamp(_ value: Any?) throws -> Int64? {
         guard let value = value, !(value is NSNull) else { return nil }
@@ -715,6 +755,35 @@ final class IOSSystemSurfacesService: NSObject, IOSBridgeService, IOSBridgeCance
         guard let value = value as? NSNumber, CFGetTypeID(value) != CFBooleanGetTypeID(),
               value.doubleValue.isFinite, range.contains(value.doubleValue) else { throw SystemSnapshotError("invalid_snapshot_number") }
         return value.doubleValue
+    }
+    /// 0/1 或任意整数枚举（lockState / seatState / online / unread）。
+    /// 布尔真值不接受：那会让「未知」被静默洗成 0。
+    private func intState(_ value: Any?, range: ClosedRange<Int> = 0...1) throws -> Int? {
+        guard let value = value, !(value is NSNull) else { return nil }
+        guard let number = value as? NSNumber, CFGetTypeID(number) != CFBooleanGetTypeID() else {
+            throw SystemSnapshotError("invalid_snapshot_number")
+        }
+        let double = number.doubleValue
+        guard double.isFinite, double == double.rounded(), range.contains(Int(double)) else {
+            throw SystemSnapshotError("invalid_snapshot_number")
+        }
+        return Int(double)
+    }
+    /// 统计字段的采样时间：用 30 分钟宽窗口。
+    /// 车况标量（电量/充电）仍走 180 秒硬窗口 —— 那个是「实时读数」，
+    /// 而里程/胎压/积分本来就不是秒级刷新，按 180 秒判会让整块统计恒为空。
+    private func statsTimestamp(_ value: Any?) throws -> Int64? {
+        guard let value = value, !(value is NSNull) else { return nil }
+        guard let integer = IOSBridgePolicy.integer(value), integer >= 946_684_800_000 else {
+            throw SystemSnapshotError("invalid_snapshot_time")
+        }
+        let date = Date(timeIntervalSince1970: Double(integer) / 1000)
+        guard date.timeIntervalSince1970.isFinite,
+              SystemSnapshotFreshness.isFresh(Int64(integer), at: Date(),
+                  maxAgeSeconds: SystemSnapshotFreshness.widgetStatsMaxAgeSeconds) else {
+            throw SystemSnapshotError("snapshot_stale")
+        }
+        return Int64(integer)
     }
     private func optionalBoolean(_ value: Any?) throws -> Bool? {
         guard let value = value, !(value is NSNull) else { return nil }

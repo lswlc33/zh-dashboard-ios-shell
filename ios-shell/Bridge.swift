@@ -3,6 +3,7 @@ import UIKit
 import WebKit
 import CryptoKit
 import ZeehoShared
+import ZeehoSystemShared
 
 // 服务只声明自己的 RPC；桥统一保证主线程派发、可信导航、一次回执和有界生命周期。
 protocol IOSBridgeService: AnyObject {
@@ -728,6 +729,22 @@ final class IOSBridge {
         foreground = true
         generation += 1
         emitLifecycle("foreground")
+        drainWidgetCommands()
+    }
+
+    /// 消费小组件车控按钮投递的命令。
+    ///
+    /// 扩展进程不能跑网络/BLE，所以按钮只往 App Group 邮箱写一条命令
+    /// （见 Widgets/WidgetCommands.swift），主 App 回前台时在这里取出来，
+    /// 交给网页的车控逻辑执行（iOS 壳原生没有车控 API，安卓也走网页 car_cmd）。
+    /// 只投递一次、失败不重试：车控是显式动作，重复执行比不执行更危险。
+    private func drainWidgetCommands() {
+        guard foreground, let command = ZeehoWidgetCommandMailbox.consume() else { return }
+        guard let web = webView, !navigationID.isEmpty else { return }
+        let event: [String: Any] = ["action": command, "navId": navigationID, "generation": generation]
+        guard let json = try? IOSBridgePolicy.scriptJSON(event) else { return }
+        web.evaluateJavaScript("window.__zeehoWidgetCommand && window.__zeehoWidgetCommand(" + json + ");",
+                               completionHandler: nil)
     }
 
     private func emitLifecycle(_ kind: String) {

@@ -177,8 +177,13 @@ final class IOSWidgetCompatibilityService: IOSBridgeService, IOSBridgeCancellabl
         let generationText = generation as? String ?? IOSBridgePolicy.integer(generation).map(String.init)
         guard generationText == payload["generation"] as? String else { throw SystemSnapshotError("stale_session") }
         if status["source"] as? String == "foreground", status["capturedAt"] != nil {
+            // 展示类统计字段与 Android 小组件 1:1 对齐；全部可选，缺测就不下发。
             let allowed: Set<String> = ["source", "capturedAt", "name", "socPercent", "socUpdatedAt", "charging", "chargingUpdatedAt",
-                "chargeProgressPercent", "chargeProgressUpdatedAt"]
+                "chargeProgressPercent", "chargeProgressUpdatedAt",
+                "voltage", "current", "power", "lockState", "seatState", "online",
+                "todayMileKm", "lastMileKm", "lastRideMinutes", "totalMileKm", "rangeKm",
+                "integral", "unread", "tireFrontBar", "tireRearBar",
+                "tireFrontTemp", "tireRearTemp", "statsUpdatedAt"]
             for key in allowed { if let value = status[key] { payload[key] = value } }
             return payload
         }

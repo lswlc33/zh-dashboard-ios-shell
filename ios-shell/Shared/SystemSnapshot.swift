@@ -18,6 +18,9 @@ public struct SystemSnapshotOwner: Codable, Equatable, Hashable, Sendable {
         if let account = accountHash, let otherAccount = other.accountHash { return account == otherAccount }
         return accountVINHash == other.accountVINHash
     }
+    /// AppIntent 实体/配置用的匿名 id（与 SystemWidgetVehicle.id 同一拼法）。
+    /// 只暴露两个 hash，不含 VIN 与账号名。
+    public var ownerIdentifierString: String { accountVINHash + "." + scopeID }
     public var isValid: Bool {
         !scopeID.isEmpty && scopeID.utf8.count <= 96
             && scopeID.unicodeScalars.allSatisfy {
@@ -35,6 +38,9 @@ public struct SystemSnapshotOwner: Codable, Equatable, Hashable, Sendable {
 public enum SystemSnapshotFreshness {
     public static let vehicleMaxAgeSeconds: Double = 180
     public static let rideSpeedMaxAgeSeconds: Double = 10
+    // 统计类（里程/胎压/积分/电压电流功率）变化慢，与桌面小组件 30 分钟窗口对齐；
+    // 用 180 秒判会让这些整块恒为空。
+    public static let widgetStatsMaxAgeSeconds: Double = 30 * 60
     public static let futureToleranceSeconds: Double = 30
     public static func isFresh(_ timestamp: Int64?, at date: Date = Date(), maxAgeSeconds: Double) -> Bool {
         guard let timestamp = timestamp else { return false }
@@ -53,13 +59,48 @@ public struct SystemVehicleSnapshot: Codable, Equatable, Hashable, Sendable {
     public let chargeProgressPercent: Double?
     public let chargeProgressUpdatedAt: Int64?
     public let updatedAt: Int64
+    // ---- 与 Android 小组件 1:1 对齐所需的展示字段 ----
+    // 全部是可缺席的匿名标量：缺测就是 nil，绝不补 0 或拿旧值顶替。
+    // 只用于桌面/锁屏展示，不参与身份、凭据或位置。
+    public let voltage: Double?          // V，0.1 精度
+    public let current: Double?          // A
+    public let power: Double?            // W（负值为回充）
+    public let lockState: Int?           // 1=已锁 0=未锁 nil=未知
+    public let seatState: Int?           // 1=已锁 0=未锁 nil=未知
+    public let online: Int?              // 1=在线 0=离线 nil=未知
+    public let todayMileKm: Double?      // 今日骑行
+    public let lastMileKm: Double?       // 上次骑行
+    public let lastRideMinutes: Double?  // 上次骑行时长
+    public let totalMileKm: Double?      // 总里程
+    public let rangeKm: Double?          // 仪表续航（官方未校准）
+    public let integral: Double?         // 积分
+    public let unread: Int?              // 未读消息
+    public let tireFrontBar: Double?     // 前轮胎压
+    public let tireRearBar: Double?      // 后轮胎压
+    public let tireFrontTemp: Double?    // 前胎温度
+    public let tireRearTemp: Double?     // 后胎温度
+    public let statsUpdatedAt: Int64?    // 上述统计字段的统一采样时间
+
     public init(name: String? = nil, vinDisplaySuffix: String? = nil, socPercent: Double? = nil,
                 socUpdatedAt: Int64? = nil, charging: Bool? = nil, chargingUpdatedAt: Int64? = nil,
-                chargeProgressPercent: Double? = nil, chargeProgressUpdatedAt: Int64? = nil, updatedAt: Int64) {
+                chargeProgressPercent: Double? = nil, chargeProgressUpdatedAt: Int64? = nil, updatedAt: Int64,
+                voltage: Double? = nil, current: Double? = nil, power: Double? = nil,
+                lockState: Int? = nil, seatState: Int? = nil, online: Int? = nil,
+                todayMileKm: Double? = nil, lastMileKm: Double? = nil, lastRideMinutes: Double? = nil,
+                totalMileKm: Double? = nil, rangeKm: Double? = nil, integral: Double? = nil, unread: Int? = nil,
+                tireFrontBar: Double? = nil, tireRearBar: Double? = nil,
+                tireFrontTemp: Double? = nil, tireRearTemp: Double? = nil, statsUpdatedAt: Int64? = nil) {
         self.name = name; self.vinDisplaySuffix = vinDisplaySuffix; self.socPercent = socPercent
         self.socUpdatedAt = socUpdatedAt; self.charging = charging; self.chargingUpdatedAt = chargingUpdatedAt
         self.chargeProgressPercent = chargeProgressPercent; self.chargeProgressUpdatedAt = chargeProgressUpdatedAt
         self.updatedAt = updatedAt
+        self.voltage = voltage; self.current = current; self.power = power
+        self.lockState = lockState; self.seatState = seatState; self.online = online
+        self.todayMileKm = todayMileKm; self.lastMileKm = lastMileKm; self.lastRideMinutes = lastRideMinutes
+        self.totalMileKm = totalMileKm; self.rangeKm = rangeKm; self.integral = integral; self.unread = unread
+        self.tireFrontBar = tireFrontBar; self.tireRearBar = tireRearBar
+        self.tireFrontTemp = tireFrontTemp; self.tireRearTemp = tireRearTemp
+        self.statsUpdatedAt = statsUpdatedAt
     }
     // 云端时间是接口同步时间，不宣称是传感器时间；缺时间或超过 180 秒一律显示未知。
     public func visibleSOCPercent(at date: Date = Date()) -> Double? {
@@ -73,6 +114,54 @@ public struct SystemVehicleSnapshot: Codable, Equatable, Hashable, Sendable {
     public func visibleChargeProgress(at date: Date = Date()) -> Double? {
         SystemSnapshotFreshness.isFresh(chargeProgressUpdatedAt, at: date, maxAgeSeconds: SystemSnapshotFreshness.vehicleMaxAgeSeconds)
             ? chargeProgressPercent : nil
+    }
+    /// 统计类字段（里程/胎压/积分等）变化慢，用与桌面小组件一致的 30 分钟窗口；
+    /// 缺测就是 nil，不参与「未知」以外的任何推断。
+    public var hasStatistics: Bool {
+        statsUpdatedAt != nil && (voltage != nil || tireFrontBar != nil || tireRearBar != nil
+            || todayMileKm != nil || lastMileKm != nil || totalMileKm != nil
+            || rangeKm != nil || integral != nil || unread != nil
+            || current != nil || power != nil || lastRideMinutes != nil)
+    }
+    /// 前后胎压都没有时（无胎压车型），展示层让位给总里程 —— 与 Android 判据完全一致：
+    /// 只有「两个传感器都没上报」才让位，只缺一侧仍显示「—」。
+    public var hasTirePressure: Bool { tireFrontBar != nil || tireRearBar != nil }
+    // 状态类字段（锁车/坐垫/在线）用与车况标量相同的 180 秒窗口：
+    // 它们是「当前状态」，过期后就不该再宣称已锁车/在线。
+    /// 锁车状态：1 = 已锁、0 = 未锁、nil = 未知。
+    public func visibleLockState(at date: Date = Date()) -> Int? {
+        SystemSnapshotFreshness.isFresh(statsUpdatedAt, at: date, maxAgeSeconds: SystemSnapshotFreshness.vehicleMaxAgeSeconds)
+            ? lockState : nil
+    }
+    public func visibleSeatState(at date: Date = Date()) -> Int? {
+        SystemSnapshotFreshness.isFresh(statsUpdatedAt, at: date, maxAgeSeconds: SystemSnapshotFreshness.vehicleMaxAgeSeconds)
+            ? seatState : nil
+    }
+    public func visibleOnlineState(at date: Date = Date()) -> Int? {
+        SystemSnapshotFreshness.isFresh(statsUpdatedAt, at: date, maxAgeSeconds: SystemSnapshotFreshness.vehicleMaxAgeSeconds)
+            ? online : nil
+    }
+    /// 统计类字段的可见性：里程/胎压/积分等用 30 分钟宽窗口。
+    public func visibleStatistics(at date: Date = Date()) -> Bool {
+        SystemSnapshotFreshness.isFresh(statsUpdatedAt, at: date, maxAgeSeconds: SystemSnapshotFreshness.widgetStatsMaxAgeSeconds)
+    }
+    public func visibleTires(at date: Date = Date()) -> Bool {
+        SystemSnapshotFreshness.isFresh(statsUpdatedAt, at: date, maxAgeSeconds: SystemSnapshotFreshness.widgetStatsMaxAgeSeconds)
+    }
+    public func visibleVoltage(at date: Date = Date()) -> Double? {
+        visibleStatistics(at: date) ? voltage : nil
+    }
+    public func visibleCurrent(at date: Date = Date()) -> Double? {
+        visibleStatistics(at: date) ? current : nil
+    }
+    public func visiblePower(at date: Date = Date()) -> Double? {
+        visibleStatistics(at: date) ? power : nil
+    }
+    public func visibleTotalMile(at date: Date = Date()) -> Double? {
+        visibleStatistics(at: date) ? totalMileKm : nil
+    }
+    public func visibleRange(at date: Date = Date()) -> Double? {
+        visibleStatistics(at: date) ? rangeKm : nil
     }
 }
 
@@ -174,6 +263,23 @@ public struct SystemSnapshot: Codable, Equatable, Hashable, Sendable {
                   (value.socPercent == nil) == (value.socUpdatedAt == nil),
                   (value.charging == nil) == (value.chargingUpdatedAt == nil),
                   (value.chargeProgressPercent == nil) == (value.chargeProgressUpdatedAt == nil) else {
+                throw SystemSnapshotError("invalid_vehicle_snapshot")
+            }
+            // 展示类统计字段：只做范围与符号校验，缺测合法。
+            // 单位统一为展示单位（V/A/W/bar/km/分），负功率表示回充，其余不允许负值。
+            guard number(value.voltage, range: 0...200), number(value.current, range: -500...500),
+                  number(value.power, range: -30_000...30_000),
+                  number(value.todayMileKm, range: 0...10_000), number(value.lastMileKm, range: 0...10_000),
+                  number(value.lastRideMinutes, range: 0...10_000), number(value.totalMileKm, range: 0...2_000_000),
+                  number(value.rangeKm, range: 0...2_000), number(value.integral, range: 0...100_000_000),
+                  number(value.tireFrontBar, range: 0...20), number(value.tireRearBar, range: 0...20),
+                  number(value.tireFrontTemp, range: -60...200), number(value.tireRearTemp, range: -60...200),
+                  value.lockState.map({ [0, 1].contains($0) }) ?? true,
+                  value.seatState.map({ [0, 1].contains($0) }) ?? true,
+                  value.online.map({ [0, 1].contains($0) }) ?? true,
+                  value.unread.map({ (0...100_000).contains($0) }) ?? true,
+                  sampleTime(value.statsUpdatedAt),
+                  value.statsUpdatedAt.map({ $0 <= capturedAt }) ?? true else {
                 throw SystemSnapshotError("invalid_vehicle_snapshot")
             }
         }

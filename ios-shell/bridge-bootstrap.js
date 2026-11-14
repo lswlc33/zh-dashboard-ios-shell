@@ -273,4 +273,16 @@
         }) }));
       }
     } });
+  // 小组件车控按钮投递的命令（主 App 回前台时由 Bridge.drainWidgetCommands 派发）。
+  // 只转发给网页，具体执行仍走网页自己的车控通道（与安卓同一条 car_cmd 链路），
+  // 桥不认识车控语义、也不在原生侧伪造一次「已执行」。
+  Object.defineProperty(w, '__zeehoWidgetCommand', { configurable: false, writable: false,
+    value: function (event) {
+      if (!event || event.navId !== config.navId) return;
+      if (w.dispatchEvent && typeof w.CustomEvent === 'function') {
+        w.dispatchEvent(new w.CustomEvent('zeehoios:widget-command', { detail: Object.freeze({
+          action: String(event.action || ''), navId: config.navId, generation: event.generation
+        }) }));
+      }
+    } });
 })(window, __ZEEHO_IOS_CONFIG__);
