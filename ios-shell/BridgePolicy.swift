@@ -22,7 +22,10 @@ enum IOSBridgePolicy {
         "ble.diagnostic.open", "session.renew.prepare", "compat.call", "cast.start",
         // 本地实验壁纸 ZIP 构建+MD5 可能超默认 30s；与 ios-bridge.js 的 INTERACTIVE 逐项对齐，
         // 不加会让「网页还在等、原生 30s 到点已撤单」。
-        "asset.zip.build.begin"
+        "asset.zip.build.begin",
+        // 后台凭据会落 Keychain 并长期有效，原生必定弹确认框；超时必须放宽，
+        // 否则用户还在读说明文字，网页已经报超时了。
+        "background.credential"
     ]
     static let maxBodyBytes = 8 * 1024 * 1024
     static let maxResponseBytes = 4 * 1024 * 1024

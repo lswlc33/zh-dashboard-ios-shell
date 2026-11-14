@@ -23,6 +23,56 @@ public enum SystemSnapshotStore {
         #endif
     }
 
+    /// App Group 容器根目录（不含本模块的 snapshots 子目录）。
+    ///
+    /// 后台任务日志要放在这里，而不是 ZeehoSystemSnapshots-v1 里：后者被
+    /// `reconcile` 按 owner 白名单清扫，混进去会被当孤儿删掉。
+    public static func containerURL() throws -> URL {
+        #if os(iOS) || os(macOS)
+        guard let container = FileManager.default.containerURL(
+            forSecurityApplicationGroupIdentifier: appGroupIdentifier) else {
+            throw SystemSnapshotError("app_group_unavailable")
+        }
+        return container
+        #else
+        throw SystemSnapshotError("app_group_unavailable")
+        #endif
+    }
+
+    // MARK: - 后台任务回执
+    //
+    // 与快照分开存放：后台任务的「上次跑了什么」不属于任何一辆车，也不该随
+    // 换账号被清掉（否则用户看到的一直是「从未运行」，无从判断功能是否生效）。
+    // 键里只带任务名，内容是 JSON；不做 owner 隔离。
+
+    private static let backgroundReportPrefix = "bgtask-report-"
+
+    public static func readBackgroundReport(_ identifier: String) -> Data? {
+        guard let safe = backgroundIdentifier(identifier) else { return nil }
+        return (try? coordinated(create: false) { root in
+            let url = root.appendingPathComponent(backgroundReportPrefix + safe, isDirectory: false)
+            return try boundedRead(url, limit: 4096)
+        }) ?? nil
+    }
+
+    public static func writeBackgroundReport(_ data: Data, identifier: String) {
+        guard let safe = backgroundIdentifier(identifier), data.count <= 4096 else { return }
+        try? coordinated(create: true) { root in
+            let url = root.appendingPathComponent(backgroundReportPrefix + safe, isDirectory: false)
+            try data.write(to: url, options: .atomic)
+        }
+    }
+
+    /// 只接受 identifier 的最后一段做文件名，避免任何路径分隔符进来。
+    private static func backgroundIdentifier(_ identifier: String) -> String? {
+        let safe = identifier.split(separator: ".").last.map(String.init) ?? ""
+        guard !safe.isEmpty, safe.utf8.count <= 64,
+              safe.unicodeScalars.allSatisfy({
+                  (48...57).contains($0.value) || (65...90).contains($0.value) || (97...122).contains($0.value)
+              }) else { return nil }
+        return safe
+    }
+
     public static func currentOwner() throws -> SystemSnapshotOwner? {
         try coordinated(create: false) { root in try owner(at: root) }
     }

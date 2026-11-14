@@ -6,7 +6,7 @@ Swift UIKit + WKWebView 面板壳，默认从 `https://lswlc33.github.io/zeeho-3
 
 构建目标仍是 arm64 iPhone / iPad、**iOS 15.4**。网页检查真实 `HTMLElement.inert`，参考基线为 **iOS / Safari 15.5**；只补确定性的 `findLast`，不伪造 `inert`，不能保证 15.4 可用。Live Activities 另需 **iOS 16.1+**；Widget 每实例车辆选择使用 **iOS 17+** 的 AppIntentConfiguration，旧系统沿用默认 StaticConfiguration。更高系统版本、方法存在或合成回执均不是设备验收证明。
 
-新网页等待真实 `WKScriptMessageHandlerWithReply` 的 `hello`，按逐方法 capability 与 `NativeShell.has(method)` 启用业务，不注入同步 `ZeehoShell`。普通浏览器 / PWA 转下载页；本地回环预览、旧壳或桥自检失败进入隔离合成 UI，不保存真实账号、不请求官方 API / H5 或发送车控，原生动作显示 `unavailable`。产品平台只有 Android / iOS，标签只用精确 `Android only` / `iOS only`，跨平台功能无标签；[功能环境标记](../docs/功能环境标记.md) 中旧归属需结合本轮[迁移验收](../docs/iOS原生兼容迁移验收.md) 阅读。
+新网页等待真实 `WKScriptMessageHandlerWithReply` 的 `hello`，按逐方法 capability 与 `NativeShell.has(method)` 启用业务，不注入同步 `ZeehoShell`。普通浏览器 / PWA 转下载页；本地回环预览、旧壳或桥自检失败进入隔离合成 UI，不保存真实账号、不请求官方 API / H5 或发送车控，原生动作显示 `unavailable`。产品平台只有 Android / iOS，平台归属只作内部渲染/执行判据、界面不展示平台标签；[功能环境标记](../docs/功能环境标记.md) 中旧归属需结合本轮[迁移验收](../docs/iOS原生兼容迁移验收.md) 阅读。
 
 ## 已接入源码与系统展示
 
@@ -31,7 +31,7 @@ Swift UIKit + WKWebView 面板壳，默认从 `https://lswlc33.github.io/zeeho-3
 - 「我的 → iOS 系统展示」使用标准页面卡片，提供启用 / 关闭、活动开始 / 更新 / 结束及小组件刷新。执行检查真实回执、有效车辆范围、extension、App Group 与系统权限；缺能力显示 `unavailable`。公开 entitlement 模板不证明群组权限已获批准，灵动岛展示还取决于设备硬件与系统。
 - 车辆数值超过 **180 秒**、骑行速度超过 **10 秒**显示过期 / 未知；重新读取或刷新不改样本时间。iOS 16.2+ 使用 `staleDate`，16.1 没有同等系统自动过期保证。Widget 实际刷新受系统预算控制，`reload_requested` 不是已显示新数据。
 
-后台连续电量 / 完整充电采样、每日自动云任务、Android 桌面小组件、VPN 抓取、Android Wi-Fi Direct 建组与 root 增强仍是 `Android only`；iOS 普通 AP 投屏与壁纸传输是另一条已接源码、未验设备的路线。iOS 可保存真实前台历史与已收到的骑行点，缺测留空；不能宣称完整连续轨迹、后台电池健康或用 GPS 推算容量。
+后台连续电量 / 完整充电采样、每日自动云任务、Android 桌面小组件、VPN 抓取、Android Wi-Fi Direct 建组与 root 增强仍只有 Android 原生实现；iOS 普通 AP 投屏与壁纸传输是另一条已接源码、未验设备的路线。iOS 可保存真实前台历史与已收到的骑行点，缺测留空；不能宣称完整连续轨迹、后台电池健康或用 GPS 推算容量。
 
 ## iOS 软件更新与面板更新
 

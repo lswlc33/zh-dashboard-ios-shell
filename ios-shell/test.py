@@ -206,7 +206,7 @@ def main():
     assert 'AppIntentConfiguration(' not in widget_bundle, '仍只用 StaticConfiguration 承载控件'
     assert 'appintentsmetadataprocessor' in build_sh, '交互按钮必须生成 AppIntents metadata，否则点击无效'
     assert 'extract.actionsdata' in build_sh, 'metadata 段必须校验索引真的落地'
-    assert '--source-file-list' in build_sh, 'metadata 生成必须给 processor 源码清单'
+    assert '-emit-const-values-path' in build_sh, 'swiftc 必须导出 const-values 供 processor 使用'
     assert '-weak_framework -Xlinker AppIntents' in build_sh, \
         'AppIntents 必须链接但用 weak（deployment target 15.4，强链接会让老系统 dyld 崩）'
     # 索引必须在签名之前生成，否则不会进签名封条。
@@ -279,7 +279,70 @@ def main():
     assert 'UIBackgroundModes' in info, 'UIBackgroundModes 缺失：后台蓝牙/定位会静默降级'
     background = info.get('UIBackgroundModes') or []
     assert 'bluetooth-central' in background and 'location' in background, 'UIBackgroundModes 缺后台蓝牙/定位'
+    # BGAppRefreshTask 需要 fetch；缺了 submit 会被系统直接拒绝，后台签到/采样永远不跑。
+    assert 'fetch' in background, 'UIBackgroundModes 缺 fetch：BGAppRefreshTask 无法提交'
+    # identifier 必须与 BackgroundTasks.swift 里的常量逐字一致，否则 submit 抛
+    # BGTaskSchedulerErrorCodeUnavailable，日志里只会看到 "No handler registered"。
+    permitted = info.get('BGTaskSchedulerPermittedIdentifiers') or []
+    assert 'io.github.lswlc33.dashboard.ios.refresh' in permitted, \
+        'BGTaskSchedulerPermittedIdentifiers 缺 refresh（后台采样不会跑）'
+    assert 'io.github.lswlc33.dashboard.ios.signin' in permitted, \
+        'BGTaskSchedulerPermittedIdentifiers 缺 signin（自动签到不会跑）'
     assert 'UILaunchScreen' in info, 'UILaunchScreen 缺失：启动时会出现黑屏/兼容模式'
+
+    # ---- 后台任务（BGAppRefreshTask + 原生签到/采样）----
+    background_tasks = strip_comments((root / 'BackgroundTasks.swift').read_text(encoding='utf-8'))
+    # identifier 必须与 Info.plist 逐字一致（上面已断言 plist 侧，这里断言代码侧同值）。
+    assert '"io.github.lswlc33.dashboard.ios.refresh"' in background_tasks, 'refresh identifier 与 plist 不一致'
+    assert '"io.github.lswlc33.dashboard.ios.signin"' in background_tasks, 'signin identifier 与 plist 不一致'
+    # 注册必须在 didFinishLaunching 附近发生：Apple 要求启动结束前注册完，否则系统唤起时
+    # 找不到 handler，日志只会说 "No handler registered"，任务被静默丢弃。
+    assert 'IOSBackgroundScheduler.shared.register(' in \
+        strip_comments((root / 'Dashboard.swift').read_text(encoding='utf-8')), \
+        '必须在 AppDelegate 启动阶段注册后台任务 handler'
+    # 每次跑完都要重排下一次，否则 BGTaskScheduler 队列只有一条、跑完就再也不跑。
+    assert 'reschedule(' in background_tasks, '后台任务必须自我重排'
+    # expirationHandler 必须收尾：到点不 setTaskCompleted 会被系统认为任务失控并降低后续调度。
+    assert 'expirationHandler' in background_tasks and 'setTaskCompleted' in background_tasks, \
+        '后台任务必须处理超时并回报 setTaskCompleted'
+
+    # 后台不能跑网页（Apple Frameworks Engineer: "This is by design"；Cordova CB-10657 Won't Fix）。
+    # 所以后台逻辑必须是原生 HTTP + 原生签名，绝不能出现 WKWebView / evaluateJavaScript。
+    for name in ('BackgroundRunner.swift', 'BackgroundSigning.swift', 'BackgroundService.swift'):
+        source = strip_comments((root / name).read_text(encoding='utf-8'))
+        for forbidden in ('WKWebView', 'evaluateJavaScript', 'webkit'):
+            assert forbidden not in source, f'{name} 不能在后台依赖网页（{forbidden}）'
+    signing = strip_comments((root / 'BackgroundSigning.swift').read_text(encoding='utf-8'))
+    # 签名算法必须是 sha1Hex -> md5Hex 这条与网页同构的链；写成 HMAC 会全量 401。
+    assert 'sha1Hex' in signing and 'md5Hex' in signing, '后台签名必须复刻 sha1HexThenMd5Hex'
+    assert 'Insecure.SHA1' in signing and 'Insecure.MD5' in signing, '后台签名要用 CryptoKit 的 Insecure 摘要'
+    # 密钥不能是源码常量：ios-shell/ 会整目录同步到公开仓库（sync-public-ios.sh），
+    # 写死就是公开发布密钥。密钥必须由网页在用户授权后交给原生、存 Keychain。
+    forbidden_secret = re.compile(r'(APP_SECRET|H5_SECRET|H5_BOX_SECRET)\s*[:=]\s*"[^"]{8,}"')
+    for name in ('BackgroundRunner.swift', 'BackgroundSigning.swift', 'BackgroundService.swift'):
+        source = (root / name).read_text(encoding='utf-8')
+        assert not forbidden_secret.search(source), f'{name} 不得内联签名密钥（公开仓库会同步 ios-shell/）'
+    assert 'kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly' in signing, \
+        '后台凭据必须用 AfterFirstUnlock（锁屏时会被唤醒）+ ThisDeviceOnly（不跨设备同步）'
+
+    # 充电/任务提醒必须落在与 notifications.* 相同的 namespace，
+    # 否则网页的 notifications.cancel 删不掉后台发的通知。
+    runner = strip_comments((root / 'BackgroundRunner.swift').read_text(encoding='utf-8'))
+    assert '"dashboard.local."' in runner and '"dashboard.system.local.v1"' in runner, \
+        '后台通知必须复用 dashboard.local. 前缀与 namespaced'
+    # 充电翻转只认明确的 true->false；nil 是「接口没给」，不能当成状态变化。
+    assert 'lastCharging' in runner or 'previous.lastCharging' in runner, \
+        '充电翻转判定必须基于上一次的明确样本'
+    # 后台采样不能直接写 History 的历史文件（battery/ledger 双份 + fingerprint 校验），
+    # 必须走待合并队列，由前台用 history.record 入账。
+    assert 'IOSBackgroundSampleQueue' in runner, '后台采样必须走待合并队列'
+    assert 'IOSHistoryService' not in runner, '后台不能直接调 IOSHistoryService（会破坏历史文件格式）'
+    # 充电视时活动要在充电明确结束时自动收尾（只认 true->false，不碰 ride/gauge）。
+    assert 'autoEndChargingActivity' in surfaces_src, '充电结束应自动收起充电视时活动'
+    # 车速活动节流必须 >= 5 秒：iOS 18 起本地 update 被压到 5~15 秒，
+    # 2 秒的旧值纯属白耗 CPU 且会被系统合并。
+    assert 'gaugeInterval: TimeInterval = 5' in surfaces_src, \
+        '车速 Live Activity 节流应为 5 秒（对齐 iOS 18 的本地更新限制）'
 
     # 主界面完全沉浸：WebView 四边贴 view（不是 safeAreaLayoutGuide），
     # 安全区改由 app.info.safeArea 交给网页，避免 WK 的 env() 给 0 或含导航栏高度。

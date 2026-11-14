@@ -566,7 +566,12 @@ final class IOSSystemService: NSObject, IOSBridgeCancellableService, IOSBridgeMe
             "systemVersion": UIDevice.current.systemVersion, "methods": methods,
             "maxFileBytes": Self.maxFileBytes, "maxClipboardBytes": Self.maxClipboardBytes,
             "photoMimeTypes": Self.photoMimes, "localNotifications": true,
-            "backgroundPolling": false, "liveActivities": false, "crossAppMedia": false,
+            // backgroundPolling 保持 false：iOS **没有**定时轮询能力，别让网页当成有。
+            // backgroundTasks 单独报「BGAppRefreshTask 可用」，但时序不保证；
+            // 精确状态（是否已排队 / 上次跑了什么）由 background.status 给。
+            "backgroundPolling": false, "backgroundTasks": true,
+            "backgroundSchedulerAvailable": true, "backgroundDeliveryGuaranteed": false,
+            "liveActivities": true, "crossAppMedia": false,
             // 网页用它决定顶栏/底栏留白。WebView 已铺满整屏，env(safe-area-inset-*)
             // 在 WK 里可能给 0，所以必须由原生给出真实点值（pt 与 CSS px 1:1）。
             "safeArea": safeAreaJSON(),
@@ -911,7 +916,8 @@ final class IOSSystemService: NSObject, IOSBridgeCancellableService, IOSBridgeMe
         return ["status": status, "authorizationStatus": status, "enabled": enabled,
                 "canRequest": settings.authorizationStatus == .notDetermined,
                 "alert": settings.alertSetting == .enabled, "sound": settings.soundSetting == .enabled,
-                "localNotifications": true, "backgroundPolling": false, "liveActivities": false,
+                "localNotifications": true, "backgroundPolling": false,
+                "backgroundTasks": true, "liveActivities": true,
                 "foregroundPresentation": "systemDefault"]
     }
 

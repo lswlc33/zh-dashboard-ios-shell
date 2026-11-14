@@ -943,6 +943,14 @@ def validate_ipa(path, expected_info=None):
         require(widget_metadata, 'Widget must embed AppIntents metadata for its control buttons')
         require(metadata_prefix + 'extract.actionsdata' in names,
                 'Widget AppIntents index is missing extract.actionsdata')
+        # 主 App 也声明 AppIntent（BackgroundIntents.swift 的签到/采样 + AppShortcutsProvider）。
+        # 快捷指令的「个人自动化 → 特定时间」是 iOS 上唯一有系统保证的定时入口，
+        # 索引缺失时用户在快捷指令里根本看不到这些 intent，且系统不报错（静默无效）。
+        app_metadata_prefix = app_prefix + 'Metadata.appintents/'
+        app_metadata = sorted(n for n in names if n.startswith(app_metadata_prefix))
+        require(app_metadata, 'App must embed AppIntents metadata for its background task intents')
+        require(app_metadata_prefix + 'extract.actionsdata' in names,
+                'App AppIntents index is missing extract.actionsdata')
         dynamic = app_prefix + 'Frameworks/ZeehoShared.framework/ZeehoShared'
         linkage = 'static'
         if dynamic in reports:
@@ -954,6 +962,7 @@ def validate_ipa(path, expected_info=None):
         resolve_imports(reports, names, app_prefix)
         return {'info': info, 'linkage': linkage, 'machO': reports, 'artifactKind': 'full-app',
                 'widgetAppIntentsMetadata': widget_metadata,
+                'appAppIntentsMetadata': app_metadata,
                 'bridgeSha256': hashlib.sha256(bridge).hexdigest(),
                 'executableSha256': hashlib.sha256(archive.read(binary_name)).hexdigest()}
 
@@ -976,6 +985,16 @@ def validate_target_frameworks(reports, inputs):
                 forms.append(swift_overlays[name])
             require(any(form in linked for form in forms),
                     'Imported system framework not linked into ' + binary + ': ' + name)
+        # Host 侧 iOS 16+ 框架必须弱链接：deployment target 是 15.4，
+        # 强链接会让老系统在 dyld 阶段直接崩（不是运行时降级，是启动即失败）。
+        # 这条只覆盖 Host：扩展的同类断言在 validate_ipa 的 widgets 分支里。
+        if key == 'systemFrameworks':
+            for name in ('ActivityKit', 'AppIntents'):
+                if name not in inputs[key]:
+                    continue
+                imports = [i for i in reports[binary]['imports'] if '/' + name + '.framework/' in i['path']]
+                require(imports and all(i['weak'] for i in imports),
+                        'Host must weak-link ' + name + ' (strong link crashes dyld on iOS 15.x)')
 
 
 def release_metadata(path, info):
@@ -1117,6 +1136,7 @@ def verify_artifacts(path, expected_info=None, source_manifest=None):
     validate_target_frameworks(report['machO'], manifest)
     require(re.fullmatch(r'[0-9a-f]{64}', manifest.get('sharedFrameworkSha256', '')), 'Shared framework checksum missing')
     require(manifest.get('widgetAppIntentsMetadata') == report['widgetAppIntentsMetadata'], 'Widget AppIntents metadata checksum mismatch')
+    require(manifest.get('appAppIntentsMetadata') == report['appAppIntentsMetadata'], 'App AppIntents metadata checksum mismatch')
     require(manifest.get('machO') == report['machO'] and manifest.get('bridgeSha256') == report['bridgeSha256'], 'Build manifest Mach-O/resource mismatch')
     require(manifest.get('buildHostPlatform') == 'Darwin' and manifest.get('codeSigningVerifiedOnMac') is True, 'Missing actual macOS code-sign verification record')
     records = manifest.get('inputs', [])

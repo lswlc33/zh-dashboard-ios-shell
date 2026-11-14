@@ -21,6 +21,17 @@ final class AppDelegate: UIResponder, UIApplicationDelegate {
         if let identifiers = launchOptions?[.bluetoothCentrals] as? [String] {
             IOSBluetoothService.shared.restoreIfRequested(identifiers)
         }
+        // 后台任务必须在 didFinishLaunching 里注册完，否则系统唤起时找不到 handler
+        // （日志只会看到 "No handler registered"，任务被静默丢弃）。
+        // 注册本身不发请求、不申请权限：真正的执行等到系统唤醒时才发生。
+        if #available(iOS 13.0, *) {
+            IOSBackgroundScheduler.shared.register(
+                refresh: { completion in IOSBackgroundRunner.runRefresh(completion: completion) },
+                signIn: { completion in IOSBackgroundRunner.runSignIn(completion: completion) })
+            // 这里只重排一次，让「上次卸载/关机导致队列清空」的情况能自己恢复。
+            // 用户关掉自动签到时 signIn 会被 isEnabled 挡掉，不会偷偷跑。
+            IOSBackgroundScheduler.shared.scheduleAll()
+        }
         return true
     }
 }
@@ -310,12 +321,13 @@ final class PanelController: UIViewController, WKNavigationDelegate, WKUIDelegat
         let blobs = IOSNativeFileStreamService()
         let cast = IOSCastService()
         let widgets = IOSWidgetCompatibilityService(systemSurfaces: surfaces)
-        let compatibility = IOSCompatibilityService(ride: ride, gps: IOSLocationService.shared,
+        let background = IOSBackgroundService(presenter: { [weak self] in self })        let compatibility = IOSCompatibilityService(ride: ride, gps: IOSLocationService.shared,
                                                    system: system, widget: widgets, utility: utility)
         let updates = IOSUpdateService(welcome: { [weak self] in self?.requestWelcome() ?? false },
             restart: { [weak self] in self?.restartAfterPanelUpdate() })
         let core = IOSBridge(webView: web, services: [IOSLocationService.shared, bluetooth, ride, history,
-                             system, surfaces, line, utility, secrets, renewal, wifi, tcp, assets, blobs, cast, widgets, compatibility, updates])
+                             system, surfaces, line, utility, secrets, renewal, wifi, tcp, assets, blobs, cast, widgets,
+                             background, compatibility, updates])
         let scope: () -> IOSRideScope? = { [weak core] in core?.nativeSessionScope() }
         let presenter: () -> UIViewController? = { [weak self] in self }
         let metadata: () -> [String: Any]? = { [weak core] in core?.nativeSessionMetadata() }

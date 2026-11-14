@@ -37,6 +37,20 @@
     <key>UIBackgroundModes</key><array>
         <string>bluetooth-central</string>
         <string>location</string>
+        <!-- BGAppRefreshTask 需要 fetch；没有它 submit 会被系统直接拒绝。 -->
+        <string>fetch</string>
+        <!-- 静默推送（content-available）用 remote-notification。当前没有 aps-environment
+             权益（ad-hoc 签名拿不到），这一项只有在用户用自己的付费证书重签后才真正生效；
+             留着是因为它不影响无推送时的行为，且省得以后再加时忘改 plist。 -->
+        <string>remote-notification</string>
+    </array>
+    <!-- BGTaskScheduler 的 identifier 必须与代码里的常量逐字一致，否则 submit 抛错。
+         两个 identifier 分别是：后台补采车况/电量、每日自动签到。
+         系统只保证「不早于 earliestBeginDate」，实际何时跑由使用习惯决定。 -->
+    <key>BGTaskSchedulerPermittedIdentifiers</key>
+    <array>
+        <string>io.github.lswlc33.dashboard.ios.refresh</string>
+        <string>io.github.lswlc33.dashboard.ios.signin</string>
     </array>
     <key>NSSupportsLiveActivities</key><true/>
     <!-- 诊断日志写在 Documents，开这两个键才能在「文件」App 里看到并导出。

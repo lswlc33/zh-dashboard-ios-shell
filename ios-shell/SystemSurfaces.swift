@@ -902,11 +902,19 @@ final class IOSSystemSurfacesService: NSObject, IOSBridgeService, IOSBridgeCance
                 if let job = job, !self.current(job) { return }
                 switch result {
                 case .success:
+                    let previousVehicle = self.persistedSnapshot?.vehicle
                     self.persistedSnapshot = value
                     // 写回调不能让活动车速倒退到排队前；车况沿用本次成功值，原生源使用最新已接受样本。
                     self.latest = (try? self.candidate(vehicle: value.vehicle)) ?? value
                     self.lastError = nil
                     self.reloadWidgets(force: false, snapshot: value)
+                    // 充电结束就自动收起充电活动：用户此时已经不需要盯着进度条，
+                    // 留着会被系统算到 8 小时上限里，还占着灵动岛位置。
+                    // 只认明确的 true→false；nil（接口没给）一律不动。
+                    if let before = previousVehicle?.charging, before,
+                       let after = value.vehicle?.charging, !after {
+                        self.autoEndChargingActivity(next: value)
+                    }
                     if let completion = completion { completion() }
                     else {
                         self.publishExistingActivity(self.latest ?? value)
@@ -983,7 +991,18 @@ final class IOSSystemSurfacesService: NSObject, IOSBridgeService, IOSBridgeCance
               nativeGauge.map({ value.updatedAt >= $0.updatedAt }) ?? true else { return }
         nativeGauge = value
         if nativeRide != nil { scheduleNativePersistence(scope: captured, immediate: false) }
-        guard approved, !revoking, ProcessInfo.processInfo.systemUptime - lastGaugePublish >= 2 else { return }
+        guard approved, !revoking else { return }
+        // Live Activity 的本地 update 有系统级节流：
+        // iOS 17 时接近每秒一次，**iOS 18 起被压到约 5~15 秒一次**
+        // （Apple 答复开发者："Live Activities were never intended to be used to create
+        // real-time experiences. That we allowed this was a hole in the API. That hole is
+        // fixed in iOS 18."）。所以这里按 5 秒下限发，比系统阈值略快一点点：
+        // 多出来的那些会被系统合并，而不是被丢弃；低于 5 秒则纯粹是白耗 CPU。
+        //
+        // 为什么不设更长（比如 15 秒）：iPhone 18 Pro 起灵动岛可同显两个活动，
+        // 系统允许的有效刷新率并不固定在 15 秒；5 秒是「既不浪费又尽量跟上」的折中。
+        let gaugeInterval: TimeInterval = 5
+        guard ProcessInfo.processInfo.systemUptime - lastGaugePublish >= gaugeInterval else { return }
         do {
             let value = try candidate()
             // 活动车速采用有限频率；Widget 不随每个速度样本重写，避免系统预算与共享 IO 浪费。
@@ -1018,6 +1037,22 @@ final class IOSSystemSurfacesService: NSObject, IOSBridgeService, IOSBridgeCance
             let manager = liveManager()
             Task { _ = await manager.end(owner: owner, kind: .ride) }
         }
+    }
+
+    /// 充电视时活动的自动收尾。
+    ///
+    /// 只在「明确充电中 → 明确未充电」时触发。`nil`（接口没给这个字段）不动：
+    /// 缺测不是状态变化，凭它收掉活动会让用户以为充电结束了。
+    private func autoEndChargingActivity(next: SystemSnapshot) {
+        guard let owner = owner, #available(iOS 16.1, *) else { return }
+        guard runningValue().contains(where: { $0.kind == .charging }) else { return }
+        let manager = liveManager()
+        Task {
+            // 只结束 .charging 这一种，不碰用户可能同时开着的 ride/gauge 活动。
+            _ = await manager.end(owner: owner, kind: .charging)
+        }
+        IOSBackgroundLog.write("充电结束，自动收起充电视时活动")
+        _ = next
     }
 
     private func startActivity(_ value: SystemSnapshot, kind: ZeehoActivityKind, job: Job) {
