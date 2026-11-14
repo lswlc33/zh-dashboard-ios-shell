@@ -897,11 +897,19 @@ def validate_ipa(path, expected_info=None):
             require({'@executable_path/Frameworks', '@executable_path/../../Frameworks', '/usr/lib/swift'} <= set(code['rpaths']),
                     'Extension runtime search paths are incomplete: ' + key)
             if key == 'widgets':
-                # Widget 只用 StaticConfiguration，不再依赖 AppIntents；ActivityKit 仍需弱链接。
+                # Widget 用 StaticConfiguration 承载控件 + AppIntent 承载车控/刷新按钮。
+                # ActivityKit 与 AppIntents 都必须弱链接：deployment target 是 15.4，
+                # 强链接 iOS 16+ 框架会让老系统 dyld 崩；真正用到的地方都有 #available 降级。
                 imports = [i for i in code['imports'] if '/ActivityKit.framework/' in i['path']]
                 require(imports and all(i['weak'] for i in imports), 'iOS 15.4 Widget must weak-link ActivityKit')
-                require(not any('/AppIntents.framework/' in i['path'] for i in code['imports']),
-                        'Widget no longer uses AppIntents; it must not link it')
+                appintents = [i for i in code['imports'] if '/AppIntents.framework/' in i['path']]
+                require(appintents, 'Widget 交互按钮需要 AppIntents：必须链接，否则 Button(intent:) 无法解析')
+                require(all(i['weak'] for i in appintents),
+                        'iOS 15.4 Widget must weak-link AppIntents (strong link crashes dyld on older systems)')
+                # 交互按钮靠 AppIntents metadata 索引生效；索引必须真的打进 appex，
+                # 且必须在签名之前生成（否则不进签名封条）。
+                require('Metadata.appintents/extract.actionsdata' in names,
+                        'Widget 缺少 Metadata.appintents/extract.actionsdata：按钮点击会静默无效')
             if key == 'broadcast':
                 require(any('/ReplayKit.framework/' in i['path'] for i in code['imports'])
                         and any('/VideoToolbox.framework/' in i['path'] for i in code['imports']),
@@ -928,12 +936,13 @@ def validate_ipa(path, expected_info=None):
                 reports[name] = macho(data, 6)
             elif data.startswith((b'\xcf\xfa\xed\xfe', b'\xfe\xed\xfa\xcf', b'\xca\xfe\xba\xbe', b'!<arch>\n')):
                 raise ValueError('Unexpected executable/archive in IPA: ' + name)
-        # Widget 已统一用 StaticConfiguration，不再声明 AppIntents 配置，因此包内不应出现
-        # Metadata.appintents；如果出现了，说明构建还在用旧的 AppIntentConfiguration。
+        # Widget 的控件仍是 StaticConfiguration，但车控/刷新按钮走 AppIntent，
+        # 所以包内**必须**有 Metadata.appintents 索引（缺了按钮点不动）。
         metadata_prefix = extension_prefixes['widgets'] + 'Metadata.appintents/'
-        require(not any(n.startswith(metadata_prefix) for n in names),
-                'Widget must not embed AppIntents metadata: StaticConfiguration only')
-        widget_metadata = []
+        widget_metadata = sorted(n for n in names if n.startswith(metadata_prefix))
+        require(widget_metadata, 'Widget must embed AppIntents metadata for its control buttons')
+        require(metadata_prefix + 'extract.actionsdata' in names,
+                'Widget AppIntents index is missing extract.actionsdata')
         dynamic = app_prefix + 'Frameworks/ZeehoShared.framework/ZeehoShared'
         linkage = 'static'
         if dynamic in reports:
