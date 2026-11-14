@@ -239,6 +239,13 @@ def main():
     assert 'widgetExtension' in surfaces_src, '诊断必须回传扩展探测明细'
     for banned in ('== "io.github.lswlc33.dashboard.ios.widgets"', '+ ".widgets"'):
         assert banned not in surfaces_src, '扩展判据不能再依赖 bundle ID 推断: ' + banned
+    # 探测失败不能放大成「快照永不落盘」：写快照/开关/配置只依赖 App Group，
+    # 只有真正要求扩展存在的操作（status 展示、pin 指引）才看 supported。
+    assert 'requiresVerifiedExtension' in surfaces_src, 'system.snapshot 必须与扩展探测解耦'
+    assert 'guard available["appGroupAvailable"] as? Bool == true else { return false }' in surfaces_src, \
+        'reloadWidgets 只应依赖 App Group，不能按 supported 拦下'
+    assert 'operation == "pin"' in surfaces_src, 'widgets 兼容出口只对 pin 要求扩展存在'
+    assert 'executableSize' in surfaces_src and 'pluginsDirectoryExists' in surfaces_src, '诊断要含扩展可执行文件大小与 PlugIns 是否存在'
     # 非 VC 服务对象挂 presentationController delegate，消失/结束/取消三条路径都要清，
     # 否则残留弱引用在系统 setDelegate 时触发断言（真机崩溃栈在 confirm）。
     assert surfaces_src.count('presentationController?.delegate = nil') >= 2, 'confirm 的 delegate 必须在结束与 dismiss 两条路径清理'

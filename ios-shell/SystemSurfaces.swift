@@ -415,8 +415,19 @@ final class IOSSystemSurfacesService: NSObject, IOSBridgeService, IOSBridgeCance
             guard !revoking else { throw SystemSnapshotError("system_surfaces_busy") }
             let current = try checkedScope(options)
             let availability = runtimeAvailability()
-            guard availability["supported"] as? Bool == true else {
-                throw SystemSnapshotError(availability["reason"] as? String ?? "system_surfaces_unavailable")
+            // 闸门按操作分层：写快照/开关只是主 App 往共享容器落盘，与「扩展是否被系统
+            // 注册」无关，只要 App Group 可用就该放行。若沿用 supported（= embedded && group），
+            // 侧载后扩展探测一旦误判，快照就永远不写，桌面小组件表现为「车况暂无数据」，
+            // 连「打开 App 同步一次」这条兜底都失效——这是比探测本身更严重的失败放大。
+            let requiresVerifiedExtension = method != "system.snapshot"
+            if requiresVerifiedExtension {
+                guard availability["supported"] as? Bool == true else {
+                    throw SystemSnapshotError(availability["reason"] as? String ?? "system_surfaces_unavailable")
+                }
+            } else {
+                guard availability["appGroupAvailable"] as? Bool == true else {
+                    throw SystemSnapshotError("app_group_unavailable")
+                }
             }
             let job = try begin(method, args: args, reply: reply)
             operation = job
@@ -485,18 +496,21 @@ final class IOSSystemSurfacesService: NSObject, IOSBridgeService, IOSBridgeCance
     // runtime 元数据与容器检查不等于本会话已经做过 Apple 编译/真机验收；绝不请求系统权限来探测。
     func runtimeAvailability() -> [String: Any] {
         precondition(Thread.isMainThread)
-        // 重签工具改扩展 bundle ID 的规则不止一种（原样保留 / 主ID+.widgets /
-        // 主ID.原组件名 都见过），任何写死或按后缀推断的比对都会误报
-        // widget_extension_missing。改为按 WidgetKit 的 NSExtensionPointIdentifier
-        // 在 PlugIns 里认出真正的扩展，并把每项检查结果回传，便于侧载场景定位。
+        // 重签工具改扩展 bundle ID / 目录名的规则不止一种，任何写死或按后缀推断的比对
+        // 都会误报 widget_extension_missing。改为枚举 PlugIns 下的 .appex，
+        // 直接读每个扩展的 Info.plist 文件（不用 Bundle(url:)——它对未注册的 appex
+        // 可能拿不到 infoDictionary，那会让所有候选都被跳过），
+        // 按 WidgetKit 的 NSExtensionPointIdentifier 认出真正的扩展。
         let plugins = Bundle.main.bundleURL.appendingPathComponent("PlugIns", isDirectory: true)
         var widgetPlugin: (url: URL, info: [String: Any])?
         var appexNames: [String] = []
+        var profileNames: [String] = []
         for name in (try? FileManager.default.contentsOfDirectory(atPath: plugins.path))?.sorted() ?? [] {
             guard name.hasSuffix(".appex") else { continue }
             appexNames.append(name)
             let url = plugins.appendingPathComponent(name, isDirectory: true)
-            guard let info = Bundle(url: url)?.infoDictionary else { continue }
+            guard let data = try? Data(contentsOf: url.appendingPathComponent("Info.plist")),
+                  let info = try? PropertyListSerialization.propertyList(from: data, options: [], format: nil) as? [String: Any] else { continue }
             let extensionInfo = info["NSExtension"] as? [String: Any]
             guard extensionInfo?["NSExtensionPointIdentifier"] as? String == "com.apple.widgetkit-extension" else { continue }
             if widgetPlugin == nil { widgetPlugin = (url, info) }
@@ -504,17 +518,20 @@ final class IOSSystemSurfacesService: NSObject, IOSBridgeService, IOSBridgeCance
         var executableName: String?
         var executableExists = false
         var executableIsExecutable = false
+        var executableSize: Int64 = 0
         if let plugin = widgetPlugin {
-            let name = plugin.info[kCFBundleExecutableKey as String] as? String ?? ""
+            let name = plugin.info["CFBundleExecutable"] as? String ?? ""
             executableName = name.isEmpty ? nil : name
             if !name.isEmpty {
-                let path = plugin.url.appendingPathComponent(name, isDirectory: false).path
+                let target = plugin.url.appendingPathComponent(name, isDirectory: false)
+                let path = target.path
                 executableExists = FileManager.default.fileExists(atPath: path)
                 executableIsExecutable = FileManager.default.isExecutableFile(atPath: path)
+                executableSize = (try? target.resourceValues(forKeys: [.fileSizeKey]).fileSize).map(Int64.init) ?? 0
             }
         }
-        // 扩展可执行文件必须真的在；bundle ID 只作诊断，不作判据。
-        let embedded = widgetPlugin != nil && executableIsExecutable
+        // 扩展可执行文件必须真的在且非空；bundle ID 只作诊断，不作判据。
+        let embedded = widgetPlugin != nil && executableExists && executableIsExecutable && executableSize > 0
         let group = SystemSnapshotStore.isAvailable()
         let supported = embedded && group
         // 侧载诊断：全能签等 P12 工具会把组名换成证书团队的，原始码 app_group_unavailable
@@ -522,12 +539,17 @@ final class IOSSystemSurfacesService: NSObject, IOSBridgeService, IOSBridgeCance
         let groupInfo = AppGroup.resolution()
         let widgetInfo: [String: Any] = [
             "found": embedded,
+            "pluginsDirectoryExists": FileManager.default.fileExists(atPath: plugins.path),
             "appexNames": appexNames,
-            "bundleIdentifier": widgetPlugin?.info[kCFBundleIdentifierKey as String] as? String ?? NSNull(),
+            "bundleIdentifier": widgetPlugin?.info["CFBundleIdentifier"] as? String ?? NSNull(),
             "hostBundleIdentifier": Bundle.main.bundleIdentifier ?? NSNull(),
             "executableName": executableName ?? NSNull(),
             "executableExists": executableExists,
-            "executableIsExecutable": executableIsExecutable]
+            "executableIsExecutable": executableIsExecutable,
+            "executableSize": executableSize,
+            // WidgetKit 能否真正刷新还取决于系统是否注册了这个扩展：
+            // 侧载包即使文件齐全，`WidgetCenter` 也可能因为扩展未注册而不生效。
+            "widgetKind": Self.widgetKind]
         let declaredLive = Bundle.main.object(forInfoDictionaryKey: "NSSupportsLiveActivities") as? Bool == true
         var liveSupported = false
         var authorization = false
@@ -986,7 +1008,9 @@ final class IOSSystemSurfacesService: NSObject, IOSBridgeService, IOSBridgeCance
 
     @discardableResult private func reloadWidgets(force: Bool, snapshot: SystemSnapshot?) -> Bool {
         let available = runtimeAvailability()
-        guard available["supported"] as? Bool == true else { return false }
+        // 只要 App Group 可用就发刷新请求：reloadTimelines 对「扩展未被系统注册」是
+        // 安全的空操作，而按 supported（含扩展探测）拦下会让侧载用户连手动刷新都失效。
+        guard available["appGroupAvailable"] as? Bool == true else { return false }
         let edge = snapshot.map {
             "\($0.vehicle?.charging.map(String.init) ?? "unknown"):\($0.ride?.state.rawValue ?? "none"):\($0.ride?.gapCount ?? 0)"
         } ?? "cleared"
@@ -1080,8 +1104,16 @@ final class IOSSystemSurfacesService: NSObject, IOSBridgeService, IOSBridgeCance
             let currentScope = try checkedScope([:])
             guard let selected = owner else { throw SystemSnapshotError("authorized_vehicle_required") }
             let availability = runtimeAvailability()
-            guard availability["supported"] as? Bool == true else {
-                throw SystemSnapshotError(availability["reason"] as? String ?? "system_surfaces_unavailable")
+            // 小组件配置/偏好只是往共享容器写 plist，与扩展是否被系统注册无关；
+            // 只有真正要求扩展存在的操作（pin 指引）才看 supported。
+            if operation == "pin" {
+                guard availability["supported"] as? Bool == true else {
+                    throw SystemSnapshotError(availability["reason"] as? String ?? "system_surfaces_unavailable")
+                }
+            } else {
+                guard availability["appGroupAvailable"] as? Bool == true else {
+                    throw SystemSnapshotError("app_group_unavailable")
+                }
             }
             let job = try begin(method, args: args, reply: reply)
             pending = job
