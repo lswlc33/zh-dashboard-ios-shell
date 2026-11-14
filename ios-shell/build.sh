@@ -290,29 +290,38 @@ done < <(find "$app_dir/Frameworks" "$widget_dir/Frameworks" "$broadcast_dir/Fra
 # 不给 --swift-const-vals-list：那需要 Xcode 自己的协议清单，手写流程拿不到，
 # 传空文件反而可能产出结构合法但 actions 为空的索引。改让 processor 扫源码。
 metadata_tool="$(xcrun --find appintentsmetadataprocessor 2>/dev/null || true)"
-[[ -n "$metadata_tool" && -x "$metadata_tool" ]] || {
-    printf 'BLOCKED: appintentsmetadataprocessor 不可用（需要完整 Xcode，不是只有 CLT）
-' >&2; exit 2; }
+if [ -z "$metadata_tool" ] || [ ! -x "$metadata_tool" ]; then
+    echo 'BLOCKED: appintentsmetadataprocessor 不可用（需要完整 Xcode，不是只有 CLT）' >&2
+    exit 2
+fi
 toolchain_dir="$(xcode-select -p 2>/dev/null)/Toolchains/XcodeDefault.xctoolchain"
-[[ -d "$toolchain_dir" ]] || toolchain_dir="$(xcode-select -p 2>/dev/null)"
+if [ ! -d "$toolchain_dir" ]; then toolchain_dir="$(xcode-select -p 2>/dev/null)"; fi
+# processor 强制要求显式 xcode-version，缺了会直接 error 退出、不产出任何索引。
+xcode_version="$(xcodebuild -version 2>/dev/null | head -1 | awk '{print $2}')"
+if [ -z "$xcode_version" ]; then xcode_version=16.0; fi
 # 按钮 intent 归属扩展，但系统也会查主 App 的索引，所以两份都要生成。
 for bundle in "$widget_dir" "$app_dir"; do
-    if [[ "$bundle" == "$app_dir" ]]; then
-        module_name=Dashboard; source_list="$build_dir/swift-sources.txt"
+    if [ "$bundle" = "$app_dir" ]; then
+        module_name=Dashboard
+        source_list="$build_dir/swift-sources.txt"
     else
-        module_name=DashboardWidgets; source_list="$build_dir/widget-sources.txt"
+        module_name=DashboardWidgets
+        source_list="$build_dir/widget-sources.txt"
     fi
     metadata_log="$build_dir/appintents-$module_name.log"
-    "$metadata_tool" --toolchain-dir "$toolchain_dir"         --module-name "$module_name" --sdk-root "$sdk_path"         --platform-family iOS --deployment-target 15.4         --target-triple arm64-apple-ios15.4 --output "$bundle"         --source-file-list "$source_list" --force >"$metadata_log" 2>&1 || true
-    printf '[appintents] %s: ' "$module_name"
-    tail -3 "$metadata_log" | tr '
-' ' '; printf '
-'
-    [[ -f "$bundle/Metadata.appintents/extract.actionsdata" ]] || {
-        printf 'BLOCKED: %s 缺少 AppIntents 索引（按钮会静默无效）；processor 输出：
-' "$bundle" >&2
+    "$metadata_tool" --toolchain-dir "$toolchain_dir" \
+        --module-name "$module_name" --sdk-root "$sdk_path" \
+        --platform-family iOS --deployment-target 15.4 \
+        --xcode-version "$xcode_version" \
+        --target-triple arm64-apple-ios15.4 --output "$bundle" \
+        --source-file-list "$source_list" --force >"$metadata_log" 2>&1 || true
+    echo "[appintents] $module_name: xcode=$xcode_version"
+    tail -5 "$metadata_log" | sed 's/^/[appintents]   /'
+    if [ ! -f "$bundle/Metadata.appintents/extract.actionsdata" ]; then
+        echo "BLOCKED: $bundle 缺少 AppIntents 索引（按钮会静默无效）；processor 输出：" >&2
         cat "$metadata_log" >&2
-        exit 2; }
+        exit 2
+    fi
 done
 # 三个真实 bundle 内到外签名。模板不是 Apple 授权，不保证普通安装/TrollStore能力。
 # 注意：签名必须在 metadata 生成之后，否则索引不会进签名封条。
