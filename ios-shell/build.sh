@@ -189,11 +189,35 @@ done < "$build_dir/widget-frameworks.txt"
 # 弱链接：deployment target 仍是 15.4，强链接 iOS 16+ 框架会让老系统 dyld 崩。
 # 与 ActivityKit 同样处理；真正用到 AppIntents 的地方都做了 #available 分支。
 widget_args+=(-Xlinker -weak_framework -Xlinker AppIntents)
+# AppIntents const-values：processor 的输入。
+#
+# swiftc 只在同时给了协议清单时才真的提取（源码里 emitConstValues 的
+# 「ConstGatherProtocolListFilePath 为空就直接 return」），否则文件是空的，
+# processor 报 "No swift const values found" 并跳过写索引，按钮就点不动。
+# 协议清单必须是**裸 JSON 数组**、元素是**不带模块前缀**的协议名
+# （Xcode 自己那份是 wrapper dict，前端会拒绝）。
 widget_const_values="$build_dir/DashboardWidgets.swiftconstvalues"
-xcrun --sdk iphoneos swiftc -O -swift-version 5 -parse-as-library -application-extension \
+const_protocols="$build_dir/const_extract_protocols.json"
+cat > "$const_protocols" <<'ZEEHO_PROTOCOLS'
+["AppIntent","EntityQuery","AppEntity","EntityStringQuery","TransientEntity","AppEnum","AppShortcutProviding","AppShortcutsProvider","AnyResolverProviding","AppIntentsPackage","DynamicOptionsProvider","OpenIntent","_IntentValueRepresentable","_AssistantIntentsProvider","_GenerativeFunctionExtractable","IntentValueQuery","Resolver"]
+ZEEHO_PROTOCOLS
+# -wmo 保证整模块只产出一个 const-values 文件（非 wmo 下每个 primary 各要一个路径）。
+xcrun --sdk iphoneos swiftc -O -wmo -swift-version 5 -parse-as-library -application-extension \
     -target arm64-apple-ios15.4 -sdk "$sdk_path" -module-name DashboardWidgets \
-    -emit-const-values-path "$widget_const_values" \
+    -emit-const-values -emit-const-values-path "$widget_const_values" \
+    -Xfrontend -const-gather-protocols-file -Xfrontend "$const_protocols" \
     "${widget_args[@]}" "${widget_sources[@]}" -o "$widget_dir/DashboardWidgets"
+# 空 const-values 必须当场报错：否则一路走到 processor 才失败，日志里只有一句
+# "No swift const values found"，看不出是协议清单没生效。
+python3 -I - "$widget_const_values" <<'ZEEHO_CHECKCV'
+import json, sys
+try:
+    data = json.load(open(sys.argv[1], encoding="utf-8"))
+except Exception as error:
+    sys.exit("BLOCKED: 读不出 const-values: %s" % error)
+if not isinstance(data, list) or not data:
+    sys.exit("BLOCKED: const-values 为空，AppIntents 索引会缺失（检查协议清单是否为裸 JSON 数组）")
+ZEEHO_CHECKCV
 
 # ReplayKit 的标准 upload extension 仍由 _NSExtensionMain 进入 NSObject 子类 SampleHandler。
 # -framework ReplayKit 提供真实 API/入口依赖；不发明 _appexentry，也不复用 host main。
@@ -314,7 +338,9 @@ for bundle in "$widget_dir" "$app_dir"; do
         --platform-family iOS --deployment-target 15.4 \
         --xcode-version "$xcode_version" \
         --target-triple arm64-apple-ios15.4 --output "$bundle" \
-        --source-file-list "$source_list" --force >"$metadata_log" 2>&1 || true
+        --source-file-list "$source_list" \
+        --swift-const-vals-list "$widget_const_values" \
+        --compile-time-extraction --force >"$metadata_log" 2>&1 || true
     echo "[appintents] $module_name: xcode=$xcode_version"
     tail -5 "$metadata_log" | sed 's/^/[appintents]   /'
     if [ ! -f "$bundle/Metadata.appintents/extract.actionsdata" ]; then
