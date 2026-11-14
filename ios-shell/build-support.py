@@ -938,19 +938,17 @@ def validate_ipa(path, expected_info=None):
                 raise ValueError('Unexpected executable/archive in IPA: ' + name)
         # Widget 的控件仍是 StaticConfiguration，但车控/刷新按钮走 AppIntent，
         # 所以包内**必须**有 Metadata.appintents 索引（缺了按钮点不动）。
+        # 只要求目录非空：不同 Xcode 版本产出的文件名不完全一致
+        # （extract.actionsdata / version.json / nlu/… 都有），钉死文件名会误报。
         metadata_prefix = extension_prefixes['widgets'] + 'Metadata.appintents/'
         widget_metadata = sorted(n for n in names if n.startswith(metadata_prefix))
         require(widget_metadata, 'Widget must embed AppIntents metadata for its control buttons')
-        require(metadata_prefix + 'extract.actionsdata' in names,
-                'Widget AppIntents index is missing extract.actionsdata')
         # 主 App 也声明 AppIntent（BackgroundIntents.swift 的签到/采样 + AppShortcutsProvider）。
         # 快捷指令的「个人自动化 → 特定时间」是 iOS 上唯一有系统保证的定时入口，
         # 索引缺失时用户在快捷指令里根本看不到这些 intent，且系统不报错（静默无效）。
         app_metadata_prefix = app_prefix + 'Metadata.appintents/'
         app_metadata = sorted(n for n in names if n.startswith(app_metadata_prefix))
         require(app_metadata, 'App must embed AppIntents metadata for its background task intents')
-        require(app_metadata_prefix + 'extract.actionsdata' in names,
-                'App AppIntents index is missing extract.actionsdata')
         dynamic = app_prefix + 'Frameworks/ZeehoShared.framework/ZeehoShared'
         linkage = 'static'
         if dynamic in reports:

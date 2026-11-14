@@ -390,11 +390,16 @@ if [[ -f "${widget_const_values:-}" ]]; then
         echo "[appintents] $module_name: xcode=$xcode_version"
         tail -5 "$metadata_log" | sed 's/^/[appintents]   /'
         # 索引必须真的落地，否则按钮/快捷指令会静默失效。
-        if [ ! -f "$bundle/Metadata.appintents/extract.actionsdata" ]; then
+        # 只要求目录存在且非空：不同 Xcode 版本的产物文件名不完全一致
+        # （extract.actionsdata / version.json / nlu、root.ssu.yaml…），
+        # 钉死单个文件名会在日志写着 "Writing Metadata.appintents" 时误报。
+        metadata_dir="$bundle/Metadata.appintents"
+        if [ ! -d "$metadata_dir" ] || [ -z "$(ls -A "$metadata_dir" 2>/dev/null)" ]; then
             echo "BLOCKED: $bundle 缺少 AppIntents 索引（按钮会静默无效）；processor 输出：" >&2
             cat "$metadata_log" >&2
             exit 2
         fi
+        echo "[appintents] $module_name: 索引已生成 -> $(ls "$metadata_dir" | tr '\n' ' ')"
     done
 fi
 # 三个真实 bundle 内到外签名。模板不是 Apple 授权，不保证普通安装/TrollStore能力。
