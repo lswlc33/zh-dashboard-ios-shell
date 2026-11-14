@@ -454,7 +454,7 @@ struct ZeehoVehicleWidgetView: View {
                         .frame(width: 4, height: 4)
                         .padding(.trailing, 4)
                 }
-                Text(WidgetStatusText.onlineText(v, date: now))
+                Text(WidgetStatusText.onlineText(vehicle: v, date: now))
                     .font(.system(size: WidgetFont.lPill))
                     .foregroundColor(colors.muted)
             }
