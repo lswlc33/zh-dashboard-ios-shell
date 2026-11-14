@@ -908,8 +908,11 @@ def validate_ipa(path, expected_info=None):
                         'iOS 15.4 Widget must weak-link AppIntents (strong link crashes dyld on older systems)')
                 # 交互按钮靠 AppIntents metadata 索引生效；索引必须真的打进 appex，
                 # 且必须在签名之前生成（否则不进签名封条）。
-                require('Metadata.appintents/extract.actionsdata' in names,
-                        'Widget 缺少 Metadata.appintents/extract.actionsdata：按钮点击会静默无效')
+                # 判据是「索引目录下有文件」：不同 Xcode 版本产出的文件名不一致
+                # （extract.actionsdata / version.json / nlu 等），钉死单个文件名会误报。
+                require(any(name.startswith(prefix + 'Metadata.appintents/')
+                            and not name.endswith('/') for name in names),
+                        'Widget 缺少 AppIntents 索引：按钮点击会静默无效')
             if key == 'broadcast':
                 require(any('/ReplayKit.framework/' in i['path'] for i in code['imports'])
                         and any('/VideoToolbox.framework/' in i['path'] for i in code['imports']),

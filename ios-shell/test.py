@@ -205,7 +205,10 @@ def main():
     assert 'ZeehoVehicleWidget()' in widget_bundle, 'Widget bundle 必须注册 StaticConfiguration 控件'
     assert 'AppIntentConfiguration(' not in widget_bundle, '仍只用 StaticConfiguration 承载控件'
     assert 'appintentsmetadataprocessor' in build_sh, '交互按钮必须生成 AppIntents metadata，否则点击无效'
-    assert 'extract.actionsdata' in build_sh, 'metadata 段必须校验索引真的落地'
+    # 判据是「索引目录里有文件」，不再死认 extract.actionsdata：Xcode 版本间改过名，
+    # 写死文件名会在明明成功的机器上误报（CI 实测 Xcode 16.4）。
+    assert 'Metadata.appintents' in build_sh, 'metadata 段必须校验索引真的落地'
+    assert '--swift-const-vals-list' in build_sh, 'processor 必须显式收到 const-values 清单'
     assert '-emit-const-values-path' in build_sh, 'swiftc 必须导出 const-values 供 processor 使用'
     assert '-weak_framework -Xlinker AppIntents' in build_sh, \
         'AppIntents 必须链接但用 weak（deployment target 15.4，强链接会让老系统 dyld 崩）'
