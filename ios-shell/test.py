@@ -209,12 +209,22 @@ def main():
         build_sh.index('--entitlements "$script_dir/Entitlements/App.entitlements"'), '签名必须 Broadcast/Widget/App 由内到外'
     # 未签名 IPA 交用户自签时，第三方 profile 的 App Group 会被换成签名团队的组，
     # 三个进程（Host/Widget/Broadcast）必须按同一契约解析，不能写死模板值。
+    # 四层回退：显式 plist 键 > AltStore 回写 > embedded.mobileprovision > 模板默认值。
+    # 全能签/eSign/zsign 这类 P12 工具不写 Info.plist，只把证书团队的组签进 entitlements，
+    # 必须从 CMS 里的内嵌 plist 读；appex 常被漏放 profile，还要回退读宿主 bundle。
     # ad-hoc 产物仍按 APP_GROUP 模板签名（build-support.py 常量不变）；运行时只是允许覆盖。
     shared_app_group = (root / 'Shared/AppGroup.swift').read_text(encoding='utf-8')
     cast = (root / 'CastProtocol.swift').read_text(encoding='utf-8')
-    for token in ('ZeehoAppGroupID', 'ALTAppGroups', 'group.io.github.lswlc33.dashboard.ios'):
+    for token in ('ZeehoAppGroupID', 'ALTAppGroups', 'mobileprovision',
+                  'com.apple.security.application-groups', 'group.io.github.lswlc33.dashboard.ios'):
         assert token in shared_app_group, 'AppGroup.swift 缺少解析键: ' + token
         assert token in cast, 'CastProtocol.swift 必须与 Shared 同一组名契约: ' + token
+    for token in ('profileCandidates', 'deletingLastPathComponent', '<?xml', '</plist>'):
+        assert token in shared_app_group and token in cast, '两处都要支持 appex 回退读宿主 profile: ' + token
+    surfaces = (root / 'SystemSurfaces.swift').read_text(encoding='utf-8')
+    assert 'AppGroup.resolution()' in surfaces, '设置页诊断必须回传解析到的组名与来源'
+    assert '"appGroup": groupInfo' in surfaces and '"appGroup": availability["appGroup"]' in surfaces, \
+        '解析结果要同时进 runtimeAvailability 与 widgets 状态字典'
     store = (root / 'Shared/SystemSnapshotStore.swift').read_text(encoding='utf-8')
     assert 'AppGroup.current()' in store, 'SystemSnapshotStore 必须走可覆盖的 AppGroup 解析'
     assert 'static let appGroupIdentifier = "group.' not in store, '组名不能再写死'

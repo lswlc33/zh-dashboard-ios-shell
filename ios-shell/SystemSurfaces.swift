@@ -494,6 +494,9 @@ final class IOSSystemSurfacesService: NSObject, IOSBridgeService, IOSBridgeCance
             && FileManager.default.isExecutableFile(atPath: executable.path)
         let group = SystemSnapshotStore.isAvailable()
         let supported = embedded && group
+        // 侧载诊断：全能签等 P12 工具会把组名换成证书团队的，原始码 app_group_unavailable
+        // 看不出签成了什么。把解析结果与来源一起回给设置页，便于用户截图定位。
+        let groupInfo = AppGroup.resolution()
         let declaredLive = Bundle.main.object(forInfoDictionaryKey: "NSSupportsLiveActivities") as? Bool == true
         var liveSupported = false
         var authorization = false
@@ -506,6 +509,7 @@ final class IOSSystemSurfacesService: NSObject, IOSBridgeService, IOSBridgeCance
         let reason: String? = !group ? "app_group_unavailable" : (!embedded ? "widget_extension_missing" : nil)
         let liveReason = reason ?? (!declaredLive ? "live_activities_not_declared" : (!liveSupported ? "ios_16_1_required" : (!authorization ? "live_activities_disabled" : "available")))
         return ["supported": supported, "embedded": embedded, "appGroupAvailable": group,
+                "appGroup": groupInfo,
                 "liveActivitiesSupported": liveSupported, "authorizationEnabled": authorization,
                 "reason": reason as Any? ?? NSNull(), "liveActivitiesReason": liveReason,
                 "verification": "runtime_bundle_check", "minimumLiveActivitiesIOS": "16.1",
@@ -566,6 +570,7 @@ final class IOSSystemSurfacesService: NSObject, IOSBridgeService, IOSBridgeCance
         return ["ok": true, "supported": supported, "enabled": supported && approved,
             "liveActivities": live, "widgets": ["supported": supported, "enabled": supported && approved && persistedSnapshot != nil,
                 "appGroupAvailable": availability["appGroupAvailable"] ?? false, "embedded": availability["embedded"] ?? false,
+                "appGroup": availability["appGroup"] ?? NSNull(),
                 "kind": Self.widgetKind, "placement": "os_managed", "reason": availability["reason"] ?? NSNull(),
                 "perInstanceVehicleSelection": configurable, "perInstanceMinimumIOS": NSNull(),
                 "supportedFamilies": ["systemSmall", "systemMedium", "systemLarge"], "refreshBudget": "os_managed", "displayed": false],

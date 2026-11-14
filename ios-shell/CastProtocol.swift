@@ -543,12 +543,40 @@ final class IOSCastMailbox {
     // profile 的 app groups 回写进每个 bundle 的 Info.plist 的 ALTAppGroups。
     // 本文件同时编进 Host 与 Broadcast 两个 module，不能 import ZeehoSystemShared，
     // 所以这里自带同一套解析；三处进程必须解析出同一个组名。
-    static var groupID: String {
+    static var groupID: String { resolvedGroupID() }
+    private static func resolvedGroupID() -> String {
         let info = Bundle.main.infoDictionary ?? [:]
         if let explicit = info["ZeehoAppGroupID"] as? String, isValidGroup(explicit) { return explicit }
         if let groups = info["ALTAppGroups"] as? [String], let first = groups.first(where: { isValidGroup($0) }) { return first }
         if let single = info["ALTAppGroups"] as? String, isValidGroup(single) { return single }
+        // 全能签/eSign/zsign 等 P12 工具只把证书团队的组签进 entitlements，不写 Info.plist；
+        // 从 CMS 包裹的 embedded.mobileprovision 抽内嵌 plist 取 application-groups。
+        // appex 常被单-profile 工具漏放，所以回退读宿主 bundle 的那份。
+        for url in profileCandidates() {
+            guard let data = try? Data(contentsOf: url),
+                  let start = data.range(of: Data("<?xml".utf8)),
+                  let end = data.range(of: Data("</plist>".utf8), in: start.lowerBound..<data.endIndex),
+                  let plist = try? PropertyListSerialization.propertyList(
+                      from: data.subdata(in: start.lowerBound..<end.upperBound),
+                      options: [], format: nil) as? [String: Any],
+                  let entitlements = plist["Entitlements"] as? [String: Any],
+                  let groups = entitlements["com.apple.security.application-groups"] as? [String],
+                  let first = groups.first(where: { isValidGroup($0) }) else { continue }
+            return first
+        }
         return "group.io.github.lswlc33.dashboard.ios"
+    }
+    private static func profileCandidates() -> [URL] {
+        var urls: [URL] = []
+        if let own = Bundle.main.path(forResource: "embedded", ofType: "mobileprovision") {
+            urls.append(URL(fileURLWithPath: own))
+        }
+        let host = Bundle.main.bundleURL.deletingLastPathComponent().deletingLastPathComponent()
+        let hostProfile = host.appendingPathComponent("embedded.mobileprovision")
+        if hostProfile.path != urls.first?.path, FileManager.default.fileExists(atPath: hostProfile.path) {
+            urls.append(hostProfile)
+        }
+        return urls
     }
     private static func isValidGroup(_ value: String) -> Bool {
         guard value.hasPrefix("group."), value.utf8.count <= 256,
