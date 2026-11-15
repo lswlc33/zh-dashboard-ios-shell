@@ -314,7 +314,9 @@ enum AccountBackup {
         case .ready, .empty: break
         }
         let rows: [[String: Any]]
-        if snapshot.status == .ready {
+        // 与 plan() 同口径：`.empty` 也可能是「文档存在但没有账号」，
+        // 那种情况下要对着已有的 0 条记录算差异，不能当成「什么都没有」。
+        if snapshot.status == .ready || !snapshot.poolRaw.isEmpty {
             rows = try parsePool(snapshot.poolRaw).accounts
         } else {
             rows = []
@@ -358,7 +360,10 @@ enum AccountBackup {
         }
         var document: [String: Any]
         var rows: [[String: Any]]
-        if snapshot.status == .ready {
+        // `.empty` 有两种来源：完全没有账号池文档，或文档合法但账号数为 0。
+        // 后者必须沿用原文档（legacyClosed / mode / aggregateVin 都在里面），
+        // 只有 poolRaw 真的为空时才新建——CI 上正是这里把 legacyClosed 丢了。
+        if snapshot.status == .ready || !snapshot.poolRaw.isEmpty {
             let pool = try parsePool(snapshot.poolRaw)
             document = pool.object
             rows = pool.accounts

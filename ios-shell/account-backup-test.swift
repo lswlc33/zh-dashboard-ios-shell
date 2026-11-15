@@ -216,6 +216,10 @@ enum AccountBackupTest {
         expect(closedPlan.puts[AccountBackup.clearedKey] == "1", "legacyClosed 的文档要保留 cleared 标记")
         let closedPool = try AccountBackup.parsePool(closedPlan.puts[AccountBackup.poolKey] ?? "")
         expect(AccountBackup.isTrue(closedPool.object["legacyClosed"]), "legacyClosed 字段本身不能丢")
+        // .empty 的直接证据：文档存在但 accounts 为空，状态必须是 empty（不是 ready），
+        // 而恢复计划仍要沿用这份文档的全部额外字段（mode / legacyClosed / aggregateVin）。
+        expect(closed.status == .empty, "零账号的合法文档应判 empty")
+        expect(closedPool.object["mode"] as? String == "separate", "mode 字段要随文档保留")
         // 上限：恢复后超过 20 个直接拒
         var nineteen: [AccountBackup.Entry] = []
         for i in 0..<18 { nineteen.append(AccountBackup.Entry(token: "ntok\(i)", userid: "nuid\(i)")) }
