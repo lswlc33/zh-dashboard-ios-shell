@@ -173,9 +173,8 @@ public enum WidgetVehicleClient {
         // chargeState().progress 完全一致；两个数不同步时宁可 null 也不猜。
         if out.charging == true,
            let charged = minutes(text(home["chargeTimeString"])),
-           let expectValue = number(home["expectFullTimeDescribe"]).map({ Int($0) }),
-           expectValue > 0, charged > 0 {
-            out.chargeProgressPercent = min(100, Double((charged * 100 + expectValue / 2) / expectValue))
+           let expect = integer(home["expectFullTimeDescribe"]), expect > 0, charged > 0 {
+            out.chargeProgressPercent = min(100, Double((charged * 100 + expect / 2) / expect))
         }
         // ---- 电池（batteryInfo）----
         if let battery = battery {
@@ -304,6 +303,22 @@ public enum WidgetVehicleClient {
             return number.stringValue
         }
         return nil
+    }
+
+    /// 整数（`expectFullTimeDescribe` 实测多数是空串，偶尔是纯数字字符串）。
+    /// 与 model.js 的 `n(expect)` 同口径：只有能解析成有限数才当「预计分钟」。
+    private static func integer(_ value: Any?) -> Int? {
+        let parsed: Double?
+        if let number = value as? NSNumber, CFGetTypeID(number) != CFBooleanGetTypeID() {
+            parsed = number.doubleValue
+        } else if let text = value as? String {
+            let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+            parsed = trimmed.isEmpty ? nil : Double(trimmed)
+        } else {
+            parsed = nil
+        }
+        guard let value = parsed, value.isFinite, value > 0, value <= 100_000 else { return nil }
+        return Int(value)
     }
 
     /// 三态状态位：只认 "1" / "0"（也接受 true/false），其余（含 "ONLINE"）走 online 专用解析。

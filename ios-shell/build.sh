@@ -151,8 +151,12 @@ fi
 # 这条回归只依赖 Foundation + Security 的类型声明（不实际访问 Keychain），
 # 用来钉死「旧 JSON 必须仍能解码」「两个域可独立判定」这两条契约。
 if [[ -f "$script_dir/background-credential-test.swift" ]]; then
-    xcrun swiftc "$script_dir/BackgroundSigning.swift" "$script_dir/background-credential-test.swift" \
-        -o "$build_dir/background-credential-test"
+    # 只连 BackgroundSigning.swift：这条回归钉的是「旧 JSON 能解码 / 两个域独立判定 /
+    # 错误码映射」，都在这一个文件里，不需要 UIKit 与 AppIntents。
+    # 测试本体用 @main：swiftc 只在单文件编译时接受顶层可执行语句，多文件会报
+    # "expressions are not allowed at the top level"（CI 实测）。
+    xcrun swiftc -swift-version 5 "$script_dir/BackgroundSigning.swift" \
+        "$script_dir/background-credential-test.swift" -o "$build_dir/background-credential-test"
     "$build_dir/background-credential-test"
 else
     printf '%s\n' 'note: background-credential-test 已跳过（缺 ios-shell/background-credential-test.swift）'
