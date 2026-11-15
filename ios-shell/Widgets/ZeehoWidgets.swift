@@ -136,7 +136,8 @@ struct ZeehoVehicleProvider: TimelineProvider {
         // 保守取 3.5 秒：与系统对 App Extension 的常见预算留出余量。
         gate.scheduleFallback(seconds: 3.5) {
             let now = Date()
-            Self.timeline(entry: ZeehoWidgetReader.read(at: now), now: now)
+            // 多语句闭包必须显式 return（单表达式闭包才允许省略）。
+            return Self.timeline(entry: ZeehoWidgetReader.read(at: now), now: now)
         }
     }
 
