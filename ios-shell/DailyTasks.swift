@@ -1,4 +1,5 @@
 import Foundation
+import CoreFoundation
 
 // 每日任务的社交侧执行体：任务列表、发帖、点赞、分享、删帖。
 //
@@ -409,7 +410,7 @@ final class IOSDailyTasksClient {
             var ids = Set<String>()
             for field in ["tuuid", "articleId", "id"] {
                 if let raw = text(row[field]), !raw.isEmpty, !Self.isPlaceholderID(raw) {
-                    ids.add(raw)
+                    ids.insert(raw)
                 }
             }
             let id = ids.count == 1 ? (ids.first ?? "") : ""
