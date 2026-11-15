@@ -21,12 +21,21 @@ assert.ok(!input.broadcastSwiftImports.some(n => ['ZeehoShared', 'ZeehoSystemSha
 assert.deepEqual(set(input.swiftImports), set([...input.hostModuleImports, ...input.sharedSwiftImports]));
 assert.ok(input.systemLibraries.includes('z'));
 assert.ok(!input.systemFrameworks.includes('CommonCrypto'));
-// Widget 统一 StaticConfiguration，但车控/刷新按钮走 AppIntent（1.1.17 起）：
-// AppIntents 必须进框架清单（按钮点按的执行入口），且必须产出 metadata 索引，
-// 否则真机上按钮点不动（linkd Missing: <bundle>:<Type>）。这里只校验「有没有」，
-// 不校验具体文件名——Xcode 版本间改过名（见 ios-shell/test.py 的同一说明）。
+// Widget 用 AppIntentConfiguration（iOS 17+ 原生编辑）+ StaticConfiguration（低系统兜底），
+// 车控/刷新按钮走 AppIntent（1.1.17 起）：
+// AppIntents 必须进框架清单（按钮与编辑面板的入口），且必须产出 metadata 索引，
+// 否则真机上按钮点不动、编辑面板为空（linkd Missing: <bundle>:<Type>）。这里只校验
+// 「有没有」，不校验具体文件名——Xcode 版本间改过名（见 ios-shell/test.py 的同一说明）。
 assert.ok(input.widgetSystemFrameworks.includes('AppIntents'), '车控按钮需要 AppIntents');
 assert.ok(input.widgetSwiftSources.includes('ios-shell/Widgets/WidgetCommands.swift'), '按钮意图源文件必须在构建清单里');
+assert.ok(input.widgetSwiftSources.includes('ios-shell/Widgets/WidgetConfiguration.swift'),
+  '原生编辑面板的 WidgetConfigurationIntent 必须在构建清单里');
+assert.ok(input.sharedSwiftSources.includes('ios-shell/Shared/WidgetCredential.swift'),
+  'App Group 凭据存储必须在 Shared 清单里（Host 与扩展共链接）');
+assert.ok(input.sharedSwiftSources.includes('ios-shell/Shared/WidgetVehicleClient.swift'),
+  '小组件自取数的客户端必须在 Shared 清单里');
+assert.ok(input.sharedSwiftSources.includes('ios-shell/Shared/WidgetDataSource.swift'),
+  '小组件取数策略必须在 Shared 清单里');
 const records = set(input.files.map(r => r.path));
 for (const name of ['Broadcast/Info.plist', 'Entitlements/Broadcast.entitlements', 'CastProtocol.swift', 'CastEncoder.swift']) {
   assert.ok(records.has('ios-shell/' + name), name);

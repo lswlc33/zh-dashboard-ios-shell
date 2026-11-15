@@ -30,11 +30,35 @@ final class IOSUpdateCenter {
         Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String ?? ""
     }
 
-    func status() -> [String: Any] {
+    /// `currentBuild` 是网页自报的「我现在跑的这份构建」（`<meta name=build>`，可能没有）。
+    func status(currentBuild: String = "") -> [String: Any] {
         let line = IOSPanelLine.current
         return ["ok": true, "line": line.rawValue,
                 "app": appStates[line] ?? ["state": "idle"],
-                "panel": panelStates[line] ?? ["state": "idle"]]
+                "panel": settledPanelState(line, currentBuild: currentBuild)]
+    }
+
+    /// 读 panel 状态时顺手对一次账：**网页自报正在跑的构建就是之前记的「待重启/有更新」目标
+    /// ⇒ 那份更新确实生效了**，直接把状态落成 latest。
+    ///
+    /// 为什么必须在读取时判（2026-11-15 用户报障）：iOS 有两条更新入口——网页的 `panel.update`
+    /// （会走 panelReady）和设置页的「面板更新 / 重新初始化」（直接 IOSPanelCache.initialize，
+    /// 完全绕过 UpdateService）。后者成功后没人清 ready，而页面重载后 checkedOnLaunch 已为 true、
+    /// 不会再自动检查 → 网页每 3 秒拿到的都是「待重启」，提示永远不消失。
+    ///
+    /// 判据只认网页自报的 build，不认磁盘快照的：快照在 initialize 提交那一刻就已经是新版，
+    /// 而重启失败时页面还是旧的 —— 前者会误报「已生效」，后者才是要保留「待重启」的情况。
+    private func settledPanelState(_ line: IOSPanelLine, currentBuild: String) -> [String: Any] {
+        guard let state = panelStates[line] else { return ["state": "idle"] }
+        let phase = state["state"] as? String
+        let target = phase == "ready" ? state["pending"] as? String
+            : phase == "update" ? state["remote"] as? String : nil
+        guard let target = target, !target.isEmpty, target == currentBuild else { return state }
+        // 只落状态、不写 panelCheckedAt：这一轮没有联网，「刚查过」的时间戳必须继续反映
+        // 真实检查时刻，否则自动检查的 30 分钟节流会被这次结算白送一个窗口。
+        let settled: [String: Any] = ["state": "latest", "current": target, "remote": target, "line": line.rawValue]
+        panelStates[line] = settled
+        return settled
     }
 
     func checkApp(line: IOSPanelLine, force: Bool = true) async throws -> IOSRelease {
@@ -124,9 +148,10 @@ final class IOSUpdateCenter {
         panelRevisions[line] = (panelRevisions[line] ?? 0) &+ 1
         panelRequests.removeValue(forKey: line)?.task.cancel()
         panelCheckedAt.removeValue(forKey: line)
+        // 这里只记「已下好待重启」：重启还没发生，页面此刻跑的还是旧构建。
+        // 什么时候算生效由 status(currentBuild:) 按网页自报的构建判定。
         panelStates[line] = ["state": "ready", "pending": build, "line": line.rawValue]
     }
-}
 
 @MainActor
 enum IOSUpdatePresentation {
@@ -260,8 +285,15 @@ final class IOSUpdateService: IOSBridgeCancellableService {
             guard welcome() else { reply(failure("recovery_unavailable"), nil); return }
             reply(["ok": true], nil)
         case "update.status":
-            guard options.isEmpty else { reply(failure("invalid_args"), nil); return }
-            begin(method: method, args: args, line: line, reply: reply) { IOSUpdateCenter.shared.status() }
+            // current：网页自报它此刻真正在跑的构建号（`<meta name=build>`，开发版可能没有）。
+            // 有了它，原生才能在「更新已经生效、只是没人来清状态」时把 ready/update 落成 latest；
+            // 旧网页不带这个字段也照常工作（只返回既有状态）。
+            guard Set(options.keys).isSubset(of: ["current"]),
+                  (options["current"] == nil || (options["current"] as? String).map { $0.utf8.count <= 64 } == true) else {
+                reply(failure("invalid_args"), nil); return
+            }
+            let currentBuild = options["current"] as? String ?? ""
+            begin(method: method, args: args, line: line, reply: reply) { IOSUpdateCenter.shared.status(currentBuild: currentBuild) }
         case "update.check":
             guard options.isEmpty else { reply(failure("invalid_args"), nil); return }
             begin(method: method, args: args, line: line, reply: reply) {
