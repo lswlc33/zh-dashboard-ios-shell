@@ -29,7 +29,7 @@ Swift UIKit + WKWebView 面板壳，默认从 `https://lswlc33.github.io/zeeho-3
 - `SystemSurfaces.swift` 发布已接受的前台真实云 API 样本；`Ride.swift` 经原生确认的 GPS / BLE 录制与 gauge 事件更新已存在活动，不自动启动活动、不新增后台云轮询器。
 - `Widgets/` 只有一个传统 `com.apple.widgetkit-extension` appex。普通 Widget 支持 small / medium / large；同一 `WidgetBundle` 内的 `ActivityConfiguration` 提供锁屏 / 横幅、Dynamic Island compact / minimal / expanded 布局，不使用 ExtensionKit 的 `EXAppExtensionAttributes`。
 - 「我的 → iOS 系统展示」使用标准页面卡片，提供启用 / 关闭、活动开始 / 更新 / 结束及小组件刷新。执行检查真实回执、有效车辆范围、extension、App Group 与系统权限；缺能力显示 `unavailable`。公开 entitlement 模板不证明群组权限已获批准，灵动岛展示还取决于设备硬件与系统。
-- 车辆数值超过 **180 秒**、骑行速度超过 **10 秒**显示过期 / 未知；重新读取或刷新不改样本时间。iOS 16.2+ 使用 `staleDate`，16.1 没有同等系统自动过期保证。Widget 实际刷新受系统预算控制，`reload_requested` 不是已显示新数据。
+- 新鲜度口径分两层：**桌面小组件**保留最后已知值，超过 30 分钟只在时间后追加「可能已过期」（对齐 Android `BaseWidget.updated()`）；**Live Activity** 不出现任何过期字样，锁屏 / 灵动岛始终展示最后一次同步到的电量、充电状态、车速与时长，时间新旧由「最后更新 <时间>」那一行体现（用户自行判断）。共享层的 180 秒车辆窗口 / 10 秒速度窗口只用于「实时读数是否可信」的其它判断，不再拿它把 Live Activity 抹成「—」。重新读取或刷新不改样本时间；iOS 16.2+ 使用 `staleDate`，16.1 没有同等系统自动过期保证。Widget 实际刷新受系统预算控制，`reload_requested` 不是已显示新数据。
 
 后台连续电量 / 完整充电采样、每日自动云任务、Android 桌面小组件、VPN 抓取、Android Wi-Fi Direct 建组与 root 增强仍只有 Android 原生实现；iOS 普通 AP 投屏与壁纸传输是另一条已接源码、未验设备的路线。iOS 可保存真实前台历史与已收到的骑行点，缺测留空；不能宣称完整连续轨迹、后台电池健康或用 GPS 推算容量。
 

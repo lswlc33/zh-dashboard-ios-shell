@@ -2,23 +2,27 @@ import Foundation
 import UIKit
 import ZeehoSystemShared
 
-// 小组件车模素材。
+// 小组件车模素材（读侧）。
 //
-// 现状：iOS 侧还没有把车模/立绘写进 App Group 的链路（Android 走 WidgetCar 缓存 PNG）。
-// 所以这里先只认一个约定路径，取不到就返回 nil，由布局层保持占位（不塌陷）。
-// 后续把主 App 的 3D/立绘素材导出到这里即可，无需改布局代码。
+// 素材由主 App 在 `system.snapshot` 落盘后按需下载（见 SystemSurfaces 的车模下载），
+// 存进 App Group 的 `widget-vehicle-art-<ownerID>.png`（存取契约在
+// Shared/SystemWidgetArt.swift）。扩展只读文件、不联网、不解码之外的任何事。
+//
+// 为什么按匿名 owner id 分文件，而不是一个固定 `widget-vehicle-art.png`：
+// 换车/换账号时同一个固定文件会被上一辆车（或上一个账号）的图覆盖，
+// 桌面小组件在刷新窗口内就会显示别人的车。ownerID 是
+// accountVINHash + "." + scopeID 的匿名摘要，既不含原始 VIN 也不含账号名。
 enum ZeehoWidgetArt {
-    /// 约定的共享素材文件名（放在 App Group 根目录）。
-    static let fileName = "widget-vehicle-art.png"
     /// 素材解码上限，与 Android WidgetCar.MAX_W/H(420×280) 对齐。
-    static let maxPixelWidth = 420
-    static let maxPixelHeight = 280
+    static let maxPixelWidth = SystemWidgetArt.maxPixelWidth
+    static let maxPixelHeight = SystemWidgetArt.maxPixelHeight
+    /// 读盘上限，与 Android WidgetCar.MAX_BYTES 同一口径（Shared 侧写入也按它截断）。
+    static let maxBytes = SystemWidgetArt.maxBytes
 
-    static func vehicleImage() -> UIImage? {
-        guard let root = FileManager.default.containerURL(
-                forSecurityApplicationGroupIdentifier: AppGroup.current()) else { return nil }
-        let url = root.appendingPathComponent(fileName, isDirectory: false)
-        guard let data = try? Data(contentsOf: url), !data.isEmpty,
+    /// ownerID 为空（还没拿到快照）→ nil，由布局层保持占位（不塌陷）。
+    static func vehicleImage(ownerID: String) -> UIImage? {
+        guard !ownerID.isEmpty,
+              let data = SystemWidgetArt.read(ownerID: ownerID, limit: maxBytes), !data.isEmpty,
               let image = UIImage(data: data) else { return nil }
         // 超过上限等比缩小：小组件里贴图不能吃满内存。
         let width = image.size.width * image.scale

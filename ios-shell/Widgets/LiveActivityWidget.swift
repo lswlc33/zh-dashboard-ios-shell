@@ -19,7 +19,13 @@ private struct LiveActivityPresentation {
         return false
     }
     var vehicle: WidgetVehiclePresentation {
-        WidgetVehiclePresentation(snapshot: snapshot, date: date, requiresRefresh: systemIsStale)
+        // 锁屏/灵动岛只展示最后一次同步到的值：界面已经写了「最后更新」时间，
+        // 用户能自己判断新旧；把电量/充电状态抹成「—」反而丢掉了有用信息。
+        // 时间窗与桌面小组件对齐 30 分钟口径（WidgetFreshness.maxAgeSeconds）。
+        var value = WidgetVehiclePresentation(snapshot: snapshot, date: date, requiresRefresh: systemIsStale)
+        value.keepsLastKnown = true
+        value.freshWindow = WidgetFreshness.maxAgeSeconds
+        return value
     }
     var ride: SystemRideSnapshot? { snapshot?.ride }
     var isGauge: Bool { kind == .gauge }
@@ -38,17 +44,19 @@ private struct LiveActivityPresentation {
     }
     var name: String { snapshot?.vehicle?.name ?? WidgetStrings.vehicle }
     var updatedAt: Int64? { isGauge ? snapshot?.gauge?.updatedAt : kind == .ride ? ride?.updatedAt : snapshot?.vehicle?.updatedAt }
+    // 车速/时长同样给最后已知的原始值：过期只由下面的「最后更新」时间体现，
+    // 不再用 visibleSpeedKph 的 10 秒窗口把锁屏读数抹成「—」。
     var speed: Double? {
-        isStale ? nil : isGauge ? snapshot?.gauge?.visibleSpeedKph(at: date) : ride?.visibleSpeedKph(at: date)
+        isGauge ? snapshot?.gauge?.speedKph : ride?.speedKph
     }
-    var elapsedText: String { WidgetValueText.elapsed(isStale ? nil : ride?.elapsedSeconds) }
+    var elapsedText: String { WidgetValueText.elapsed(ride?.elapsedSeconds) }
     var primaryText: String {
         speedDisplay ? WidgetValueText.speed(speed) : WidgetValueText.percent(vehicle.soc)
     }
     var primaryLabel: String { speedDisplay ? WidgetStrings.speed : WidgetStrings.soc }
     var icon: String {
         guard available else { return "questionmark.circle" }
-        if isStale { return "exclamationmark.circle" }
+        // 过期不再换感叹号：图标只表达业务形态，时间新旧交给「最后更新」那一行。
         if isGauge { return "speedometer" }
         if kind == .ride {
             switch ride?.state {
@@ -63,7 +71,7 @@ private struct LiveActivityPresentation {
     }
     var status: String {
         guard available else { return WidgetStrings.activityUnavailable }
-        if isStale { return WidgetStrings.stale }
+        // 状态文案始终是真实业务状态；过期由「最后更新」行体现，不换成「数据已过期」。
         if isGauge { return WidgetStrings.nativeGauge }
         if kind == .ride {
             switch ride?.state {
@@ -132,7 +140,10 @@ private struct LiveActivityBanner: View {
                     }
                 }
             }
-            WidgetUpdatedAt(timestamp: presentation.updatedAt, stale: presentation.isStale)
+            // annotatesStale: false —— 实时活动不出现「数据已过期/可能已过期」，
+            // 只保留「最后更新 <时间>」这一行。
+            WidgetUpdatedAt(timestamp: presentation.updatedAt, stale: presentation.isStale,
+                            annotatesStale: false)
         }
         .padding(16)
     }
@@ -189,7 +200,10 @@ private struct LiveActivityExpandedBottom: View {
                     Text(WidgetValueText.percent(progress)).font(.caption.monospacedDigit())
                 }
             }
-            WidgetUpdatedAt(timestamp: presentation.updatedAt, stale: presentation.isStale)
+            // annotatesStale: false —— 实时活动不出现「数据已过期/可能已过期」，
+            // 只保留「最后更新 <时间>」这一行。
+            WidgetUpdatedAt(timestamp: presentation.updatedAt, stale: presentation.isStale,
+                            annotatesStale: false)
         }
     }
 }

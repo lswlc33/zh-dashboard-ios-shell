@@ -14,13 +14,23 @@ import ZeehoSystemShared
 enum IOSBackgroundRunner {
     /// 每日自动签到。
     ///
-    /// 只有用户在设置里开了开关、并且导入过凭据才会真的发请求；否则直接成功返回，
-    /// 这样系统不会因为我们「跑了但什么也没做」而降低后续调度意愿。
-    static func runSignIn(completion: @escaping (Bool) -> Void) {
-        guard IOSBackgroundPreferences.autoSignInEnabled else {
+    /// 默认路径（`force == false`）是系统 BGAppRefreshTask：只有用户在设置里开了自动签到
+    /// 开关、并且导入过凭据才会真的发请求；否则直接成功返回，这样系统不会因为我们
+    /// 「跑了但什么也没做」而降低后续调度意愿。
+    ///
+    /// `force == true` 是快捷指令 / 个人自动化这类**用户主动触发**的路径。自动签到开关的
+    /// 语义是「允许系统在后台自己定时跑」，不是「禁止用户手动签」，所以这条路径必须忽略它；
+    /// 否则用户在快捷指令里点一次也会被开关挡掉，只得到一句「自动签到未开启」。
+    /// 主动触发与系统定时任务是两件事，别把开关套到主动触发上。
+    static func runSignIn(force: Bool = false, completion: @escaping (Bool) -> Void) {
+        guard force || IOSBackgroundPreferences.autoSignInEnabled else {
             IOSBackgroundLog.write("跳过签到：用户未开启自动签到")
             completion(true)
             return
+        }
+        // 只有「主动触发顶掉关闭状态」这一点值得记：正常开启时不必再刷一条日志。
+        if force && !IOSBackgroundPreferences.autoSignInEnabled {
+            IOSBackgroundLog.write("主动触发签到：忽略自动签到开关")
         }
         guard let credential = IOSBackgroundCredentialStore.load() else {
             IOSBackgroundLog.write("跳过签到：没有已授权的后台凭据")
@@ -78,6 +88,11 @@ enum IOSBackgroundRunner {
     ///
     /// 关键约束：iOS 后台唤醒不可靠，所以「充电开始/结束」只在真的采到样本、
     /// 且与上一次样本比较出翻转时才发。绝不因为「上次是充电中、这次没唤醒」就推断结束。
+    ///
+    /// `completion` 的布尔是**运行是否正常走完**，不是**取数是否成功**：网络失败、缺凭据
+    /// 都会回 true（那是给 BGTaskScheduler 的调度评分看的，别让系统因此扣我们的调度意愿）。
+    /// 想知道这一次到底取到没有，必须读 `IOSBackgroundScheduler.report(...).lastResult`
+    /// （`ok` 才算真取到）。调用方按这两个不同语义各自取用，别拿布尔当成功判据。
     static func runRefresh(completion: @escaping (Bool) -> Void) {
         guard let credential = IOSBackgroundCredentialStore.load() else {
             IOSBackgroundLog.write("跳过采样：没有已授权的后台凭据")

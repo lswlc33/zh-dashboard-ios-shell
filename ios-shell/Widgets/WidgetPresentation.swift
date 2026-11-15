@@ -104,10 +104,11 @@ struct WidgetVehiclePresentation {
     let snapshot: SystemSnapshot?
     let date: Date
     var requiresRefresh = false
-    // 桌面小组件保留最后已知值（过期只标注时间，和 Android 小组件一致）；
-    // Live Activity 不打开这个开关：锁屏上的数值会被当成实时读数。
+    // 保留最后已知值（过期只标注时间，和 Android 小组件一致）：桌面小组件与
+    // Live Activity 都打开这个开关——过期时也要显示「上次同步到的数值 + 更新时间」。
     var keepsLastKnown = false
-    // 判过期用的时间窗；桌面小组件传 WidgetFreshness.maxAgeSeconds，其余保持 180 秒。
+    // 判过期用的时间窗；保留最后已知值的场景（桌面小组件、Live Activity）传
+    // WidgetFreshness.maxAgeSeconds，其余保持 180 秒。
     var freshWindow: Double = SystemSnapshotFreshness.vehicleMaxAgeSeconds
 
     var vehicle: SystemVehicleSnapshot? { snapshot?.vehicle }
@@ -158,10 +159,12 @@ struct WidgetUpdatedAt: View {
     // 桌面小组件保留最后已知值时用 true：同一行写「时间 · 可能已过期」，
     // 与 Android 小组件的 widget_updated_stale 一致，不再单独占一行红字。
     var keepsLastKnown = false
+    // Live Activity 传 false：时间新旧已经由这一行本身表达，不再叠加任何过期标注。
+    var annotatesStale = true
 
     var body: some View {
         VStack(alignment: .leading, spacing: 3) {
-            if stale && !keepsLastKnown {
+            if annotatesStale && stale && !keepsLastKnown {
                 Label(WidgetStrings.stale, systemImage: "exclamationmark.circle")
                     .font(.caption2)
             }
@@ -180,6 +183,7 @@ struct WidgetUpdatedAt: View {
 
     private func line(_ date: Date) -> String {
         let stamp = "\(WidgetStrings.lastUpdated) \(date.formatted(date: .numeric, time: .shortened))"
+        guard annotatesStale else { return stamp }
         return stale && keepsLastKnown ? "\(stamp) · \(WidgetStrings.mayBeStale)" : stamp
     }
 }
@@ -195,8 +199,10 @@ struct WidgetSurface: ViewModifier {
             content
                 .containerBackground(for: .widget) { colors?.bg ?? Color(uiColor: .systemBackground) }
         } else {
+            // iOS 17 之前没有 containerBackground，也没有系统内容边距：这里不额外加 padding，
+            // 内边距统一由各档布局按 Android 规格自己加。以前这里再插 16pt，会和布局自带的
+            // 14dp 叠成 30pt —— 和 iOS 17+ 的「边距大到异常」是同一个观感问题。
             content
-                .padding(16)
                 .background(colors?.bg ?? Color(uiColor: .systemBackground))
         }
     }

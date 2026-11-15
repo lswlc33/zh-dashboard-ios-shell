@@ -194,6 +194,17 @@ struct ZeehoVehicleWidgetView: View {
     private var presentation: WidgetVehiclePresentation { entry.presentation }
     private var colors: WidgetPalette.Colors { WidgetPalette.colors(dark: entry.isDark(colorScheme)) }
 
+    /// 内容内边距（Android dp 1:1）在 iOS 17 之后要扣掉系统自加的那一层。
+    ///
+    /// WidgetKit 从 iOS 17 起会先给 widget 内容套一层默认内容边距（iPhone 上 16pt），
+    /// 我们这套布局又按 Android 规格自带 14/12dp 内边距，两层叠起来就是 30dp —— 用户看到的
+    /// 「边距大到异常、内容挤在中间一小块」正是这个。iOS 17+ 因此不再叠加自己那一层，
+    /// 交给系统边距兜住；老系统没有系统边距，仍按 Android 规格加。
+    private func contentPad(_ android: CGFloat) -> CGFloat {
+        if #available(iOS 17.0, *) { return 0 }
+        return android
+    }
+
     var body: some View {
         Group {
             if presentation.vehicle == nil {
@@ -223,6 +234,7 @@ struct ZeehoVehicleWidgetView: View {
                 .fixedSize(horizontal: false, vertical: true)
             Spacer(minLength: 0)
         }
+        .padding(contentPad(WidgetMetrics.padSmall))
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
     }
 
@@ -303,7 +315,7 @@ struct ZeehoVehicleWidgetView: View {
             .frame(height: 24)
             .padding(.top, 4)
         }
-        .padding(WidgetMetrics.padSmall)
+        .padding(contentPad(WidgetMetrics.padSmall))
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
     }
 
@@ -390,10 +402,9 @@ struct ZeehoVehicleWidgetView: View {
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
                 .padding(.leading, 8)
 
-                // 栏 3：车模（fitCenter，占满栏高）
-                vehicleArt
-                    .frame(maxWidth: .infinity, maxHeight: .infinity)
-                    .padding(.leading, 6)
+                // 栏 3：车模（fitCenter，占满栏高）；缺图时整栏不占位，电量与统计按 Android
+                // w_car_box GONE 的口径自动吃满剩余宽度。
+                vehicleArt(ownerID: presentation.ownerID, leading: 6)
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity)
             .padding(.top, 2)
@@ -402,7 +413,7 @@ struct ZeehoVehicleWidgetView: View {
             controlRow(height: WidgetMetrics.buttonHeightMedium, fontSize: WidgetFont.mButton)
                 .padding(.top, 4)
         }
-        .padding(WidgetMetrics.padMedium)
+        .padding(contentPad(WidgetMetrics.padMedium))
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
     }
 
@@ -494,9 +505,7 @@ struct ZeehoVehicleWidgetView: View {
                 .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .leading)
                 .layoutPriority(40)
 
-                vehicleArt
-                    .frame(maxWidth: .infinity, maxHeight: .infinity)
-                    .padding(.leading, 8)
+                vehicleArt(ownerID: presentation.ownerID, leading: 8)
                     .layoutPriority(60)
             }
             .frame(minHeight: 88, maxHeight: .infinity)
@@ -531,7 +540,7 @@ struct ZeehoVehicleWidgetView: View {
             controlRow(height: WidgetMetrics.buttonHeightLarge, fontSize: WidgetFont.lButton)
                 .padding(.top, 2)
         }
-        .padding(WidgetMetrics.padSmall)
+        .padding(contentPad(WidgetMetrics.padSmall))
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
     }
 
@@ -591,15 +600,18 @@ struct ZeehoVehicleWidgetView: View {
         .frame(maxWidth: .infinity, alignment: alignedLeading ? .leading : .center)
     }
 
-    /// 车模：读 App Group 里的共享素材；缺图时不占位（Android w_car_box GONE）。
-    @ViewBuilder private var vehicleArt: some View {
-        if let image = ZeehoWidgetArt.vehicleImage() {
+    /// 车模：读 App Group 里按匿名 owner 分文件的共享素材（由主 App 在快照落盘后按 artUrl 下载）。
+    ///
+    /// 缺图时返回 `EmptyView` 而不是 `Color.clear`：`Color.clear` 仍会占住
+    /// `.frame(maxWidth:.infinity)` 分到的整栏宽度，用户看到的就是「车没显示、右边空了一大块」。
+    /// Android 那边 w_car_box 缺图是 GONE（布局里直接不占位），这里对齐同一口径。
+    @ViewBuilder private func vehicleArt(ownerID: String, leading: CGFloat) -> some View {
+        if let image = ZeehoWidgetArt.vehicleImage(ownerID: ownerID) {
             Image(uiImage: image)
                 .resizable()
                 .scaledToFit()
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
-        } else {
-            Color.clear
+                .padding(.leading, leading)
         }
     }
 

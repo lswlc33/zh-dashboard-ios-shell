@@ -21,8 +21,12 @@ assert.ok(!input.broadcastSwiftImports.some(n => ['ZeehoShared', 'ZeehoSystemSha
 assert.deepEqual(set(input.swiftImports), set([...input.hostModuleImports, ...input.sharedSwiftImports]));
 assert.ok(input.systemLibraries.includes('z'));
 assert.ok(!input.systemFrameworks.includes('CommonCrypto'));
-// Widget 统一 StaticConfiguration，不再引入 AppIntents 或 AppIntents 意图源文件。
-assert.ok(!input.widgetSystemFrameworks.includes('AppIntents'));
+// Widget 统一 StaticConfiguration，但车控/刷新按钮走 AppIntent（1.1.17 起）：
+// AppIntents 必须进框架清单（按钮点按的执行入口），且必须产出 metadata 索引，
+// 否则真机上按钮点不动（linkd Missing: <bundle>:<Type>）。这里只校验「有没有」，
+// 不校验具体文件名——Xcode 版本间改过名（见 ios-shell/test.py 的同一说明）。
+assert.ok(input.widgetSystemFrameworks.includes('AppIntents'), '车控按钮需要 AppIntents');
+assert.ok(input.widgetSwiftSources.includes('ios-shell/Widgets/WidgetCommands.swift'), '按钮意图源文件必须在构建清单里');
 const records = set(input.files.map(r => r.path));
 for (const name of ['Broadcast/Info.plist', 'Entitlements/Broadcast.entitlements', 'CastProtocol.swift', 'CastEncoder.swift']) {
   assert.ok(records.has('ios-shell/' + name), name);
@@ -33,8 +37,11 @@ const build = readFileSync(path.join(shell, 'build.sh'), 'utf8');
 for (const token of ['-module-name ZeehoCastBroadcast', '-Xlinker -e -Xlinker _NSExtensionMain',
   '--scan-executable "$broadcast_dir/ZeehoCastBroadcast"', '--scan-folder "$broadcast_dir/Frameworks"',
   'xcrun --sdk iphoneos swiftc']) assert.ok(build.includes(token), token);
-assert.ok(!build.includes('appintentsmetadataprocessor') && !build.includes('Metadata.appintents'),
-  'StaticConfiguration 不需要 AppIntents metadata');
+// 反过来：AppIntents 按钮必须生成 metadata 索引，而且要在签名之前（否则不进签名封条）。
+assert.ok(build.includes('appintentsmetadataprocessor'), 'AppIntents 按钮必须生成 metadata 索引');
+assert.ok(build.includes('Metadata.appintents'), 'metadata 索引目录必须校验真的落地');
+assert.ok(build.indexOf('appintentsmetadataprocessor') < build.indexOf('Entitlements/Widgets.entitlements'),
+  'metadata 必须在 Widget 签名之前生成');
 assert.ok(build.indexOf('Entitlements/Broadcast.entitlements') < build.indexOf('Entitlements/Widgets.entitlements'));
 assert.ok(build.indexOf('Entitlements/Widgets.entitlements') < build.indexOf('Entitlements/App.entitlements'));
 

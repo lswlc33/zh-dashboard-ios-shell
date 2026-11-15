@@ -21,6 +21,114 @@ private final class IOSSystemSurfaceLease: @unchecked Sendable {
     func cancel() { lock.lock(); cancelled = true; lock.unlock() }
 }
 
+// 小组件车模素材的一次性下载。
+//
+// 不复用桥的传输层：桥的每条 RPC 都绑定网页 navigation/epoch，而这张图只是快照的
+// 附加产物，取消纪律由 IOSSystemSurfacesService 自己的 ticket/lease 管（见 refreshWidgetArt）。
+// 用 delegate 逐块累加并在超限时立刻取消：Content-Length 可能缺失或是假的（chunked），
+// 不能只靠预检就把 4MB 上限定死。
+private final class IOSWidgetArtFetch: NSObject, URLSessionDataDelegate, URLSessionTaskDelegate {
+    private let request: URLRequest
+    private let limit: Int
+    private let queue = OperationQueue()
+    private var session: URLSession?
+    private var task: URLSessionDataTask?
+    private var data = Data()
+    private var completion: ((Result<Data, SystemSnapshotError>) -> Void)?
+    private var finished = false
+
+    init(url: URL, limit: Int, completion: @escaping (Result<Data, SystemSnapshotError>) -> Void) {
+        // 低优先级：一张展示图不该和快照/车控抢主线程与网络。
+        request = URLRequest(url: url, cachePolicy: .reloadIgnoringLocalCacheData, timeoutInterval: 15)
+        self.limit = limit
+        self.completion = completion
+        super.init()
+        queue.maxConcurrentOperationCount = 1
+        queue.qualityOfService = .utility
+    }
+
+    func start() {
+        // 会话创建也放到 delegate 的同一条串行队列：否则主线程写 session/task
+        // 可能与取消/回调里的读交错（理论上 race，真机上表现为偶发不回调）。
+        queue.addOperation { [weak self] in self?.begin() }
+    }
+
+    private func begin() {
+        guard !finished else { return }
+        let config = URLSessionConfiguration.ephemeral
+        config.urlCache = nil
+        config.httpCookieStorage = nil
+        config.httpShouldSetCookies = false
+        config.urlCredentialStorage = nil
+        config.requestCachePolicy = .reloadIgnoringLocalCacheData
+        config.timeoutIntervalForRequest = 15
+        // 资源总时长给得比单次请求宽一点：只容忍有限次重定向，不允许无限续命。
+        config.timeoutIntervalForResource = 30
+        config.waitsForConnectivity = false
+        let session = URLSession(configuration: config, delegate: self, delegateQueue: queue)
+        self.session = session
+        let task = session.dataTask(with: request)
+        self.task = task
+        task.resume()
+    }
+
+    /// 新 URL 到来或换车时作废旧下载；结果仍会回调一次（失败），由调用方按 ticket 丢弃。
+    func cancel() {
+        queue.addOperation { [weak self] in self?.finish(.failure(SystemSnapshotError("widget_art_cancelled"))) }
+    }
+
+    private func finish(_ result: Result<Data, SystemSnapshotError>) {
+        guard !finished else { return }
+        finished = true
+        task?.cancel(); task = nil
+        session?.invalidateAndCancel(); session = nil
+        let callback = completion; completion = nil
+        guard let callback = callback else { return }
+        // 统一回主线程：缩图（UIGraphicsImageRenderer）与 WidgetCenter 刷新都要求主线程。
+        DispatchQueue.main.async { callback(result) }
+    }
+
+    func urlSession(_ session: URLSession, task: URLSessionTask, willPerformHTTPRedirection response: HTTPURLResponse,
+                    newRequest request: URLRequest, completionHandler: @escaping (URLRequest?) -> Void) {
+        // 只跟随 https 重定向：车图走官方 OSS，跳 CDN 是常态；降到 http 的一律拒绝
+        // （ATS 也会拦，但在这里拒绝能给出确定的失败原因）。
+        guard request.url?.scheme?.lowercased() == "https" else {
+            completionHandler(nil)
+            finish(.failure(SystemSnapshotError("widget_art_insecure_redirect")))
+            return
+        }
+        completionHandler(request)
+    }
+
+    func urlSession(_ session: URLSession, dataTask: URLSessionDataTask, didReceive response: URLResponse,
+                    completionHandler: @escaping (URLSession.ResponseDisposition) -> Void) {
+        guard let http = response as? HTTPURLResponse else {
+            completionHandler(.cancel); finish(.failure(SystemSnapshotError("widget_art_invalid_response"))); return
+        }
+        guard (200..<300).contains(http.statusCode) else {
+            completionHandler(.cancel); finish(.failure(SystemSnapshotError("widget_art_http_error"))); return
+        }
+        // Content-Length 预检：明确超限就别开始下载。缺失（-1）时靠下面的累计上限兜底。
+        if http.expectedContentLength > Int64(limit) {
+            completionHandler(.cancel); finish(.failure(SystemSnapshotError("widget_art_too_large"))); return
+        }
+        completionHandler(.allow)
+    }
+
+    func urlSession(_ session: URLSession, dataTask: URLSessionDataTask, didReceive chunk: Data) {
+        guard !finished, chunk.count <= limit - data.count else {
+            finish(.failure(SystemSnapshotError("widget_art_too_large"))); return
+        }
+        data.append(chunk)
+    }
+
+    func urlSession(_ session: URLSession, task: URLSessionTask, didCompleteWithError error: Error?) {
+        if error != nil { finish(.failure(SystemSnapshotError("widget_art_network_failed"))); return }
+        guard !data.isEmpty else { finish(.failure(SystemSnapshotError("widget_art_empty"))); return }
+        finish(.success(data))
+    }
+}
+
 private struct IOSRunningSystemActivity: Sendable {
     let id: String
     let kind: ZeehoActivityKind
@@ -220,6 +328,15 @@ final class IOSSystemSurfacesService: NSObject, IOSBridgeService, IOSBridgeCance
     private var lastWidgetReload = -Double.infinity
     private var lastWidgetEdge = ""
     private var lastError: String?
+    // 车模素材：artUrl 触发的一次性下载，同一时刻只允许一个（见 refreshWidgetArt）。
+    private var artTicket: UInt64 = 0
+    private var artURLInFlight: String?
+    private var artFetch: IOSWidgetArtFetch?
+    /// 已经落盘成功的 (owner, url)。内存里记一份，省掉每帧都去 stat 文件 + 读索引；
+    /// 也兜住「URL 太长写不进旁路索引」的情况——否则那种 URL 会每帧重下一次。
+    private var artReady: (owner: String, url: String)?
+    /// 失败退避：网页每一帧都会带 artUrl，失败后不记一笔就会变成每帧重试、白烧流量。
+    private var artFailed: (url: String, until: TimeInterval)?
 
     private final class Job {
         let id = UUID()
@@ -239,7 +356,7 @@ final class IOSSystemSurfacesService: NSObject, IOSBridgeService, IOSBridgeCance
         }
     }
 
-    deinit { ownerLease.cancel(); publishWork?.cancel() }
+    deinit { ownerLease.cancel(); publishWork?.cancel(); artFetch?.cancel() }
 
     // MARK: - 持久化（scopeID / approved）
     //
@@ -329,6 +446,8 @@ final class IOSSystemSurfacesService: NSObject, IOSBridgeService, IOSBridgeCance
         }
         revoking = false; latest = nil; persistedSnapshot = nil; nativeWritePending = false
         nativeRide = nil; nativeGauge = nil; lastError = nil
+        // 换车/换账号/撤销：进行中的车模下载立刻作废，迟到的字节不许落到新 owner 的文件里。
+        cancelWidgetArt()
         lastNativePublish = -Double.infinity; lastGaugePublish = -Double.infinity
         lastWidgetReload = -Double.infinity; lastWidgetEdge = ""
         // approved 也从持久化里取；没拿到 scope 的中间态保留当前内存值，
@@ -441,13 +560,16 @@ final class IOSSystemSurfacesService: NSObject, IOSBridgeService, IOSBridgeCance
                     return
                 }
                 let vehicle = try vehicleSnapshot(options, scope: current)
+                // artUrl 只用于触发本地车模素材下载，不进 SystemSnapshot（共享 schema 不动）。
+                // 不合法就当作没带这个键：一个展示字段不该把整帧快照打回。
+                let artURL = Self.widgetArtURL(options["artUrl"])
                 // 小组件零门槛：前台采样直接落盘，不再要求先去设置页点「启用」并确认。
                 // 用户显式关闭过系统显示时 approved 为 false，这里如实跳过（不写快照、不弹框）。
                 // enable:true 仍保留为「显式重新开启」，供设置页的启用按钮使用。
-                if approved { saveVehicle(vehicle, job: job) }
+                if approved { saveVehicle(vehicle, artURL: artURL, job: job) }
                 else if try optionalBoolean(options["enable"]) == true {
                     grantApproval()
-                    saveVehicle(vehicle, job: job)
+                    saveVehicle(vehicle, artURL: artURL, job: job)
                 } else { finish(job, failure("snapshot_consent_required")) }
             case "liveActivity.start":
                 try validateAction(options, allowing: ["kind"])
@@ -663,12 +785,14 @@ final class IOSSystemSurfacesService: NSObject, IOSBridgeService, IOSBridgeCance
     private func validateSnapshotKeys(_ options: [String: Any]) throws {
         // 展示类统计字段（电压/电流/功率/锁车/坐垫/在线/里程/续航/骑行统计/胎压）与
         // Android 小组件 1:1 对齐；全部可选，缺测合法。
+        // artUrl 是车模图片的 https 地址（网页取 home.scalePic || home.pic），
+        // 同样只用于展示：它不落进 SystemSnapshot，只触发一次本地素材下载。
         let allowed: Set<String> = ["accountId", "vin", "generation", "source", "capturedAt", "enable", "name",
             "socPercent", "socUpdatedAt", "charging", "chargingUpdatedAt", "chargeProgressPercent", "chargeProgressUpdatedAt",
             "voltage", "current", "power", "lockState", "seatState", "online",
             "todayMileKm", "lastMileKm", "lastRideMinutes", "totalMileKm", "rangeKm",
             "integral", "unread", "tireFrontBar", "tireRearBar",
-            "tireFrontTemp", "tireRearTemp", "statsUpdatedAt"]
+            "tireFrontTemp", "tireRearTemp", "statsUpdatedAt", "artUrl"]
         guard Set(options.keys).isSubset(of: allowed) else { throw SystemSnapshotError("invalid_args") }
     }
     private func vehicleSnapshot(_ options: [String: Any], scope: IOSRideScope) throws -> SystemVehicleSnapshot {
@@ -825,6 +949,8 @@ final class IOSSystemSurfacesService: NSObject, IOSBridgeService, IOSBridgeCance
         revokeApproval()
         ownerLease.cancel()
         publishWork?.cancel(); publishWork = nil
+        // 撤销授权时也把车模下载停掉：否则迟到的响应会在「已关闭」状态下继续写 App Group。
+        cancelWidgetArt()
         for other in Array(jobs.values) where other !== job { finish(other, failure("system_surfaces_disabled"), cancel: true) }
         // clear 排在本服务所有旧写之后；未完成的 activity.start lease 已取消，不能在关闭之后复活。
         worker.async { [weak self] in
@@ -876,11 +1002,16 @@ final class IOSSystemSurfacesService: NSObject, IOSBridgeService, IOSBridgeCance
         }.map { IOSRunningSystemActivity(id: $0.id, kind: $0.attributes.kind) }
     }
 
-    private func saveVehicle(_ value: SystemVehicleSnapshot, job: Job) {
+    private func saveVehicle(_ value: SystemVehicleSnapshot, artURL: String?, job: Job) {
         do {
             let value = try candidate(vehicle: value)
             guard !value.isStale() else { throw SystemSnapshotError("snapshot_stale") }
-            try persist(value, job: job)
+            // 下载是快照落盘之后的附加产物：失败/被取消都不影响这一帧已经存好的车况。
+            let owner = value.owner; let ticket = epoch; let lease = ownerLease
+            try persist(value, job: job, didPersist: { [weak self] saved in
+                guard saved, let self = self else { return }
+                self.refreshWidgetArt(sourceURL: artURL, owner: owner, ticket: ticket, lease: lease)
+            })
         } catch { finish(job, failure(Self.code(error))) }
     }
     private func persist(_ value: SystemSnapshot, job: Job?, didPersist: ((Bool) -> Void)? = nil,
@@ -1133,6 +1264,126 @@ final class IOSSystemSurfacesService: NSObject, IOSBridgeService, IOSBridgeCance
         WidgetCenter.shared.reloadTimelines(ofKind: Self.widgetKind)
         lastWidgetEdge = edge; lastWidgetReload = now
         return true
+    }
+
+    // MARK: - 小组件车模素材（artUrl → App Group PNG）
+
+    /// `artUrl` 的只读校验：https 绝对 URL、≤ 2048 字节、不含空白/控制字符、host 非空。
+    ///
+    /// 信任级别与 Android WidgetCar 相同：地址来自官方接口（公开 OSS 车图），不是用户输入。
+    /// 所以这里只做协议/长度/形态闸门，**不引入域名白名单**——换 CDN 时白名单会让
+    /// 小组件直接白屏；真正要防的（明文 http、超大响应）由协议与体积上限拦住。
+    /// 不合法返回 nil，调用方当作「这一帧没带 artUrl」，绝不能因此把整帧快照打回。
+    private static func widgetArtURL(_ value: Any?) -> String? {
+        guard let value = value, !(value is NSNull), let text = value as? String else { return nil }
+        guard !text.isEmpty, text.utf8.count <= 2048 else { return nil }
+        // 空白/控制字符一律拒绝：URL 里出现它们只可能是拼接错误或被塞进了额外字段。
+        guard text.unicodeScalars.allSatisfy({
+            !CharacterSet.whitespacesAndNewlines.contains($0) && !CharacterSet.controlCharacters.contains($0)
+        }) else { return nil }
+        // 走 URLComponents 而不是 URL(string:)：后者对畸形串过于宽容，
+        // 而 user/password 也得在 components 上才看得清楚（不能带凭据进 OSS 请求）。
+        guard let parts = URLComponents(string: text) else { return nil }
+        guard parts.scheme?.lowercased() == "https",
+              let host = parts.host, !host.isEmpty,
+              parts.user == nil, parts.password == nil,
+              let url = parts.url else { return nil }
+        return url.absoluteString
+    }
+
+    /// 丢弃进行中的车模下载（换车/换账号/撤销授权时必须先作废，迟到的字节不许落盘）。
+    private func cancelWidgetArt() {
+        artTicket &+= 1
+        artURLInFlight = nil
+        artFetch?.cancel(); artFetch = nil
+        // 内存里的「已就绪」只对当前 owner 有意义，换车/换账号时必须清掉；
+        // 失败退避也跟着清，新 owner 的同一个 URL 值得重试一次。
+        artReady = nil
+        artFailed = nil
+    }
+
+    /// 快照写盘成功后按需刷新车模素材。
+    ///
+    /// 取消纪律沿用本文件既有写法：发起时抓一份 ticket，回调里复核
+    /// lease / epoch / owner / approved，任何一项失配就丢弃。
+    /// 并发闸门：同一时刻只允许一个下载；URL 换了就作废旧的（旧车的图没有意义）。
+    private func refreshWidgetArt(sourceURL: String?, owner expected: SystemSnapshotOwner,
+                                  ticket: UInt64, lease: IOSSystemSurfaceLease) {
+        precondition(Thread.isMainThread)
+        guard approved, !revoking, lease.valid, ticket == epoch, owner == expected,
+              let sourceURL = sourceURL, let url = URL(string: sourceURL) else { return }
+        let ownerID = expected.ownerIdentifierString
+        // 本会话已经为这个 (owner, url) 成功落盘过：直接跳过文件系统与索引检查
+        // （网页每一帧快照都会走到这里，每次都 stat + 读索引是白耗 IO）。
+        if let ready = artReady, ready.owner == ownerID, ready.url == sourceURL { return }
+        // 同一 URL 已经在下载中：不重复发起（网页每帧都会带 artUrl，这里必须去重）。
+        guard artURLInFlight != sourceURL else { return }
+        // 失败退避 60 秒（与 Android 那条「失败 60 秒后才允许重试」同一口径）：
+        // 断网/图挂了时浏览器每帧都送 artUrl，不退避就是每帧一次 15 秒超时的下载。
+        // 放在 needsDownload 之前：退避期内连 stat 都不做。
+        guard artFailed.map({ $0.url != sourceURL || ProcessInfo.processInfo.systemUptime >= $0.until }) ?? true
+        else { return }
+        // URL 没变且图还在：不用重下（与 Android WidgetCar 同一判据，省流量也省内存）。
+        guard SystemWidgetArt.needsDownload(ownerID: ownerID, sourceURL: sourceURL) else {
+            artReady = (ownerID, sourceURL)
+            return
+        }
+        // 复合赋值不产生值，必须分开写：`let next = artTicket &+= 1` 在 Swift 里不合法。
+        artTicket &+= 1
+        let next = artTicket
+        artURLInFlight = sourceURL
+        artFetch?.cancel()
+        let fetch = IOSWidgetArtFetch(url: url, limit: SystemWidgetArt.maxBytes) { [weak self] result in
+            // 先核 ticket 再动状态：被 cancelWidgetArt 作废的旧下载迟到回调时，
+            // 绝不能让它的清理逻辑去清掉**新**下载的引用。
+            guard let self = self, self.artTicket == next else { return }
+            self.artFetch = nil
+            self.artURLInFlight = nil
+            guard lease.valid, ticket == self.epoch, self.owner == expected,
+                  self.approved, !self.revoking else { return }
+            switch result {
+            case .failure(let error):
+                // 失败保留旧图：素材是附加产物，显示上一次的车也好过整块空白。
+                self.artFailed = (sourceURL, ProcessInfo.processInfo.systemUptime + 60)
+                IOSBackgroundLog.write("小组件车模下载失败 host=\(url.host ?? "-") code=\(error.code)")
+            case .success(let data):
+                guard let png = Self.widgetArtPNG(data) else {
+                    self.artFailed = (sourceURL, ProcessInfo.processInfo.systemUptime + 60)
+                    IOSBackgroundLog.write("小组件车模解码失败，保留旧图 host=\(url.host ?? "-")")
+                    return
+                }
+                // 写盘前再复核一次：解码本身也可能因为大图而耗时。
+                guard self.artTicket == next, lease.valid, ticket == self.epoch,
+                      self.owner == expected, self.approved, !self.revoking else { return }
+                SystemWidgetArt.write(png, ownerID: ownerID, sourceURL: sourceURL)
+                self.artReady = (ownerID, sourceURL)
+                self.artFailed = nil
+                // 图换过了就让系统重读一次；复用 reloadWidgets 的既有节流/入口，不另建一套。
+                self.reloadWidgets(force: true, snapshot: self.persistedSnapshot)
+            }
+        }
+        artFetch = fetch
+        fetch.start()
+    }
+
+    /// 只留 PNG：扩展侧按固定后缀读文件，PNG 免去它每次解码再猜格式。
+    /// 超过 420×280 等比缩小——小组件贴图不能吃满扩展的内存预算（对齐 Android WidgetCar）。
+    private static func widgetArtPNG(_ data: Data) -> Data? {
+        guard let image = UIImage(data: data) else { return nil }
+        let width = image.size.width * image.scale
+        let height = image.size.height * image.scale
+        guard width > 0, height > 0 else { return nil }
+        let ratio = min(1, min(Double(SystemWidgetArt.maxPixelWidth) / Double(width),
+                               Double(SystemWidgetArt.maxPixelHeight) / Double(height)))
+        let target = CGSize(width: max(1, (width * ratio).rounded()),
+                            height: max(1, (height * ratio).rounded()))
+        // 缩放比例钉死 1：默认会按屏幕 scale（3x）渲染，等于落盘 1260×840 的 PNG，
+        // 与 Android 存的 420×280 差 9 倍体积，扩展读盘与解码都白花内存。
+        let format = UIGraphicsImageRendererFormat.default()
+        format.scale = 1
+        let renderer = UIGraphicsImageRenderer(size: target, format: format)
+        let scaled = renderer.image { _ in image.draw(in: CGRect(origin: .zero, size: target)) }
+        return scaled.pngData()
     }
 
     private func begin(_ method: String, args: [Any], reply: @escaping (Any?, String?) -> Void) throws -> Job {

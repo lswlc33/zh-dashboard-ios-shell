@@ -62,25 +62,49 @@ struct ZeehoRunBackgroundTaskIntent: AppIntent {
         let wantsSample = action == .sample || action == .both
         var parts: [String] = []
         if wantsSample {
-            let ok = await withCheckedContinuation { continuation in
-                IOSBackgroundRunner.runRefresh { success in continuation.resume(returning: success) }
+            // 与签到同样的道理：runRefresh 的布尔是「运行是否正常走完」，不是「取数是否成功」，
+            // 网络失败与缺凭据都回 true（那是给系统调度评分用的，不是给用户看的结论）。
+            // 所以成败一律按 completion 回调里读到的 lastResult 判定，`ok` 才算真取到；
+            // 从没跑过是 `never`，同样落到失败分支显示真实机器码，不能谎报「车况已更新」。
+            let report = await withCheckedContinuation { continuation in
+                IOSBackgroundRunner.runRefresh { _ in
+                    continuation.resume(returning: IOSBackgroundScheduler.report(IOSBackgroundTaskID.refresh))
+                }
             }
-            let report = IOSBackgroundScheduler.report(IOSBackgroundTaskID.refresh)
-            parts.append(ok ? "车况已更新" : "车况采样失败（\(report.lastResult)）")
+            switch report.lastResult {
+            case "ok":
+                parts.append("车况已更新")
+            case "no_credential":
+                parts.append("车况采样失败（未导入后台凭据）")
+            default:
+                parts.append("车况采样失败（\(report.lastResult)）")
+            }
+            // 采样失败只记账、不提前 return：both 动作里签到是独立的另一件事，
+            // 不能因为取车况失败就把用户的签到也一起放弃。两条结果用「；」拼接。
         }
         if wantsSignIn {
-            guard IOSBackgroundPreferences.autoSignInEnabled else {
-                parts.append("自动签到未开启")
-                return .result(dialog: IntentDialog(stringLiteral: parts.joined(separator: "；")))
+            // 这里**故意不看**设置里的自动签到开关：快捷指令 / 个人自动化是用户主动触发的一次
+            // 执行，不是系统在后台定时自动跑。那个开关的语义只是「允许系统自己定时签到」，
+            // 拿它挡住用户手动触发，就会出现「我明明点了签到，却只回一句自动签到未开启」。
+            // 系统定时路径（BGAppRefreshTask -> IOSBackgroundRunner.runSignIn 默认参数）仍然
+            // 尊重该开关，两条路径的区分写在 runSignIn 的注释里。
+            //
+            // 回执必须在 completion 回调里读：runSignIn 是异步的，请求发出后才会记账，
+            // 在 await 之前读到的还是上一条旧记录。
+            let report = await withCheckedContinuation { continuation in
+                IOSBackgroundRunner.runSignIn(force: true) { _ in
+                    continuation.resume(returning: IOSBackgroundScheduler.report(IOSBackgroundTaskID.signIn))
+                }
             }
-            let ok = await withCheckedContinuation { continuation in
-                IOSBackgroundRunner.runSignIn { success in continuation.resume(returning: success) }
-            }
-            let report = IOSBackgroundScheduler.report(IOSBackgroundTaskID.signIn)
-            if ok {
-                let days = report.lastSignInDays.map { "（连签 \($0) 天）" } ?? ""
-                parts.append((report.lastResult == "already_signed" ? "今日已签到" : "签到成功") + days)
-            } else {
+            let daysPart = report.lastSignInDays.map { "（连签 \($0) 天）" } ?? ""
+            switch report.lastResult {
+            case "already_signed", "signed":
+                parts.append((report.lastResult == "already_signed" ? "今日已签到" : "签到成功") + daysPart)
+            case "no_credential":
+                // runSignIn 在缺凭据时回 completion(true)，那是给系统调度评分用的
+                // （缺凭据不是运行失败，不该扣分）；对用户来说这次确实没签上，不能报成功。
+                parts.append("签到失败（未导入后台凭据）")
+            default:
                 parts.append("签到失败（\(report.lastResult)）")
             }
         }
