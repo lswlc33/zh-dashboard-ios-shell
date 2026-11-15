@@ -62,9 +62,17 @@ public enum WidgetDataSource {
             }
             switch await WidgetVehicleClient.fetch(credential, at: date) {
             case .success(let vehicle):
-                let snapshot = makeSnapshot(vehicle, credential: credential, at: date)
-                WidgetFetchCache.write(snapshot)
-                return WidgetDataSourceResult(snapshot: snapshot, origin: .live, reason: "")
+                // 构造不出来（owner/时间不自洽）就当这次失败：宁可退回缓存/快照，
+                // 也绝不写一份会被 `validated()` 拒绝的坏数据进缓存。
+                if let snapshot = makeSnapshot(vehicle, credential: credential, at: date) {
+                    WidgetFetchCache.write(snapshot)
+                    return WidgetDataSourceResult(snapshot: snapshot, origin: .live, reason: "")
+                }
+                liveReason = "snapshot_invalid"
+                if let cached = WidgetFetchCache.read(ownerID: credential.ownerID, at: date,
+                                                      maxAgeSeconds: cacheMaxAgeSeconds) {
+                    return WidgetDataSourceResult(snapshot: cached, origin: .cache, reason: liveReason)
+                }
             case .failure(let error):
                 liveReason = error.code
                 // 接口挂了但缓存还在：先用缓存，别退回更旧的宿主快照。
@@ -89,14 +97,18 @@ public enum WidgetDataSource {
         return age >= -SystemSnapshotFreshness.futureToleranceSeconds && age < snapshotMaxAgeSeconds
     }
 
-    /// 把接口结果拼成共享 schema 的快照。
+    /// 把接口结果拼成共享 schema 的快照。构造不出合规数据就返回 nil（调用方退回缓存/快照）。
     ///
     /// 时间全部用**响应到达时刻**（`sampledAt` / `statsUpdatedAt`），不用服务端的
     /// `refreshTime`：那个是车机上报时间，可能比本地时钟旧几分钟，会让卡片一加上就「可能已过期」。
+    ///
+    /// **必须自己过一遍 `validated()`**：这份快照会进缓存、被扩展当权威数据渲染，
+    /// 一旦违反 schema（时间倒挂、owner 非法、数值越界）就该当场失败，
+    /// 而不是等渲染时显示成一片「--」还查不出原因。
     private static func makeSnapshot(_ vehicle: WidgetFetchedVehicle,
-                                     credential: WidgetCredential, at date: Date) -> SystemSnapshot {
-        let owner = SystemSnapshotStore.ownerIdentifier(credential.ownerID)
-            ?? SystemSnapshotOwner(scopeID: "unknown", accountVINHash: String(repeating: "0", count: 64))
+                                     credential: WidgetCredential, at date: Date) -> SystemSnapshot? {
+        // owner 必须能从凭据解析出来；解析不出说明凭据本身坏了，直接失败。
+        guard let owner = SystemSnapshotStore.ownerIdentifier(credential.ownerID) else { return nil }
         let suffix = credential.vin.utf8.count > 6 ? String(credential.vin.suffix(4)) : nil
         let statsAt = vehicle.statsUpdatedAt
         let value = SystemVehicleSnapshot(
@@ -117,8 +129,9 @@ public enum WidgetDataSource {
         // 有效期给足 15 分钟（schema 上限）：扩展自己拉的条目靠 capturedAt 判新旧，
         // expiresAt 只是让 `isStale` 在绘制时有个一致的参考。
         let captured = max(vehicle.sampledAt, statsAt ?? 0)
-        return SystemSnapshot(owner: owner, capturedAt: captured,
-                              expiresAt: captured + SystemSnapshot.maxLifetimeMs,
-                              vehicle: value)
+        let snapshot = SystemSnapshot(owner: owner, capturedAt: captured,
+                                      expiresAt: captured + SystemSnapshot.maxLifetimeMs,
+                                      vehicle: value)
+        return (try? snapshot.validated(expectedOwner: owner)) == nil ? nil : snapshot
     }
 }

@@ -27,21 +27,27 @@ import ZeehoSystemShared
 // · 本文件与 `WidgetCommands.swift` 一样必须进 `Metadata.appintents` 索引，
 //   否则编辑面板是空的（且没有任何报错）。
 
-/// 外观：跟随系统 / 浅色 / 深色。
+/// 外观：跟随 App 设置 / 跟随系统 / 浅色 / 深色。
+///
+/// **必须单独有 `followApp`**：1.1.17 之前外观只由 App 内的「深浅色」设置控制。
+/// 如果这里默认成 `.auto`，老实例升级成可编辑控件后会被无值配置强制改成「跟随系统」，
+/// 用户在 App 里选的深色就被悄悄覆盖了 —— 属于升级回归。
 @available(iOS 17.0, *)
 enum ZeehoWidgetAppearance: String, AppEnum {
-    case auto, light, dark
+    case followApp, auto, light, dark
 
     static var typeDisplayRepresentation = TypeDisplayRepresentation(name: "外观")
     static var caseDisplayRepresentations: [ZeehoWidgetAppearance: DisplayRepresentation] = [
+        .followApp: DisplayRepresentation(title: "跟随 App 设置"),
         .auto: DisplayRepresentation(title: "跟随系统"),
         .light: DisplayRepresentation(title: "浅色"),
         .dark: DisplayRepresentation(title: "深色"),
     ]
 
-    /// 映射回 Android 同语义的 darkMode 值。
-    var darkMode: Int {
+    /// 映射回 Android 同语义的 darkMode 值；nil 表示「不改，用 App 设置」。
+    var darkMode: Int? {
         switch self {
+        case .followApp: return nil
         case .auto: return -1
         case .light: return 0
         case .dark: return 1
@@ -89,7 +95,7 @@ struct ZeehoVehicleWidgetConfiguration: WidgetConfigurationIntent {
     @Parameter(title: "显示更新时间")
     var showTime: Bool?
 
-    @Parameter(title: "外观", default: .auto)
+    @Parameter(title: "外观", default: .followApp)
     var appearance: ZeehoWidgetAppearance
 
     @Parameter(title: "统计内容", default: .followApp)
@@ -103,7 +109,7 @@ struct ZeehoVehicleWidgetConfiguration: WidgetConfigurationIntent {
     }
 
     init() {
-        appearance = .auto
+        appearance = .followApp
         stats = .followApp
     }
 }
@@ -115,7 +121,8 @@ extension ZeehoVehicleEntry {
         var value = self
         if let showName = configuration.showName { value.showName = showName }
         if let showTime = configuration.showTime { value.showTime = showTime }
-        value.darkMode = configuration.appearance.darkMode
+        // nil = 「跟随 App 设置」：保留 entry 里已经从 widget-settings 读到的 darkMode。
+        if let dark = configuration.appearance.darkMode { value.darkMode = dark }
         let preset = configuration.stats
         if preset == .hidden {
             value.stats = []
@@ -147,9 +154,40 @@ struct ZeehoVehicleConfigProvider: AppIntentTimelineProvider {
     }
 
     func timeline(for configuration: ZeehoVehicleWidgetConfiguration, in context: Context) async -> Timeline<ZeehoVehicleEntry> {
-        let result = await WidgetDataSource.load(at: Date())
+        // 与 StaticConfiguration 那条一样要防超时：`WidgetDataSource.load` 最坏 18 秒，
+        // 而 WidgetKit 的预算只有几秒。超时就交「只读本地」的 entry，
+        // 网络结果迟到只会写进缓存，下次刷新自然用上。
         let now = Date()
+        let result = await Self.loadWithDeadline(at: now, seconds: 3.5)
         let entry = ZeehoWidgetReader.entry(result, at: now).applying(configuration)
         return ZeehoVehicleProvider.timeline(entry: entry, now: now)
+    }
+
+    /// 带硬截止的取数：到点就返回本地快照，不等网络。
+    ///
+    /// 用 `ResultBox` 包一层而不是 `Optional`：`group.next()` 本身返回 Optional，
+    /// 再套一层 `Optional` 会变成双层可选，`if let` 的语义容易写错（编译期看不出来）。
+    private static func loadWithDeadline(at date: Date, seconds: Double) async -> WidgetDataSourceResult {
+        await withTaskGroup(of: ResultBox.self) { group in
+            group.addTask {
+                ResultBox(value: await WidgetDataSource.load(at: date))
+            }
+            group.addTask {
+                try? await Task.sleep(nanoseconds: UInt64(max(0.5, seconds) * 1_000_000_000))
+                return ResultBox(value: nil)
+            }
+            defer { group.cancelAll() }
+            // 只要**第一个完成**的：拿到真结果就用它，拿到 nil 就是超时。
+            // 不能 while 轮询——超时分支先返回 nil 后再等 loadTask 等于没做超时。
+            let first = await group.next()
+            if let value = first?.value { return value }
+            return WidgetDataSourceResult(snapshot: ZeehoWidgetReader.read(at: date).snapshot,
+                                          origin: .snapshot, reason: "timeout")
+        }
+    }
+
+    /// 只为了让任务组的结果类型单一（避免 Optional 套 Optional）。
+    private struct ResultBox: Sendable {
+        let value: WidgetDataSourceResult?
     }
 }

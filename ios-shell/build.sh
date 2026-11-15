@@ -201,8 +201,12 @@ while IFS= read -r library; do link_args+=("-l$library"); done < "$build_dir/lib
 # 协议清单必须是**裸 JSON 数组**、元素是**不带模块前缀**的协议名
 # （Xcode 自己那份是 wrapper dict，前端会拒绝）。
 const_protocols="$build_dir/const_extract_protocols.json"
+# 列表里必须包含**小组件编辑面板**用到的协议：WidgetConfigurationIntent 与
+# ParameterSummary。缺了它们，AppIntentConfiguration 的配置类型不会进
+# Metadata.appintents，真机上「编辑小组件」面板是空的且**没有任何报错**
+# （与按钮缺索引时 linkd Missing 同类的静默失效）。
 cat > "$const_protocols" <<'ZEEHO_PROTOCOLS'
-["AppIntent","EntityQuery","AppEntity","EntityStringQuery","TransientEntity","AppEnum","AppShortcutProviding","AppShortcutsProvider","AnyResolverProviding","AppIntentsPackage","DynamicOptionsProvider","OpenIntent","_IntentValueRepresentable","_AssistantIntentsProvider","_GenerativeFunctionExtractable","IntentValueQuery","Resolver"]
+["AppIntent","WidgetConfigurationIntent","ParameterSummary","EntityQuery","AppEntity","EntityStringQuery","TransientEntity","AppEnum","AppShortcutProviding","AppShortcutsProvider","AnyResolverProviding","AppIntentsPackage","DynamicOptionsProvider","OpenIntent","_IntentValueRepresentable","_AssistantIntentsProvider","_GenerativeFunctionExtractable","IntentValueQuery","Resolver"]
 ZEEHO_PROTOCOLS
 
 # 主 App 的 AppIntents 必须弱链接：deployment target 是 15.4，强链接 iOS 16+ 框架

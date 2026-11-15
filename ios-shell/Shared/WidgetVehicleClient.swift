@@ -161,8 +161,11 @@ public enum WidgetVehicleClient {
         } else {
             out.charging = nil
         }
-        // vehicleType 才是 Android 小组件显示的车名（不是 vehicleName），长度/字符另在展示层校验。
-        out.name = text(home["vehicleType"]).map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+        // vehicleType 才是 Android 小组件显示的车名（不是 vehicleName）。
+        // 长度/字符必须在源头就按 `SystemVehicleSnapshot.validated()` 的判据裁掉：
+        // 车名超 40 字符或含控制字符会让**整份快照**校验失败，用户看到的是
+        // 「小组件突然空白」，而真正的原因只是车名太长。
+        out.name = safeName(text(home["vehicleType"]))
         out.lockState = state(home["headLockState"])
         // 坐垫三态：字段缺失是「未知」而不是「未锁」，与 model.js 的 seatLock 一致。
         out.seatState = home["seatLockState"] == nil ? nil : state(home["seatLockState"])
@@ -336,6 +339,18 @@ public enum WidgetVehicleClient {
     private static func percent(_ value: Double?) -> Double? {
         guard let value = value, value >= 0, value <= 100 else { return nil }
         return value
+    }
+
+    /// 车名清洗：与 `SystemVehicleSnapshot.validated()` 的 safeName 判据完全一致
+    /// （非空、≤40 字符、≤160 字节、无控制字符；另外拒掉 URL / @ / 车架号形态）。
+    /// 不合格就当作没有车名——展示层会退回「几何面板」标题，比整份快照失败好。
+    private static func safeName(_ value: String?) -> String? {
+        guard let text = value else { return nil }
+        let clean = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !clean.isEmpty, clean.count <= 40, clean.utf8.count <= 160,
+              !clean.unicodeScalars.contains(where: { CharacterSet.controlCharacters.contains($0) }),
+              !clean.contains("@"), !clean.contains("://") else { return nil }
+        return clean
     }
 
     private static func nonNegative(_ value: Double?) -> Double? {

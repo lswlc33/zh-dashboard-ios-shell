@@ -213,6 +213,23 @@ def main():
     assert 'AppIntentConfiguration(' in widget_bundle, 'iOS 17+ 原生编辑必须用 AppIntentConfiguration'
     assert 'WidgetConfigurationIntent' in widget_config, '编辑面板必须声明 WidgetConfigurationIntent'
     assert 'ZeehoWidgetKind.vehicle' in widget_bundle, '两套控件必须共用同一个 kind（WidgetCenter 按它重载）'
+    # 小组件自己拉接口的签名算法必须是 sign.js 的同一套（md5(sha1(query+param+secret))）。
+    # Host 侧（BackgroundSigning）与 Shared 侧（WidgetVehicleClient）各有一份实现
+    # —— 模块边界决定不能共享 —— 所以这里钉死两边都还在用同一串。
+    widget_client = (root / 'Shared/WidgetVehicleClient.swift').read_text(encoding='utf-8')
+    signing = (root / 'BackgroundSigning.swift').read_text(encoding='utf-8')
+    for token in ('md5Hex(sha1Hex(', 'appId=\\(appID)&nonce=\\(nonce)&timestamp=\\(milliseconds)'):
+        assert token in widget_client, '小组件签名算法缺失约定片段: ' + token
+    assert 'md5Hex(sha1Hex(' in signing, 'Host 侧签名算法必须与小组件同构'
+    # 纯函数级一致性：把两份实现的源码断言成「同一个表达式顺序」，防止单边改动漂移。
+    assert widget_client.count('sorted { $0.0 < $1.0 }') == 1 and signing.count('sorted { $0.0 < $1.0 }') == 1, \
+        '两边 query 排序规则必须一致（按 key 字典序）'
+    assert 'freshWindow = WidgetFreshness.maxAgeSeconds' in (
+        root / 'Widgets/WidgetStyle.swift').read_text(encoding='utf-8'), \
+        '桌面小组件必须用 30 分钟窗口（180 秒会让数据一渲染就掉成 --）'
+    # 编辑面板的 protocol 必须进 const-values 清单，否则 metadata 里没有它（面板空白）
+    assert 'WidgetConfigurationIntent' in build_sh, \
+        'const_extract_protocols.json 必须包含 WidgetConfigurationIntent'
     assert 'appintentsmetadataprocessor' in build_sh, '交互按钮必须生成 AppIntents metadata，否则点击无效'
     # 判据是「索引目录里有文件」，不再死认 extract.actionsdata：Xcode 版本间改过名，
     # 写死文件名会在明明成功的机器上误报（CI 实测 Xcode 16.4）。

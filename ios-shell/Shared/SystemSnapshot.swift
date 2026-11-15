@@ -102,17 +102,25 @@ public struct SystemVehicleSnapshot: Codable, Equatable, Hashable, Sendable {
         self.tireFrontTemp = tireFrontTemp; self.tireRearTemp = tireRearTemp
         self.statsUpdatedAt = statsUpdatedAt
     }
-    // 云端时间是接口同步时间，不宣称是传感器时间；缺时间或超过 180 秒一律显示未知。
-    public func visibleSOCPercent(at date: Date = Date()) -> Double? {
-        SystemSnapshotFreshness.isFresh(socUpdatedAt, at: date, maxAgeSeconds: SystemSnapshotFreshness.vehicleMaxAgeSeconds)
+    // 云端时间是接口同步时间，不宣称是传感器时间；缺时间或超过 maxAgeSeconds 一律显示未知。
+    //
+    // `maxAgeSeconds` 必须可覆盖：桌面小组件由系统按十几分钟一次的节奏唤醒，
+    // 用 180 秒判会让刚拉到/刚同步的数据一渲染就掉成「--」（1.1.17 的真实事故：
+    // 三档布局一直调这些方法，`keepsLastKnown` 那条路等于被废掉）。
+    // 默认值保持 180 秒，Live Activity 等会话级展示不受影响。
+    public func visibleSOCPercent(at date: Date = Date(),
+                                  maxAgeSeconds: Double = SystemSnapshotFreshness.vehicleMaxAgeSeconds) -> Double? {
+        SystemSnapshotFreshness.isFresh(socUpdatedAt, at: date, maxAgeSeconds: maxAgeSeconds)
             ? socPercent : nil
     }
-    public func visibleCharging(at date: Date = Date()) -> Bool? {
-        SystemSnapshotFreshness.isFresh(chargingUpdatedAt, at: date, maxAgeSeconds: SystemSnapshotFreshness.vehicleMaxAgeSeconds)
+    public func visibleCharging(at date: Date = Date(),
+                                maxAgeSeconds: Double = SystemSnapshotFreshness.vehicleMaxAgeSeconds) -> Bool? {
+        SystemSnapshotFreshness.isFresh(chargingUpdatedAt, at: date, maxAgeSeconds: maxAgeSeconds)
             ? charging : nil
     }
-    public func visibleChargeProgress(at date: Date = Date()) -> Double? {
-        SystemSnapshotFreshness.isFresh(chargeProgressUpdatedAt, at: date, maxAgeSeconds: SystemSnapshotFreshness.vehicleMaxAgeSeconds)
+    public func visibleChargeProgress(at date: Date = Date(),
+                                      maxAgeSeconds: Double = SystemSnapshotFreshness.vehicleMaxAgeSeconds) -> Double? {
+        SystemSnapshotFreshness.isFresh(chargeProgressUpdatedAt, at: date, maxAgeSeconds: maxAgeSeconds)
             ? chargeProgressPercent : nil
     }
     /// 统计类字段（里程/胎压/积分等）变化慢，用与桌面小组件一致的 30 分钟窗口；
@@ -126,19 +134,23 @@ public struct SystemVehicleSnapshot: Codable, Equatable, Hashable, Sendable {
     /// 前后胎压都没有时（无胎压车型），展示层让位给总里程 —— 与 Android 判据完全一致：
     /// 只有「两个传感器都没上报」才让位，只缺一侧仍显示「—」。
     public var hasTirePressure: Bool { tireFrontBar != nil || tireRearBar != nil }
-    // 状态类字段（锁车/坐垫/在线）用与车况标量相同的 180 秒窗口：
+    // 状态类字段（锁车/坐垫/在线）默认用与车况标量相同的 180 秒窗口：
     // 它们是「当前状态」，过期后就不该再宣称已锁车/在线。
+    // 桌面小组件传 30 分钟窗口（系统刷新节奏决定的），见 WidgetStatusText。
     /// 锁车状态：1 = 已锁、0 = 未锁、nil = 未知。
-    public func visibleLockState(at date: Date = Date()) -> Int? {
-        SystemSnapshotFreshness.isFresh(statsUpdatedAt, at: date, maxAgeSeconds: SystemSnapshotFreshness.vehicleMaxAgeSeconds)
+    public func visibleLockState(at date: Date = Date(),
+                                 maxAgeSeconds: Double = SystemSnapshotFreshness.vehicleMaxAgeSeconds) -> Int? {
+        SystemSnapshotFreshness.isFresh(statsUpdatedAt, at: date, maxAgeSeconds: maxAgeSeconds)
             ? lockState : nil
     }
-    public func visibleSeatState(at date: Date = Date()) -> Int? {
-        SystemSnapshotFreshness.isFresh(statsUpdatedAt, at: date, maxAgeSeconds: SystemSnapshotFreshness.vehicleMaxAgeSeconds)
+    public func visibleSeatState(at date: Date = Date(),
+                                 maxAgeSeconds: Double = SystemSnapshotFreshness.vehicleMaxAgeSeconds) -> Int? {
+        SystemSnapshotFreshness.isFresh(statsUpdatedAt, at: date, maxAgeSeconds: maxAgeSeconds)
             ? seatState : nil
     }
-    public func visibleOnlineState(at date: Date = Date()) -> Int? {
-        SystemSnapshotFreshness.isFresh(statsUpdatedAt, at: date, maxAgeSeconds: SystemSnapshotFreshness.vehicleMaxAgeSeconds)
+    public func visibleOnlineState(at date: Date = Date(),
+                                   maxAgeSeconds: Double = SystemSnapshotFreshness.vehicleMaxAgeSeconds) -> Int? {
+        SystemSnapshotFreshness.isFresh(statsUpdatedAt, at: date, maxAgeSeconds: maxAgeSeconds)
             ? online : nil
     }
     /// 统计类字段的可见性：里程/胎压/积分等用 30 分钟宽窗口。

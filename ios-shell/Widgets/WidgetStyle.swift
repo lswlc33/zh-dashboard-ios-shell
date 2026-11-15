@@ -188,6 +188,14 @@ struct WidgetStatValue {
 // MARK: - 状态文案（与 Android BaseWidget 9.1-9.4 完全同序）
 
 enum WidgetStatusText {
+    /// 桌面小组件专用的新鲜度窗口。
+    ///
+    /// **不能用 `SystemSnapshotFreshness.vehicleMaxAgeSeconds`（180 秒）**：WidgetKit 由系统
+    /// 按十几分钟一次的节奏唤醒，180 秒判会让刚同步/刚自己拉到的数据一渲染就掉成「--」，
+    /// 用户看到的是「小组件永远空白」。Android 小组件同样是 30 分钟口径（BaseWidget.updated()）。
+    /// 这里统一传给 Shared 的 visible* 方法，替代 1.1.17 里那条被废掉的 keepsLastKnown 路。
+    private static let freshWindow = WidgetFreshness.maxAgeSeconds
+
     /// 充电/在线状态行的语义色标记（调用点映射到具体色）。
     enum LineTone { case normal, warn, accent }
 
@@ -195,11 +203,11 @@ enum WidgetStatusText {
     static func chargeLine(vehicle: SystemVehicleSnapshot?, hasData: Bool,
                            date: Date = Date()) -> (text: String, tone: LineTone) {
         guard let vehicle = vehicle, hasData else { return ("打开面板同步", .normal) }
-        if vehicle.visibleOnlineState(at: date) == 0 { return ("离线", .warn) }
-        if let charging = vehicle.visibleCharging(at: date) {
+        if vehicle.visibleOnlineState(at: date, maxAgeSeconds: freshWindow) == 0 { return ("离线", .warn) }
+        if let charging = vehicle.visibleCharging(at: date, maxAgeSeconds: freshWindow) {
             return charging ? ("充电中", .accent) : ("未充电", .normal)
         }
-        switch vehicle.visibleLockState(at: date) {
+        switch vehicle.visibleLockState(at: date, maxAgeSeconds: freshWindow) {
         case .some(1): return ("已锁车", .normal)
         case .some(0): return ("未锁车", .normal)
         default: return ("状态未知", .normal)
@@ -207,7 +215,7 @@ enum WidgetStatusText {
     }
     /// 锁车胶囊：只有明确的 1/0 才显示，未知整颗胶囊消失（同 Android 9.2）。
     static func lockPill(vehicle: SystemVehicleSnapshot?, date: Date = Date()) -> String? {
-        switch vehicle?.visibleLockState(at: date) {
+        switch vehicle?.visibleLockState(at: date, maxAgeSeconds: freshWindow) {
         case .some(1): return "已锁车"
         case .some(0): return "未锁车"
         default: return nil
@@ -215,7 +223,7 @@ enum WidgetStatusText {
     }
     /// 坐垫胶囊：同上（Android 9.3）。
     static func seatPill(vehicle: SystemVehicleSnapshot?, date: Date = Date()) -> String? {
-        switch vehicle?.visibleSeatState(at: date) {
+        switch vehicle?.visibleSeatState(at: date, maxAgeSeconds: freshWindow) {
         case .some(1): return "坐垫已锁"
         case .some(0): return "坐垫未锁"
         default: return nil
@@ -223,14 +231,14 @@ enum WidgetStatusText {
     }
     /// 在线文案：只有明确的离线（0）才说离线；未知按在线（同 Android 9.4）。
     static func onlineText(vehicle: SystemVehicleSnapshot?, date: Date = Date()) -> String {
-        vehicle?.visibleOnlineState(at: date) == 0 ? "离线" : "在线"
+        vehicle?.visibleOnlineState(at: date, maxAgeSeconds: freshWindow) == 0 ? "离线" : "在线"
     }
     static func outageDot(vehicle: SystemVehicleSnapshot?, date: Date = Date()) -> Bool {
-        vehicle?.visibleOnlineState(at: date) != 0
+        vehicle?.visibleOnlineState(at: date, maxAgeSeconds: freshWindow) != 0
     }
     /// 电量数字：未知显示「--」（Android widget_soc_unknown）。
     static func soc(_ vehicle: SystemVehicleSnapshot?, date: Date = Date()) -> String {
-        guard let value = vehicle?.visibleSOCPercent(at: date) else { return "--" }
+        guard let value = vehicle?.visibleSOCPercent(at: date, maxAgeSeconds: freshWindow) else { return "--" }
         return String(format: "%.0f", value)
     }
     /// 电压尾巴（2×2）：「82.8 V」。

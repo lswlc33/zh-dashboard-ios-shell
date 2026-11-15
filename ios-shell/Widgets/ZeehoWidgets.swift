@@ -60,6 +60,56 @@ struct ZeehoVehicleEntry: TimelineEntry {
 // 前两条对应官方 `ZHWidgetExtension` 的做法（扩展自带网络层，不依赖宿主存活），
 // 第三条保留原有兜底，未授权后台凭据/弱网时行为不变。
 
+/// `getTimeline` 的一次性闸门：网络结果与超时兜底**先到先赢**，`completion` 只调一次。
+///
+/// 为什么必须有：WidgetKit 的时间预算只有几秒，而一次联网最坏 18 秒。
+/// 直接 `await` 会让系统在预算到点时掐掉扩展，`completion` 永不调用 ——
+/// 表现就是「小组件一直显示旧数据 / 一直占位」，而且系统不会立刻再给机会。
+/// 用闸门保证：预算内一定交出 timeline（哪怕是快照兜底），网络结果只用于填缓存。
+private final class TimelineGate {
+    private let lock = NSLock()
+    private var completion: ((Timeline<ZeehoVehicleEntry>) -> Void)?
+    private var fallback: DispatchWorkItem?
+
+    init(completion: @escaping (Timeline<ZeehoVehicleEntry>) -> Void) {
+        self.completion = completion
+    }
+
+    /// 正常完成（网络结果 / 缓存 / 快照）：取消超时兜底并交结果。
+    func finish(_ timeline: Timeline<ZeehoVehicleEntry>) {
+        lock.lock()
+        let callback = completion
+        completion = nil
+        let fallback = self.fallback
+        self.fallback = nil
+        lock.unlock()
+        fallback?.cancel()
+        callback?(timeline)
+    }
+
+    /// 超时兜底：到点还没 finish 就先交一份「只读本地」的 timeline。
+    func scheduleFallback(seconds: Double,
+                          build: @escaping () -> Timeline<ZeehoVehicleEntry>) {
+        let item = DispatchWorkItem { [weak self] in
+            guard let self = self else { return }
+            self.lock.lock()
+            let callback = self.completion
+            self.completion = nil
+            self.fallback = nil
+            self.lock.unlock()
+            guard let callback = callback else { return }
+            callback(build())
+        }
+        lock.lock()
+        fallback = item
+        let armed = completion != nil
+        lock.unlock()
+        // 已经被网络结果抢先完成时不再排队。
+        guard armed else { return }
+        DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + max(0.5, seconds), execute: item)
+    }
+}
+
 struct ZeehoVehicleProvider: TimelineProvider {
     private static let refreshInterval: TimeInterval = 15 * 60
 
@@ -74,13 +124,19 @@ struct ZeehoVehicleProvider: TimelineProvider {
     }
 
     func getTimeline(in context: Context, completion: @escaping (Timeline<ZeehoVehicleEntry>) -> Void) {
-        // 系统给的时间预算很短，这里必须先产出 result 再算 entry：
-        // 网络失败也要交出 timeline（退回快照），绝不能让 completion 永不调用
-        // —— 那会让小组件一直停在占位态，且系统不会再给它机会。
+        // WidgetKit 给的时间预算只有几秒级；网络最坏要 18 秒（见 WidgetVehicleClient），
+        // 直接 await 会被系统掐断，表现是「小组件永远停在旧数据 / 占位态」。
+        // 所以这里用一次性闸门：**先到先赢**，超时就交快照兜底的 timeline，
+        // 之后网络回来也只是把结果写进缓存，下次刷新自然用上。
+        let gate = TimelineGate(completion: completion)
         Task {
             let result = await WidgetDataSource.load(at: Date())
+            gate.finish(Self.timeline(entry: ZeehoWidgetReader.entry(result, at: Date()), now: Date()))
+        }
+        // 保守取 3.5 秒：与系统对 App Extension 的常见预算留出余量。
+        gate.scheduleFallback(seconds: 3.5) {
             let now = Date()
-            completion(Self.timeline(entry: ZeehoWidgetReader.entry(result, at: now), now: now))
+            Self.timeline(entry: ZeehoWidgetReader.read(at: now), now: now)
         }
     }
 
@@ -195,10 +251,13 @@ private struct SOCProgress: View {
 
 /// 刷新按钮（Android w_refresh：accent 文字、widget_btn 底、14dp 圆角）。
 ///
-/// 以前这里只是个 `Text` —— 长得像按钮但点不动（`ZeehoWidgetRefreshIntent` 全仓零引用）。
-/// 现在按 iOS 17 的交互式小组件规范包成 `Button(intent:)`：点击在扩展进程里真的发请求，
-/// 系统随后重建时间线。低系统没有 `Button(intent:)`，保持原样（纯装饰），
-/// 而不是塞一个点了没反应的假按钮。
+/// **iOS 17+ 才是真按钮**：`Button(intent:)` 让点击在扩展进程里真的发请求，
+/// 系统随后重建时间线。之前这里只是个 `Text` —— 长得像按钮但点不动
+/// （`ZeehoWidgetRefreshIntent` 全仓零引用，属于死控件）。
+///
+/// **iOS 15.4~16.x 降级为纯装饰**：那两代没有 `Button(intent:)`，壳也没有注册
+/// 自定义 URL scheme（`Link` 无处可跳）。这里刻意不画假按钮、也不假装能点：
+/// 低系统的刷新只能靠系统自己排时间线，用户长按进 App 同步。
 private struct RefreshPill: View {
     let text: String
     let width: CGFloat

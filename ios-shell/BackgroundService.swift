@@ -195,8 +195,10 @@ final class IOSBackgroundService: NSObject, IOSBridgeService, IOSBridgeCancellab
         let scopes = credential.grantedScopes
 
         // 长期凭据必须二次确认：网页可能被注入脚本，不能让它在启动时静默写入。
-        confirm(title: "启用后台自动任务",
-                message: "将把当前账号的登录凭据与签名密钥保存到系统钥匙串，用于在你不在时自动签到、补采电量。凭据只留在这台设备，可随时在面板里清除。") { [weak self] approved in
+        // 文案必须把两件事都说清楚：这份凭据同时供「后台自动任务」与「桌面小组件自己刷新」，
+        // 用户点确认就是在授权这两条链路（小组件那条只是读车况展示）。
+        confirm(title: "授权凭据",
+                message: "将把当前账号的登录凭据与签名密钥保存到系统钥匙串：用于在你不在时自动签到、补采电量，并让桌面小组件可以自己刷新车况。凭据只留在这台设备，可随时在面板里清除。") { [weak self] approved in
             guard let self = self else { return }
             guard approved else {
                 credential.clear()

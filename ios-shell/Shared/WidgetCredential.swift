@@ -65,9 +65,12 @@ public struct WidgetCredential: Codable, Equatable, Sendable {
             && updatedAt > 0
     }
 
-    /// 是否还在可用期内。默认 24 小时：token 失效由接口 401 立即反映，
-    /// 这个窗口只是防止一份很久以前的前台凭据在扩展里无限期被拿来打接口。
-    public func isUsable(at date: Date = Date(), maxAgeSeconds: Double = 24 * 3600) -> Bool {
+    /// 是否还在可用期内。
+    ///
+    /// 窗口给 7 天，不是 24 小时：用户完全可能连续几天不开 App，而小组件仍应该能自己
+    /// 刷新车况（这正是「不依赖宿主存活」的意义）。真正失效由接口 401 立即反映，
+    /// 过期也只会退化成读快照；这个窗口只是防止一份很久以前的前台凭据被无限期使用。
+    public func isUsable(at date: Date = Date(), maxAgeSeconds: Double = 7 * 24 * 3600) -> Bool {
         guard isValid else { return false }
         let age = date.timeIntervalSince1970 - Double(updatedAt) / 1000
         return age >= -SystemSnapshotFreshness.futureToleranceSeconds && age < maxAgeSeconds
