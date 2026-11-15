@@ -2,18 +2,27 @@ import Foundation
 import Security
 import CryptoKit
 
-// 通用的本机随机标识，按原生账号/VIN 隔离；不读取 Android ID、IDFV 或 MAC。
+// 通用的本机随机标识，不读取 Android ID、IDFV 或 MAC。
 // 不同步、不迁往其他设备，不把账号/VIN 明文写入 Keychain；无法读取不能临时换 ID。
+//
+// 作用域与安卓 InductiveKeyIdentity 对齐：**一份安装一个 ID，所有车辆共用**。
+// 旧实现按 SHA256(账号+VIN) 分片，同一辆车换账号重登就会拿到新 ID，
+// 于是同一台车会被悄悄登记成第二把手机钥匙（车端钥匙名额有上限）。
+//
+// 迁移是单向且保旧的：先查本车旧分片 key，查到就继续用（已经登记在车上的那把不能换，
+// 换掉等于让车端多一把、旧的还清不掉）；查不到才回落到全机唯一 key，再没有才新建。
 final class IOSInductiveIdentity {
     private static let queue = DispatchQueue(label: "io.github.lswlc33.dashboard.ble.identity")
     private static let service = "io.github.lswlc33.dashboard.ble.identity.v1"
+    // 全机唯一槽位名。ownerHash 是 64 位 hex，不会与这个字面量撞车。
+    private static let installAccount = "install"
 
     static func load(scope: IOSRideScope, completion: @escaping (Result<Data, IOSBLEPipeFailure>) -> Void) {
         guard scope.valid else { completion(.failure(IOSBLEPipeFailure("authorized_vehicle_required"))); return }
-        let account = scope.ownerHash
+        let legacy = scope.ownerHash
         queue.async {
             let result: Result<Data, IOSBLEPipeFailure>
-            do { result = .success(try readOrCreate(account: account)) }
+            do { result = .success(try resolve(legacy: legacy)) }
             catch { result = .failure(IOSBLEPipeFailure("identity_storage_failed")) }
             DispatchQueue.main.async { completion(result) }
         }
@@ -25,17 +34,27 @@ final class IOSInductiveIdentity {
          kSecAttrSynchronizable as String: false]
     }
 
-    private static func readOrCreate(account: String) throws -> Data {
+    // 读取顺序即兼容性策略：已登记过的旧 key 优先，其次全机唯一 key，最后新建全机唯一 key。
+    private static func resolve(legacy: String) throws -> Data {
+        if let data = try read(account: legacy) { return data }
+        if let data = try read(account: installAccount) { return data }
+        return try create(account: installAccount)
+    }
+
+    private static func read(account: String) throws -> Data? {
         var lookup = query(account: account)
         lookup[kSecReturnData as String] = true
         lookup[kSecMatchLimit as String] = kSecMatchLimitOne
         var found: CFTypeRef?
         let status = SecItemCopyMatching(lookup as CFDictionary, &found)
-        if status == errSecSuccess {
-            guard let data = found as? Data, data.count == 8 else { throw IOSBLEPipeFailure("identity_corrupt") }
-            return data
+        if status == errSecItemNotFound { return nil }
+        guard status == errSecSuccess, let data = found as? Data, data.count == 8 else {
+            throw IOSBLEPipeFailure("identity_corrupt")
         }
-        guard status == errSecItemNotFound else { throw IOSBLEPipeFailure("identity_unavailable") }
+        return data
+    }
+
+    private static func create(account: String) throws -> Data {
         var bytes = Data(count: 8)
         let randomStatus = bytes.withUnsafeMutableBytes { buffer in
             SecRandomCopyBytes(kSecRandomDefault, buffer.count, buffer.baseAddress!)
@@ -46,7 +65,11 @@ final class IOSInductiveIdentity {
         item[kSecValueData as String] = bytes
         let saved = SecItemAdd(item as CFDictionary, nil)
         // 跨实例竞争只接受已经存下来的真实 ID，绝不覆盖它。
-        if saved == errSecDuplicateItem { bytes.resetBytes(in: 0..<bytes.count); return try readOrCreate(account: account) }
+        if saved == errSecDuplicateItem {
+            bytes.resetBytes(in: 0..<bytes.count)
+            guard let existing = try read(account: account) else { throw IOSBLEPipeFailure("identity_unavailable") }
+            return existing
+        }
         guard saved == errSecSuccess else { bytes.resetBytes(in: 0..<bytes.count); throw IOSBLEPipeFailure("identity_unavailable") }
         return bytes
     }
