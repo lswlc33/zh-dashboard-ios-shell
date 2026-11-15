@@ -30,7 +30,6 @@ final class BackupPanelViewController: UIViewController, UITableViewDataSource, 
     private let store = IOSStore.shared
     /// 当前存档摘要。nil = 还没读出来（首次读盘可能因 Keychain 冷启而慢一拍）。
     private var snapshot: AccountBackup.Snapshot?
-    private var loadError: String?
     private var busy = false
     private var closed = false
     /// 每轮读取/操作一个代号，避免旧回执覆盖新状态（与恢复页同一套做法）。
@@ -58,8 +57,10 @@ final class BackupPanelViewController: UIViewController, UITableViewDataSource, 
 
     override func viewDidAppear(_ animated: Bool) {
         super.viewDidAppear(animated)
-        // 从剪贴板回来（系统粘贴授权框）或分享页回来后，状态可能已经变了。
-        if !busy { reload() }
+        // 从子页面（显示凭据 / 手动粘贴）回来时不再重读：
+        // 那些页面不改存档，重读只会推进 generation 并把用户刚确认的预览基线弄旧。
+        // 真正的「别人改过存档」由提交时的 expectedRevision 判出来。
+        if !busy, snapshot == nil { reload() }
     }
 
     @objc private func dismissSelf() {
@@ -79,7 +80,6 @@ final class BackupPanelViewController: UIViewController, UITableViewDataSource, 
             let summary = AccountBackup.snapshot(values: value.values, revision: value.revision,
                                                  readError: value.readError)
             self.snapshot = summary
-            self.loadError = value.readError
             self.table.reloadData()
         }
     }
