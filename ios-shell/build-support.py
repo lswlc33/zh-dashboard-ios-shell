@@ -416,7 +416,10 @@ def validate_info(info, executable='Dashboard', bundle_id=BUNDLE_ID):
     require(info.get('CFBundleIdentifier') == bundle_id, 'Unexpected bundle identifier')
     require(info.get('NSSupportsLiveActivities') is True, 'Host must declare NSSupportsLiveActivities')
     require(info.get('MinimumOSVersion') == MINIMUM_IOS, 'Deployment must be iOS 15.4')
-    require('NSAppTransportSecurity' not in info, 'Do not package an ATS bypass')
+    # Host 公开资源允许任意 HTTP；只接受这一种精确配置，不给 extension 或 WebView 加专项放行。
+    ats = info.get('NSAppTransportSecurity')
+    require(isinstance(ats, dict) and set(ats) == {'NSAllowsArbitraryLoads'}
+            and ats['NSAllowsArbitraryLoads'] is True, 'Host public resource ATS configuration mismatch')
     require(isinstance(info.get('NSLocalNetworkUsageDescription'), str)
             and bool(info['NSLocalNetworkUsageDescription'].strip()), 'Local TCP networking requires a user-facing purpose string')
     require('NSBonjourServices' not in info, 'Pure TCP networking must not declare Bonjour discovery')

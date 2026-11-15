@@ -76,7 +76,11 @@ def main():
         info = plistlib.load(f)
     assert info['CFBundlePackageType'] == 'APPL'
     assert info['MinimumOSVersion'] == '15.4'
-    assert 'NSAppTransportSecurity' not in info
+    assert info.get('NSAppTransportSecurity') == {'NSAllowsArbitraryLoads': True}
+    assert info['NSAppTransportSecurity']['NSAllowsArbitraryLoads'] is True
+    for extension in ('Widgets', 'Broadcast'):
+        with (root / extension / 'Info.plist').open('rb') as stream:
+            assert 'NSAppTransportSecurity' not in plistlib.load(stream), 'host HTTP 配置不能进入 extension'
     assert info['CFBundleIdentifier'] == 'io.github.lswlc33.dashboard.ios'
     assert info['NSSupportsLiveActivities'] is True
     assert info.get('NSLocalNetworkUsageDescription', '').strip(), '局域网 TCP 缺少用途说明'
@@ -659,6 +663,57 @@ def main():
         expression = r'\s*'.join(re.escape(part) for part in value.split())
         assert re.search(r'static\s+let\s+' + name + r'\s*=\s*' + expression + r'\s*(?://[^\n]*)?$', policy_code, re.M), \
             '修正预留不能放宽安全上限：' + name
+
+    # txn 公开资源走 Swift，旧官方 API/KMP 保留 4MiB；这里只检查真实接线/边界，不冒充 URLSession 执行。
+    budget_code = strip_comments((root / 'BridgeBudget.swift').read_text(encoding='utf-8'))
+    assert 'static let maxTransactionResponseBytes = 20 * 1024 * 1024' in budget_code
+    assert '((maxTransactionResponseBytes + 2) / 3) * 4 + 64 * 1024' in budget_code
+    assert 'static let maxBodyBytes = 8 * 1024 * 1024' in policy_code
+    assert 'static let maxResponseBytes = 4 * 1024 * 1024' in policy_code
+    assert 'static let maxResourceRedirects = 5' in policy_code and 'static let maxConcurrentResources = 4' in policy_code
+    for fragment in ('maxResourceResponseBytes = IOSBridgeBudget.maxTransactionResponseBytes',
+                     'maxTransactionReplyBytes = IOSBridgeBudget.maxTransactionReplyBytes',
+                     '"timeoutMs", "followRedirects"', 'CFGetTypeID(number) == CFBooleanGetTypeID()',
+                     'let resource = !trustedAPI || followRedirects', 'parts.scheme?.lowercased() == "https"',
+                     'parts.port == nil || parts.port == 443', 'trustedAPI || method == "GET"',
+                     '!followRedirects || method == "GET"', '!resource || !credentialHeaders.contains(lower)',
+                     'IOSBridgeBudget.transactionBodySize(body, limit: responseLimit)',
+                     'body.utf8.count <= maxTransactionReplyBytes - 64 * 1024'):
+        assert fragment in policy_code, 'txn 缺少资源/旧 API 边界：' + fragment
+    begin_transaction = bridge_code.split('private func beginTransaction(', 1)[1].split('private func beginResource(', 1)[0]
+    assert begin_transaction.index('if request.resource') < begin_transaction.index('self.transport.execute(json: request.json'), \
+        '公开资源必须先分流，不能再交给锁域名/4MiB 的 KMP'
+    assert 'responseLimit: request.responseLimit' in begin_transaction
+    for fragment in ('IOSResourceRequest(request: request', 'activeResourceRequests.count < IOSBridgePolicy.maxConcurrentResources',
+                     'resourceQueue.append(transportID)', 'resourceQueue.removeAll { $0 == id }',
+                     'activeResourceRequests.contains(id)', 'job.operation.cancel()', 'pumpResources()',
+                     'resourceJobs.removeValue(forKey: id)', 'cancelTransaction(transportID)',
+                     'cancelTransaction(id)', 'resourceRequests.values.forEach { $0.cancel() }'):
+        assert fragment in bridge_code, 'txn 生命周期/排队缺少真实接线：' + fragment
+    resource_code = policy_code.split('final class IOSResourceRequest:', 1)[1]
+    for fragment in ('URLSessionConfiguration.ephemeral', 'config.urlCredentialStorage = nil',
+                     'config.httpCookieStorage = nil', 'config.httpShouldSetCookies = false',
+                     'value.httpMethod = "GET"', 'value.httpShouldHandleCookies = false',
+                     '!IOSBridgePolicy.credentialHeaders.contains(name.lowercased())',
+                     'guard self.request.followRedirects', 'redirects < IOSBridgePolicy.maxResourceRedirects',
+                     'completionHandler(get(safeURL))', 'data.count <= request.responseLimit - self.data.count',
+                     'fail("response_too_large")', 'let encoding = http.value(forHTTPHeaderField: "Content-Encoding")?.lowercased()',
+                     '"bodyB64": data.base64EncodedString()', '"truncated": false',
+                     '"finalUrl": url.absoluteString', 'value["location"] = location',
+                     'session?.invalidateAndCancel()', '.cancelAuthenticationChallenge'):
+        assert fragment in resource_code, 'URLSession 资源边界缺失：' + fragment
+    assert 'completionHandler(request)' not in resource_code, '不能让 URLSession 自动继承跨站敏感头'
+    assert 'truncated = true' not in resource_code, '资源超限不能返回部分文件作为成功结果'
+    helper.validate_info(info)
+    for ats in (None, {'NSAllowsArbitraryLoads': False}, {'NSAllowsArbitraryLoads': 1},
+                {'NSAllowsArbitraryLoads': True, 'NSAllowsArbitraryLoadsInWebContent': True}):
+        altered = dict(info); altered['NSAppTransportSecurity'] = ats
+        try:
+            helper.validate_info(altered)
+        except ValueError as error:
+            assert 'ATS' in str(error)
+        else:
+            raise AssertionError('host 打包 ATS 校验必须拒绝未约定配置')
 
     # 线路选择：五个同步方法齐全，begin 同步完成（与安卓现状一致）。
     line = (root / 'PanelLineService.swift').read_text(encoding='utf-8')

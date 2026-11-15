@@ -163,7 +163,32 @@ enum BridgeBudgetTest {
         assert(full.bytes == 48 && full.held.count == 48)
         cases += 1
 
-        assert(cases == 20)
-        print("iOS bridge budget checks passed (20 cases)")
+        // 资源回执仅升 txn 专用预算，含全部二进制与大 URL 元数据，普通请求预算仍保持原值。
+        let resourceLimit = IOSBridgeBudget.maxTransactionResponseBytes
+        let encodedLimit = ((resourceLimit + 2) / 3) * 4
+        let fullResource = String(repeating: "/", count: encodedLimit - 2) + "8="
+        assert(fullResource.utf8.count == encodedLimit)
+        assert(IOSBridgeBudget.transactionBodySize(fullResource, limit: resourceLimit) == resourceLimit)
+        assert(IOSBridgeBudget.transactionBodySize(fullResource, limit: 4 * 1024 * 1024) == nil)
+        for bad in ["A", "AA", "AAA", "A===", "AA=A", "AB==", "AAB=", "!!==", "中=="] {
+            assert(IOSBridgeBudget.transactionBodySize(bad, limit: resourceLimit) == nil, "bad_base64: \(bad)")
+        }
+        for (encoded, bytes) in [("", 0), ("AA==", 1), ("AAA=", 2), ("AAAA", 3)] {
+            assert(IOSBridgeBudget.transactionBodySize(encoded, limit: resourceLimit) == bytes)
+        }
+        let oversized = String(repeating: "A", count: encodedLimit)
+        assert(IOSBridgeBudget.transactionBodySize(oversized, limit: resourceLimit) == nil,
+               "20MiB+1 不能借相同 Base64 长度通过")
+        let result: [String: Any] = ["id": "resource-fixture", "http": 200, "at": 1, "truncated": false,
+                                     "bodyB64": fullResource,
+                                     "location": String(repeating: "\"", count: 4096),
+                                     "finalUrl": "https://mirror.invalid/asset.glb"]
+        let actualReply = try JSONSerialization.data(withJSONObject: result, options: [.withoutEscapingSlashes]).count
+        assert(actualReply <= IOSBridgeBudget.maxTransactionReplyBytes,
+               "完整20MiB含 metadata 回执必须在 txn 专用预算内")
+        cases += 1
+
+        assert(cases == 21)
+        print("iOS bridge budget checks passed (21 cases)")
     }
 }

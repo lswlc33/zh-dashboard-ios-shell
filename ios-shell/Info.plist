@@ -15,6 +15,12 @@
     <key>CFBundleVersion</key><string>70</string>
     <key>MinimumOSVersion</key><string>15.4</string>
     <key>LSRequiresIPhoneOS</key><true/>
+    <!-- 公开素材可能只有 HTTP，URLSession 需 host 级 ATS 放行；此键也弱化 host ATS，
+         不承诺仅影响原生。WebView 业务导航/桥来源仍由 Swift 限定为 HTTPS 或本地快照，
+         不添加 NSAllowsArbitraryLoadsInWebContent，Widget/Broadcast 也不继承此配置。 -->
+    <key>NSAppTransportSecurity</key><dict>
+        <key>NSAllowsArbitraryLoads</key><true/>
+    </dict>
     <key>UIDeviceFamily</key><array><integer>1</integer><integer>2</integer></array>
     <key>UILaunchScreen</key><dict/>
     <key>UISupportedInterfaceOrientations</key><array>

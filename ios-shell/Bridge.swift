@@ -73,6 +73,11 @@ final class IOSBridge {
         }
     }
 
+    private struct ResourceJob {
+        let rpcID: String
+        let operation: IOSResourceRequest
+    }
+
     private struct Session {
         let accountID: String
         let vin: String
@@ -84,6 +89,10 @@ final class IOSBridge {
     // 与欢迎页的账号备份共用同一份内存档：两个实例各持缓存，后写的会整份覆盖先写的。
     private let store = IOSStore.shared
     private let transport = SharedTransport()
+    private var resourceRequests: [String: IOSResourceRequest] = [:] // 已启动任务（可取消）
+    private var resourceJobs: [String: ResourceJob] = [:] // 含排队项，request id -> job
+    private var activeResourceRequests = Set<String>() // 最多四路 URLSession data task
+    private var resourceQueue: [String] = []
     private let worker = DispatchQueue(label: "io.github.lswlc33.dashboard.ios.bridge", qos: .userInitiated)
     private let services: [IOSBridgeService]
     private var routes: [String: IOSBridgeService] = [:]
@@ -140,6 +149,7 @@ final class IOSBridge {
     deinit {
         notificationTokens.forEach { NotificationCenter.default.removeObserver($0) }
         transport.close()
+        resourceRequests.values.forEach { $0.cancel() }
         let abandoned = Array(pending.values)
         let media = mediaReply
         DispatchQueue.main.async {
@@ -358,6 +368,8 @@ final class IOSBridge {
         services.compactMap { $0 as? IOSSystemSurfacesService }.forEach { $0.bridgeClosed() }
         services.forEach { $0.navigationChanged() }
         transport.close()
+        resourceRequests.values.forEach { $0.cancel() }; resourceRequests.removeAll()
+        resourceJobs.removeAll(); resourceQueue.removeAll(); activeResourceRequests.removeAll()
         webView?.configuration.userContentController.removeScriptMessageHandler(forName: IOSBridgePolicy.handlerName,
                                                                                 contentWorld: .page)
         notificationTokens.forEach { NotificationCenter.default.removeObserver($0) }
@@ -503,7 +515,7 @@ final class IOSBridge {
                   let rpc = transactions[id], let target = pending[rpc], target.generation == generation else {
                 reject(reply, "unknown_request_id"); return
             }
-            if let transportID = target.transportID { transport.cancel(id: transportID) }
+            if let transportID = target.transportID { cancelTransaction(transportID) }
             finish(target, IOSBridgePolicy.failure(method: target.method, code: "cancelled", requestID: target.requestID))
             finish(reply, ["ok": true, "id": id])
         case "sync.session": synchronize(reply)
@@ -552,12 +564,17 @@ final class IOSBridge {
                 case let .failure(error): self.reject(reply, (error as? IOSBridgePolicy.Failure)?.code ?? "invalid_transaction")
                 case let .success(request):
                     self.arm(reply, seconds: Double(request.timeoutMs) / 1000 + 2)
+                    if request.resource {
+                        self.beginResource(reply, request: request, transportID: transportID)
+                        return
+                    }
                     self.transport.execute(json: request.json, completion: { [weak self, weak reply] text in
                         guard let self = self else { return }
                         self.worker.async { [weak self, weak reply] in
                             let value: [String: Any]
                             do {
-                                value = try IOSBridgePolicy.transactionResult(text, transportID: transportID, requestID: request.id)
+                                value = try IOSBridgePolicy.transactionResult(text, transportID: transportID, requestID: request.id,
+                                                                              responseLimit: request.responseLimit)
                             } catch {
                                 value = IOSBridgePolicy.failure(method: "txn.request", code: "invalid_transport_result", requestID: request.id)
                             }
@@ -569,6 +586,58 @@ final class IOSBridge {
                     })
                 }
             }
+        }
+    }
+
+    private func beginResource(_ reply: Pending, request: IOSBridgePolicy.Transaction, transportID: String) {
+        let operation = IOSResourceRequest(request: request, transportID: transportID) { [weak self] result in
+            guard let self = self else { return }
+            self.worker.async { [weak self] in
+                let value: [String: Any]
+                do {
+                    value = try IOSBridgePolicy.transactionResult(result, transportID: transportID, requestID: request.id,
+                                                                  responseLimit: request.responseLimit)
+                } catch {
+                    value = IOSBridgePolicy.failure(method: "txn.request", code: "invalid_transport_result", requestID: request.id)
+                }
+                DispatchQueue.main.async { [weak self] in self?.resourceCompleted(transportID, result: value) }
+            }
+        }
+        resourceJobs[transportID] = ResourceJob(rpcID: reply.id, operation: operation)
+        resourceQueue.append(transportID)
+        pumpResources()
+    }
+
+    private func pumpResources() {
+        while activeResourceRequests.count < IOSBridgePolicy.maxConcurrentResources, !resourceQueue.isEmpty {
+            let id = resourceQueue.removeFirst()
+            guard let job = resourceJobs[id], let reply = pending[job.rpcID], isCurrent(reply) else {
+                resourceJobs.removeValue(forKey: id)
+                continue
+            }
+            activeResourceRequests.insert(id)
+            resourceRequests[id] = job.operation
+            job.operation.start()
+        }
+    }
+
+    private func resourceCompleted(_ id: String, result: [String: Any]) {
+        resourceRequests.removeValue(forKey: id)
+        activeResourceRequests.remove(id)
+        let job = resourceJobs.removeValue(forKey: id)
+        if let job = job, let reply = pending[job.rpcID], isCurrent(reply) { finish(reply, result) }
+        pumpResources()
+    }
+
+    private func cancelTransaction(_ id: String) {
+        guard let job = resourceJobs[id] else { transport.cancel(id: id); return }
+        resourceQueue.removeAll { $0 == id }
+        if activeResourceRequests.contains(id) {
+            // 保留活动槽至 URLSession 的实际 cancel completion，避免取消/重启瞬间出现第 5 路。
+            job.operation.cancel()
+        } else {
+            resourceJobs.removeValue(forKey: id)
+            pumpResources()
         }
     }
 
@@ -658,7 +727,7 @@ final class IOSBridge {
     }
 
     private func cancelOperation(_ reply: Pending) {
-        if let id = reply.transportID { transport.cancel(id: id) }
+        if let id = reply.transportID { cancelTransaction(id) }
         reply.cancelling = true
         if let service = reply.service as? IOSBridgeCancellableService {
             service.cancel(method: reply.method, args: reply.args)
@@ -718,7 +787,7 @@ final class IOSBridge {
         }
         services.forEach { $0.applicationBackgrounded() }
         for reply in Array(pending.values) where !reply.backgroundHandoff {
-            if let id = reply.transportID { transport.cancel(id: id) }
+            if let id = reply.transportID { cancelTransaction(id) }
             reject(reply, "application_backgrounded")
         }
         finishMedia(.deny)
