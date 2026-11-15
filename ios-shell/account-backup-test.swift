@@ -7,13 +7,30 @@ import Foundation
 //   3. 预览与恢复计划（新增/无变化/冲突、容量、stale、keep 与 replace 的差别）
 @main
 enum AccountBackupTest {
-    static func main() throws {
+    static func main() {
+        // 顶层兜底：main 不声明 throws，任何漏出的错误都变成一条明确失败，
+        // 而不是 Swift 运行时那种只有栈、没有场景的崩溃输出。
+        do {
+            try run()
+        } catch {
+            preconditionFailure("account backup test threw unexpectedly: \(error)")
+        }
+        print("iOS account backup checks passed (pure logic, synthetic credentials only)")
+    }
+
+    static func run() throws {
         func expect(_ value: Bool, _ message: String) {
             precondition(value, message)
         }
+        // 只接受 AccountBackup.Failure：别的错误类型（比如写错的调用）也算测试失败。
         func rejects(_ message: String, _ action: () throws -> Any) {
-            do { _ = try action(); preconditionFailure("accepted invalid input: \(message)") }
-            catch is AccountBackup.Failure { }
+            do {
+                _ = try action()
+                preconditionFailure("accepted invalid input: \(message)")
+            } catch is AccountBackup.Failure {
+            } catch {
+                preconditionFailure("unexpected error type for \(message): \(error)")
+            }
         }
 
         // ---- 解码：新格式 ----
@@ -200,8 +217,6 @@ enum AccountBackupTest {
         let fullPool = makePool(accounts: (0..<3).map { ("a\($0)", "p\($0)", "pu\($0)") }, active: "a0", rev: 1)
         let full = AccountBackup.snapshot(values: [AccountBackup.poolKey: fullPool], revision: 2, readError: nil)
         rejects("恢复后超过上限") { try AccountBackup.preview(nineteen, snapshot: full) }
-
-        print("iOS account backup checks passed (pure logic, synthetic credentials only)")
     }
 
     /// 拼一份合法的账号池 JSON，省得每处都手写。
@@ -214,9 +229,15 @@ enum AccountBackupTest {
 
     /// 上限用单独一段，避免主流程被一屏的循环撑长。
     static func expectsAccountCount() {
+        // 只接受 AccountBackup.Failure：别的错误类型（比如写错的调用）也算测试失败。
         func rejects(_ message: String, _ action: () throws -> Any) {
-            do { _ = try action(); preconditionFailure("accepted invalid input: \(message)") }
-            catch is AccountBackup.Failure { }
+            do {
+                _ = try action()
+                preconditionFailure("accepted invalid input: \(message)")
+            } catch is AccountBackup.Failure {
+            } catch {
+                preconditionFailure("unexpected error type for \(message): \(error)")
+            }
         }
         var rows: [String] = []
         for i in 0..<21 { rows.append("{\"token\":\"t\(i)\",\"userid\":\"u\(i)\"}") }
