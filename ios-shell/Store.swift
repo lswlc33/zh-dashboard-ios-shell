@@ -7,6 +7,11 @@ import CoreFoundation
 // 整个存档（包括 token、账号和偏好）只在私有目录中加密落盘。
 // 队列先读再写；损坏或 Keychain 不可用时保留原件，绝不拿空库覆盖。
 final class IOSStore {
+    /// 全 App 一份。内存档与解密密钥都挂在实例上：两个实例各持一份缓存，
+    /// 后写的会把先写的整份存档盖掉（账号池与偏好会互相回退）。
+    /// 网页桥与欢迎页的账号备份必须共用这一个。
+    static let shared = IOSStore()
+
     static let maxArchiveBytes = 24 * 1024 * 1024
     static let maxValueBytes = 4 * 1024 * 1024
     private static let maxPlainBytes = 16 * 1024 * 1024
@@ -47,12 +52,22 @@ final class IOSStore {
         }
     }
 
-    func commit(_ object: [String: Any], completion: @escaping ([String: Any], Snapshot) -> Void) {
+    /// 提交一次原子写入。
+    ///
+    /// `expectedRevision` 非空时先比对当前版本：不一致直接以 `"stale"` 失败，一个字节都不写。
+    /// 账号恢复用得上——预览与提交之间只要网页那边又写了偏好/账号池，
+    /// 拿着旧快照算出来的结果就会覆盖掉新数据。网页桥不传（保持原有语义）。
+    func commit(_ object: [String: Any], expectedRevision: Int? = nil,
+                completion: @escaping ([String: Any], Snapshot) -> Void) {
         queue.async { [self] in
             self.loadIfNeeded()
             var result: [String: Any]
             do {
                 if let readError = self.readError { throw Failure.reason(readError) }
+                if let expectedRevision = expectedRevision, expectedRevision != self.revision {
+                    // 与下面的真实错误区分开：调用方要提示用户重新预览，而不是「存储坏了」。
+                    throw Failure.reason("stale")
+                }
                 guard Set(object.keys).isSubset(of: ["puts", "removes"]),
                       let puts = object["puts"] as? [String: String],
                       let removes = object["removes"] as? [String],

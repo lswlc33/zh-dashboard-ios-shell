@@ -638,12 +638,12 @@ final class RecoveryViewController: UIViewController {
     }
 
     @objc private func showBackup() {
+        // 与「版本与更新」同一种呈现：整页 formSheet，而不是 Alert。
+        // 这一页是面板进不去时的最后回退通道，所以它不能依赖 WebView 或网页状态。
         guard presentedViewController == nil, view.window != nil else { return }
-        let alert = UIAlertController(title: IOSStrings.recoveryBackupTitle,
-                                      message: IOSStrings.recoveryBackupUnavailable,
-                                      preferredStyle: .alert)
-        // 纯信息说明用 .cancel：它不是「确认某个动作」，样式上也不该是默认强调。
-        alert.addAction(UIAlertAction(title: IOSStrings.confirm, style: .cancel))
-        present(alert, animated: true)
+        let panel = BackupPanelViewController()
+        let nav = UINavigationController(rootViewController: panel)
+        nav.modalPresentationStyle = .formSheet
+        present(nav, animated: true)
     }
 }

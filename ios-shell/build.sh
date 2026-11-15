@@ -138,6 +138,14 @@ if [[ -f "$script_dir/bridge-budget-test.swift" ]]; then
 else
     printf '%s\n' 'note: bridge-budget-test 已跳过（缺 ios-shell/bridge-budget-test.swift）'
 fi
+# 账号备份是「面板进不去时」的唯一回退通道，逻辑出错会直接丢用户账号；
+# 它只依赖 Foundation，适合在这个位置做纯逻辑回归。
+if [[ -f "$script_dir/account-backup-test.swift" ]]; then
+    xcrun swiftc "$script_dir/AccountBackup.swift" "$script_dir/account-backup-test.swift" -o "$build_dir/account-backup-test"
+    "$build_dir/account-backup-test"
+else
+    printf '%s\n' 'note: account-backup-test 已跳过（缺 ios-shell/account-backup-test.swift）'
+fi
 
 gradle_args=(--project-dir "$shared_dir" --no-daemon --console=plain)
 if [[ "$offline" == true ]]; then gradle_args+=(--offline); fi

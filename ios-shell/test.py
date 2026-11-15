@@ -424,6 +424,13 @@ def main():
     # 「版本与更新」打开独立面板，不再是 Alert。
     assert 'UpdatePanelViewController()' in recovery
     assert 'UIAlertController' not in recovery.split('showVersion', 1)[1].split('private func showBackup', 1)[0]
+    # 「备份与迁移」同样是独立整页：面板进不去时它是最后的回退通道，
+    # 不能退回那个「将随后续版本提供」的 Alert，也不能依赖 WebView。
+    assert 'BackupPanelViewController()' in recovery.split('private func showBackup', 1)[1], \
+        '备份入口必须打开 BackupPanelViewController 整页'
+    backup_entry = recovery.split('private func showBackup', 1)[1]
+    assert 'UIAlertController' not in backup_entry, '备份入口不能再是 Alert 占位'
+    assert 'recoveryBackupUnavailable' not in recovery, '占位文案已删除，不能再被引用'
     # 更新面板要能看到版本、资源、线路、操作四段。
     # 文案不再内联：改为断言「那四段标题引用了 IOSStrings 的对应常量」。
     # 原来那组断言钉的是中文字面量本身，等于把内联文案固定下来，
@@ -616,14 +623,51 @@ def main():
     assert 'beginBootWatch' in controller
     assert 'didFinish: ' in controller and 'didFailProvisionalNavigation: ' in controller
 
+    # 备份与恢复：纯逻辑层必须与 UI 分离（UI 才碰 UIKit / IOSStore），
+    # 这样单测能在 mac 上只编 AccountBackup.swift 就跑完，不必拉整包。
+    backup_logic = (root / 'AccountBackup.swift').read_text(encoding='utf-8')
+    assert 'import UIKit' not in backup_logic, '逻辑层不能依赖 UIKit，否则单测编不起来'
+    assert 'IOSStore' not in strip_comments(backup_logic), '逻辑层不做读写，落盘交给调用方'
+    # 三端协议键名必须与安卓/网页一致，改一个就会让另一端的备份恢复不了。
+    for key in ('"zeeho.accounts.v1"', '"zeeho.token"', '"zeeho.session.cleared.v1"'):
+        assert key in backup_logic, f'账号池键名必须与安卓/网页一致: {key}'
+    backup_panel = (root / 'BackupPanelViewController.swift').read_text(encoding='utf-8')
+    # 恢复必须走「解码 -> 预览 -> 明确确认 -> 条件提交」四步，不能一点就写。
+    for step in ('AccountBackup.decode(', 'AccountBackup.preview(', 'AccountBackup.plan(',
+                 'expectedRevision:'):
+        assert step in backup_panel, step
+    # 冲突必须让用户明确选保留还是替换（两个按钮都在），不能替用户决定。
+    assert 'backupKeepExisting' in backup_panel and 'backupReplaceExisting' in backup_panel
+    # 剪贴板只写 localOnly：凭据不能经通用剪贴板同步到用户的其他设备。
+    assert '.localOnly: true' in backup_panel
+    # 复制/显示凭据都要给「请勿分享」的提示，不能静默把 token 塞进剪贴板。
+    assert 'backupCopiedToken' in backup_panel and 'backupCopiedCount' in backup_panel
+    # 整页不能创建 WebView（与欢迎页同一条约束）。
+    assert 'WKWebView(' not in backup_panel and 'evaluateJavaScript' not in backup_panel
+    # 所有可见文案走 IOSStrings。
+    for constant in ('recoveryBackupTitle', 'backupHint', 'backupRestoreTitle',
+                     'backupManualTitle', 'backupRestoreDetails'):
+        assert 'IOSStrings.' + constant in backup_panel, constant
+    assert 'iOS 版的账号备份' not in (root / 'IOSStrings.swift').read_text(encoding='utf-8'), \
+        '占位文案必须删除，避免有人再引回「随后续版本提供」'
+    # 共享存档：桥和备份页必须用同一个 IOSStore 实例，否则两份内存档会互相整份覆盖。
+    assert 'static let shared = IOSStore()' in (root / 'Store.swift').read_text(encoding='utf-8')
+    assert 'private let store = IOSStore.shared' in (root / 'Bridge.swift').read_text(encoding='utf-8'), \
+        'Bridge 必须改用共享存档实例'
+    assert 'private let store = IOSStore.shared' in backup_panel
+
     # 全部 Swift 源文件都要进构建清单，新增文件漏了会静默不编译。
     # build.sh 从 build-support.py 的 inventory 读文件表，所以检查 inventory 而不是 shell 脚本。
     # inventory 里的路径带 `ios-shell/` 前缀（相对仓库根）。
     listed = set(inputs['swiftSources'])
     for name in ('RecoveryView.swift', 'PanelCache.swift', 'PanelCachePolicy.swift', 'PanelSchemeHandler.swift',
                  'PanelLine.swift', 'PanelLineService.swift', 'Dashboard.swift', 'BridgeBudget.swift',
-                 'Diagnostics.swift', 'DiagnosticsViewController.swift', 'UpdatePanelViewController.swift'):
+                 'Diagnostics.swift', 'DiagnosticsViewController.swift', 'UpdatePanelViewController.swift',
+                 'AccountBackup.swift', 'BackupPanelViewController.swift'):
         assert f'ios-shell/{name}' in listed, name
+    # 纯逻辑单测也要接进 build.sh，否则等于没跑。
+    assert 'account-backup-test.swift' in (root / 'build.sh').read_text(encoding='utf-8'), \
+        'AccountBackup 的单测必须接进 build.sh'
     # 首屏骨架已由欢迎页取代，不能留孤儿文件。
     assert not (root / 'PanelLoadingView.swift').exists()
 

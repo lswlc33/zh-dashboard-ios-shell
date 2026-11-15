@@ -81,7 +81,8 @@ final class IOSBridge {
     }
 
     private weak var webView: WKWebView?
-    private let store = IOSStore()
+    // 与欢迎页的账号备份共用同一份内存档：两个实例各持缓存，后写的会整份覆盖先写的。
+    private let store = IOSStore.shared
     private let transport = SharedTransport()
     private let worker = DispatchQueue(label: "io.github.lswlc33.dashboard.ios.bridge", qos: .userInitiated)
     private let services: [IOSBridgeService]
