@@ -760,17 +760,46 @@ struct ZeehoVehicleWidget: Widget {
     }
 }
 
-/// iOS 17+ 用支持原生编辑的版本（长按小组件 →「编辑小组件」）。
+/// 原车辆小组件：**必须保持 StaticConfiguration**。
+///
+/// ## 为什么不能把它换成 AppIntentConfiguration（1.1.19 的真实事故）
+///
+/// WidgetKit 把已放置实例的配置**按 intent 类型名**存档。1.1.19 把同一 kind
+/// (`ZeehoVehicleWidget`) 从 `StaticConfiguration` 换成了 `AppIntentConfiguration`，
+/// 存量实例持有的旧配置类型不存在了 → WidgetKit **再也不会为它产出 timeline**
+/// → 桌面上永远停在占位骨架屏，用户只能删掉重加。
+/// （Stack Overflow #64075386、callstackincubator/voltra#272、tmeng53/wildcard#822
+///  三份独立实测；Apple 没有文档化这条行为。）
+///
+/// 结论：**kind 一旦对外发布，它的配置类型就不能改**。要加原生编辑只能开新 kind。
+struct ZeehoVehicleWidget: Widget {
+    let kind = ZeehoWidgetKind.vehicle
+
+    var body: some WidgetConfiguration {
+        StaticConfiguration(kind: kind, provider: ZeehoVehicleProvider()) { entry in
+            ZeehoVehicleWidgetView(entry: entry)
+        }
+        .configurationDisplayName(WidgetStrings.displayName)
+        .description(WidgetStrings.description)
+        .supportedFamilies([.systemSmall, .systemMedium, .systemLarge])
+    }
+}
+
+/// iOS 17+ 支持原生编辑的版本（长按 →「编辑小组件」），**使用独立 kind**。
+///
+/// 必须是新 kind，不能复用 `ZeehoVehicleWidget`：理由见上面 `ZeehoVehicleWidget` 的注释
+/// —— 复用会让 1.1.18 及更早的用户实例全部失效。代价是老实例不会自动获得编辑能力，
+/// 需要用户在桌面重新添加这一个小组件（图库里会看到两个条目）。
 @available(iOS 17.0, *)
 struct ZeehoConfigurableVehicleWidget: Widget {
-    let kind = ZeehoWidgetKind.vehicle
+    let kind = ZeehoWidgetKind.configurable
 
     var body: some WidgetConfiguration {
         AppIntentConfiguration(kind: kind, intent: ZeehoVehicleWidgetConfiguration.self,
                                provider: ZeehoVehicleConfigProvider()) { entry in
             ZeehoVehicleWidgetView(entry: entry)
         }
-        .configurationDisplayName(WidgetStrings.displayName)
+        .configurationDisplayName(WidgetStrings.configurableDisplayName)
         .description(WidgetStrings.configurableDescription)
         .supportedFamilies([.systemSmall, .systemMedium, .systemLarge])
     }
@@ -780,8 +809,10 @@ struct ZeehoConfigurableVehicleWidget: Widget {
 // `Widget` 与 `WidgetBundle` 的 body 都**没有** result builder，苹果也没有提供
 // `WidgetConfigurationBuilder`（SDK 里查无此类型）。带 else 的 if #available 会直接
 // 编译失败（"closure containing control flow statement cannot be used with result builder"）。
-// 唯一可行的写法是把分派提到 builder 之上：用 `static func main()` 选一条 bundle，
-// 两个 bundle 用**同一个 kind**，且同一时刻只有一个被注册（kind 必须唯一）。
+// 所以用 `static func main()` 把分派提到 builder 之上。`WidgetBundle.main()` 是
+// WidgetKit 里真实存在的 `@MainActor public static func main()`，可以这样调用
+// （Chromium / Home Assistant 都这么做，见「小组件自取数」的记忆条目）。
+// iOS 17+ 的 bundle 同时注册两个 kind：原 kind 保持静态配置，新 kind 提供编辑。
 @main
 struct ZeehoWidgets {
     static func main() {
@@ -793,10 +824,11 @@ struct ZeehoWidgets {
     }
 }
 
-/// iOS 17+：可编辑的车辆小组件 + Live Activity。
+/// iOS 17+：原静态小组件（保证老实例继续工作）+ 新的可编辑小组件 + Live Activity。
 @available(iOS 17.0, *)
 struct ZeehoModernWidgets: WidgetBundle {
     var body: some Widget {
+        ZeehoVehicleWidget()
         ZeehoConfigurableVehicleWidget()
         if #available(iOS 16.1, *) {
             ZeehoLiveActivityWidget()

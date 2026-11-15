@@ -197,22 +197,36 @@ def main():
                   '--scan-executable "$broadcast_dir/ZeehoCastBroadcast"',
                   '--scan-folder "$broadcast_dir/Frameworks"', 'Entitlements/Broadcast.entitlements'):
         assert token in build_sh, token
-    # Widget 用 AppIntentConfiguration（iOS 17+ 原生编辑）+ StaticConfiguration（低系统兜底），
-    # 车控/刷新按钮走 AppIntent。
+    # Widget 用两套 kind：原 kind 保持 StaticConfiguration（已发布契约，不能动），
+    # iOS 17+ 另开新 kind 用 AppIntentConfiguration 提供原生编辑。
     # 交互按钮与编辑面板都需要 AppIntents metadata 索引：缺了它点按钮会静默无效、
     # 编辑面板会是空的（真机日志 linkd Missing: <bundle>:<Type>），所以构建脚本必须
     # 导出 const-values、跑 appintentsmetadataprocessor、并在签名之前生成索引。
     widget_bundle = (root / 'Widgets/ZeehoWidgets.swift').read_text(encoding='utf-8')
-    assert 'ZeehoVehicleWidget()' in widget_bundle, 'Widget bundle 必须仍注册 StaticConfiguration 控件'
+    assert 'ZeehoVehicleWidget()' in widget_bundle, '原静态控件必须仍被注册'
+    # **回归防线（1.1.19 事故）**：WidgetKit 按 kind + 配置类型名归档已放置实例，
+    # 把已发布的 kind 从 StaticConfiguration 换成 AppIntentConfiguration 会让存量实例
+    # 永远停在占位骨架屏（用户实测「只显示骨架屏」）。所以原 kind 必须仍是 StaticConfiguration。
+    static_widget = widget_bundle.split('struct ZeehoVehicleWidget: Widget')[1].split('\nstruct ')[0]
+    assert 'StaticConfiguration(' in static_widget and 'AppIntentConfiguration(' not in static_widget, \
+        '已发布的 ZeehoVehicleWidget 必须保持 StaticConfiguration（换配置类型会让存量实例变骨架屏）'
+    config_widget = widget_bundle.split('struct ZeehoConfigurableVehicleWidget: Widget')[1].split('\nstruct ')[0]
+    assert 'AppIntentConfiguration(' in config_widget, '可编辑控件必须用 AppIntentConfiguration'
+    assert 'ZeehoWidgetKind.configurable' in config_widget, \
+        '可编辑控件必须用独立 kind（复用原 kind 会让老实例失效）'
     # Widget.body / WidgetBundle.body 都没有 result builder，不能写 if #available；
-    # 必须用 static main() 在两条 bundle 之间分派，且两边 kind 必须相同。
+    # 必须用 static main() 在两条 bundle 之间分派。
     assert 'static func main()' in widget_bundle, '可编辑/静态两套控件必须用 static main() 分派'
     assert 'ZeehoModernWidgets.main()' in widget_bundle and 'ZeehoLegacyWidgets.main()' in widget_bundle, \
         'static main() 必须按 iOS 17 可用性分派两条 WidgetBundle'
     widget_config = (root / 'Widgets/WidgetConfiguration.swift').read_text(encoding='utf-8')
-    assert 'AppIntentConfiguration(' in widget_bundle, 'iOS 17+ 原生编辑必须用 AppIntentConfiguration'
     assert 'WidgetConfigurationIntent' in widget_config, '编辑面板必须声明 WidgetConfigurationIntent'
-    assert 'ZeehoWidgetKind.vehicle' in widget_bundle, '两套控件必须共用同一个 kind（WidgetCenter 按它重载）'
+    # 两个 kind 的字符串必须与宿主侧 SystemSurfaces 完全一致（各写一份常量）。
+    surfaces_src = (root / 'SystemSurfaces.swift').read_text(encoding='utf-8')
+    widget_commands = (root / 'Widgets/WidgetCommands.swift').read_text(encoding='utf-8')
+    for literal in ('"ZeehoVehicleWidget"', '"ZeehoVehicleWidgetConfigurable"'):
+        assert literal in widget_commands, '扩展侧缺少 kind 常量: ' + literal
+        assert literal in surfaces_src, '宿主侧缺少同值 kind 常量: ' + literal
     # 小组件自己拉接口的签名算法必须是 sign.js 的同一套（md5(sha1(query+param+secret))）。
     # Host 侧（BackgroundSigning）与 Shared 侧（WidgetVehicleClient）各有一份实现
     # —— 模块边界决定不能共享 —— 所以这里钉死两边都还在用同一串。

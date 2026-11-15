@@ -15,10 +15,22 @@ import ZeehoSystemShared
 //   3) 再签名（保证索引进签名封条）
 // 见 build.sh 的 appintents-metadata 段与 test.py 的对应断言。
 
-/// 小组件唯一 kind。`WidgetCenter.reloadTimelines(ofKind:)` 与宿主侧的
-/// `IOSSystemSurfacesService.widgetKind` 都靠这个字符串对上，改一处必须改两处。
+/// 小组件 kind。
+///
+/// **`vehicle` 是已发布的对外契约，永久不能再改它的配置类型，也不能改这个字符串**：
+/// WidgetKit 按 kind + 配置类型名归档已放置实例，改任一项都会让存量实例永远停在
+/// 占位骨架屏（1.1.19 的真实事故，见 `ZeehoVehicleWidget` 的注释）。
+/// 新增能力（原生编辑）只能开新 kind：`configurable`。
+///
+/// 宿主侧 `IOSSystemSurfacesService.widgetKind` 也靠这些字符串对上，改一处必须改两处。
 enum ZeehoWidgetKind {
+    /// 原静态小组件（1.1.0 起对外发布，必须保持 StaticConfiguration）。
     static let vehicle = "ZeehoVehicleWidget"
+    /// iOS 17+ 可编辑小组件（AppIntentConfiguration）。
+    static let configurable = "ZeehoVehicleWidgetConfigurable"
+
+    /// 需要 `WidgetCenter.reloadTimelines` 的全部 kind。
+    static var all: [String] { [vehicle, configurable] }
 }
 
 /// 车控动作（与 Android CAR_CMDS 的四个按钮一一对应）。
@@ -73,7 +85,10 @@ struct ZeehoWidgetCommandIntent: AppIntent {
         let owner = try? SystemSnapshotStore.currentOwner()
         _ = ZeehoWidgetCommandMailbox.post(command.rawValue, owner: owner)
         // 立刻请求刷新，让界面尽快反映「已受理」（不代表车已执行）。
-        WidgetCenter.shared.reloadTimelines(ofKind: ZeehoWidgetKind.vehicle)
+        // 两个 kind 都要刷：用户可能装的是静态那个，也可能是可编辑那个。
+        for kind in ZeehoWidgetKind.all {
+            WidgetCenter.shared.reloadTimelines(ofKind: kind)
+        }
         return .result()
     }
 }
@@ -96,7 +111,9 @@ struct ZeehoWidgetRefreshIntent: AppIntent {
         // 必须在 perform 返回之前 await 完：返回后系统就会重建时间线，
         // 没写完缓存等于这次刷新白点。
         _ = await WidgetDataSource.load(at: Date(), force: true)
-        WidgetCenter.shared.reloadTimelines(ofKind: ZeehoWidgetKind.vehicle)
+        for kind in ZeehoWidgetKind.all {
+            WidgetCenter.shared.reloadTimelines(ofKind: kind)
+        }
         return .result()
     }
 }
