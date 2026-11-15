@@ -152,6 +152,7 @@ final class IOSUpdateCenter {
         // 什么时候算生效由 status(currentBuild:) 按网页自报的构建判定。
         panelStates[line] = ["state": "ready", "pending": build, "line": line.rawValue]
     }
+}
 
 @MainActor
 enum IOSUpdatePresentation {
