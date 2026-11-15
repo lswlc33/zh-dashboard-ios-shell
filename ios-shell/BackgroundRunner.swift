@@ -36,9 +36,11 @@ enum IOSBackgroundRunner {
         // 用户看到「未导入后台凭据」却其实授权过（旧 schema / 只导入一个域 /
         // 重签后钥匙串拒绝访问），会反复授权、反复失败。
         let signInOutcome = IOSBackgroundCredentialStore.outcome()
+        // `credential` 只在 guard 成功后才存在，else 分支不能引用它（CI 实测
+        // "cannot find 'credential' in scope"）：改用 outcome 自己的字段判「真的没授权」。
         guard let credential = signInOutcome.credential, credential.canSignIn else {
             let issue = IOSBackgroundCredentialIssue.from(signInOutcome)
-                ?? (credential == nil ? .neverGranted : .partial)
+                ?? (signInOutcome.credential == nil ? .neverGranted : .partial)
             IOSBackgroundLog.write("跳过签到：凭据不可用 \(issue.rawValue) \(signInOutcome)")
             IOSBackgroundScheduler.record({ report in
                 report.lastRunAt = nowMs()
@@ -104,7 +106,7 @@ enum IOSBackgroundRunner {
         let sampleOutcome = IOSBackgroundCredentialStore.outcome()
         guard let credential = sampleOutcome.credential, credential.canSampleVehicle else {
             let issue = IOSBackgroundCredentialIssue.from(sampleOutcome)
-                ?? (credential == nil ? .neverGranted : .partial)
+                ?? (sampleOutcome.credential == nil ? .neverGranted : .partial)
             IOSBackgroundLog.write("跳过采样：凭据不可用 \(issue.rawValue) \(sampleOutcome)")
             IOSBackgroundScheduler.record({ report in
                 report.lastRunAt = nowMs()
