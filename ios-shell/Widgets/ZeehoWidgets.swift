@@ -745,21 +745,6 @@ struct ZeehoVehicleWidgetView: View {
 
 // MARK: - 小组件定义
 
-/// 老系统（iOS 15.4~16.x）用的静态配置版：没有编辑面板，数据来源仍是
-/// 「自己拉 → 缓存 → 宿主快照」（`WidgetDataSource`），只是不能按实例改显示项。
-struct ZeehoVehicleWidget: Widget {
-    let kind = ZeehoWidgetKind.vehicle
-
-    var body: some WidgetConfiguration {
-        StaticConfiguration(kind: kind, provider: ZeehoVehicleProvider()) { entry in
-            ZeehoVehicleWidgetView(entry: entry)
-        }
-        .configurationDisplayName(WidgetStrings.displayName)
-        .description(WidgetStrings.description)
-        .supportedFamilies([.systemSmall, .systemMedium, .systemLarge])
-    }
-}
-
 /// 原车辆小组件：**必须保持 StaticConfiguration**。
 ///
 /// ## 为什么不能把它换成 AppIntentConfiguration（1.1.19 的真实事故）
