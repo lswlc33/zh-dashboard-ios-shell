@@ -46,10 +46,14 @@ public enum WidgetDataSource {
         // 「主页当前车辆」。两者不一致（换了账号/换了车、宿主还没重写凭据）时
         // 绝不能用旧凭据继续拉——那正是报告点名的「残留 vehicleID 显示别的车」。
         let activeOwner = (try? SystemSnapshotStore.currentOwner())?.ownerIdentifierString
-        let credential = WidgetCredentialStore.read(at: date).flatMap { value in
-            guard let activeOwner = activeOwner, value.ownerID == activeOwner else { return nil }
-            return value
-        }
+        // 不用 `flatMap`：闭包里 `return nil` 与返回 `WidgetCredential` 混在一起时
+        // 泛型参数推不出来（CI 实测 "generic parameter 'U' could not be inferred"）。
+        let stored = WidgetCredentialStore.read(at: date)
+        let credential: WidgetCredential? = {
+            guard let stored = stored, let activeOwner = activeOwner,
+                  stored.ownerID == activeOwner else { return nil }
+            return stored
+        }()
         var liveReason = "no_credential"
         if let credential = credential {
             if !force, let cached = WidgetFetchCache.read(ownerID: credential.ownerID, at: date,
