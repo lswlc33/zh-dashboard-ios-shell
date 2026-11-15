@@ -579,41 +579,51 @@ struct ZeehoVehicleWidgetView: View {
             .frame(height: 18)
             .padding(.top, 2)
 
-            // hero：电量 40% + 车模 60%
-            HStack(spacing: 0) {
-                VStack(alignment: .leading, spacing: 0) {
-                    Spacer(minLength: 0)
-                    HStack(alignment: .firstTextBaseline, spacing: 0) {
-                        Text(WidgetStatusText.soc(v, date: now))
-                            .font(.system(size: WidgetFont.lSoc, weight: .medium))
-                            .foregroundColor(colors.text)
-                            .lineLimit(1)
-                            .minimumScaleFactor(0.6)
-                        Text("%")
-                            .font(.system(size: WidgetFont.lUnit))
-                            .foregroundColor(colors.muted)
-                            .padding(.leading, 2)
-                            .padding(.bottom, 5)
+            // hero：电量左栏（固定占比）+ 车模（占剩余）
+            //
+            // **不能用两个 `.frame(maxWidth: .infinity)` + layoutPriority 抢宽度**：
+            // 车模是横向长图（宽 ≫ 高），`scaledToFit` 在给定高度下会尽量舒展宽度，
+            // 一旦它的布局优先级更高，就会把电量栏挤成一条几 pt 的竖线
+            // （1.1.21 真机实测：4×4 只剩一个「╎」和「?」，电量完全看不见）。
+            // 所以这里给电量栏一个基于宽度的固定占比，车模只吃剩下的空间。
+            GeometryReader { proxy in
+                HStack(spacing: 0) {
+                    VStack(alignment: .leading, spacing: 0) {
+                        Spacer(minLength: 0)
+                        HStack(alignment: .firstTextBaseline, spacing: 0) {
+                            Text(WidgetStatusText.soc(v, date: now))
+                                .font(.system(size: WidgetFont.lSoc, weight: .medium))
+                                .foregroundColor(colors.text)
+                                .lineLimit(1)
+                                .minimumScaleFactor(0.6)
+                            Text("%")
+                                .font(.system(size: WidgetFont.lUnit))
+                                .foregroundColor(colors.muted)
+                                .padding(.leading, 2)
+                                .padding(.bottom, 5)
+                        }
+                        chargeLine(fontSize: WidgetFont.lCharge)
+                            .padding(.top, 2)
+                        SOCProgress(percent: v?.visibleSOCPercent(at: now), height: WidgetMetrics.progressHeightLarge, colors: colors)
+                            .padding(.top, 4)
+                        // 4×4 电压独立一行
+                        if let tail = WidgetStatusText.voltageTail(v, date: now) {
+                            Text(tail)
+                                .font(.system(size: WidgetFont.lVoltage))
+                                .foregroundColor(colors.muted)
+                                .lineLimit(1)
+                                .padding(.top, 3)
+                        }
+                        Spacer(minLength: 0)
                     }
-                    chargeLine(fontSize: WidgetFont.lCharge)
-                        .padding(.top, 2)
-                    SOCProgress(percent: v?.visibleSOCPercent(at: now), height: WidgetMetrics.progressHeightLarge, colors: colors)
-                        .padding(.top, 4)
-                    // 4×4 电压独立一行
-                    if let tail = WidgetStatusText.voltageTail(v, date: now) {
-                        Text(tail)
-                            .font(.system(size: WidgetFont.lVoltage))
-                            .foregroundColor(colors.muted)
-                            .lineLimit(1)
-                            .padding(.top, 3)
-                    }
-                    Spacer(minLength: 0)
-                }
-                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .leading)
-                .layoutPriority(40)
+                    // 电量栏至少 92pt（能放下 40sp 的两位数 + 单位），
+                    // 且不超过整宽的 44% —— 车模再长也不能把它挤没。
+                    .frame(width: min(max(92, proxy.size.width * 0.40), proxy.size.width * 0.44),
+                           alignment: .leading)
 
-                vehicleArt(ownerID: presentation.ownerID, leading: 8)
-                    .layoutPriority(60)
+                    vehicleArt(ownerID: presentation.ownerID, leading: 8)
+                        .frame(maxWidth: .infinity, maxHeight: .infinity)
+                }
             }
             .frame(minHeight: 88, maxHeight: .infinity)
             .padding(.top, 2)

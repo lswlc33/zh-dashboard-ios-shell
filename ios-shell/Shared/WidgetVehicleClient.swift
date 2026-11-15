@@ -144,7 +144,9 @@ public enum WidgetVehicleClient {
         async let tireTask = getJSON(session: session, path: "/v1.0/app/cfmotoserverapp/app/vehicle/tire/monitoring",
                                      query: [("sensorType", tireSensorType(home)), ("vinNo", credential.vin)],
                                      credential: credential)
-        let (batteryResult, rideResult, tireResult) = await (batteryTask, rideTask, tireTask)
+        // 积分与未读要先用 token-only 的 myLikeInfo 拿内部 uid，拿不到就整组跳过。
+        async let accountTask = fetchAccountStats(session: session, credential: credential)
+        let (batteryResult, rideResult, tireResult, account) = await (batteryTask, rideTask, tireTask, accountTask)
         let statsAt = nowMs()
 
         let battery = value(batteryResult).flatMap { $0["data"] as? [String: Any] }
@@ -215,6 +217,12 @@ public enum WidgetVehicleClient {
                 }
             }
         }
+        // ---- 账号统计（积分 / 未读）----
+        // 只有 uid 拿到才可能成功；拿不到就是整组缺测（展示层显示「—」，不猜 0）。
+        if let account = account {
+            out.integral = nonNegative(account.integral)
+            out.unread = account.unread
+        }
         // 统计时间只在真的拿到至少一个统计字段时才写；否则保持 nil（缺测合法）。
         out.statsUpdatedAt = hasAnyStatistic(out) ? statsAt : nil
         return .success(out)
@@ -222,11 +230,64 @@ public enum WidgetVehicleClient {
 
     // MARK: - 内部
 
+    /// 账号级统计：先用 token-only 的 myLikeInfo 探测内部 uid，再并发取积分与未读。
+    ///
+    /// 为什么必须探测 uid：这两个接口都要求 `userId`，而 token 里没有它
+    /// （网页侧同样走 `myLikeInfo → data.ps0004_01_004_VO.id`，见 endpoints.js）。
+    /// 任何一步失败都返回 nil —— 小组件宁可少两格数据，也不能拿错的 uid 去查别人的账号。
+    private static func fetchAccountStats(session: URLSession,
+                                          credential: WidgetCredential) async -> (integral: Double?, unread: Int?)? {
+        // 备用顺序与网页一致：myLikeInfo → myfavoriteInfo → myActivityInfo。
+        let probes = ["/v1.0/mine/cfmotoservermine/mine/myLikeInfo",
+                      "/v1.0/mine/cfmotoservermine/mine/myfavoriteInfo",
+                      "/v1.0/mine/cfmotoservermine/mine/myActivityInfo"]
+        var uid: String?
+        for path in probes {
+            guard case .success(let object) = await getJSON(session: session, path: path, query: [],
+                                                            credential: credential),
+                  let data = object["data"] as? [String: Any] else { continue }
+            uid = accountID(in: data)
+            if uid != nil { break }
+        }
+        guard let uid = uid else { return nil }
+
+        async let integralTask = getJSON(session: session,
+                                         path: "/v1.0/mine/cfmotoservermine/integral/totalIntegral",
+                                         query: [("userId", uid)], credential: credential)
+        async let messageTask = getJSON(session: session,
+                                        path: "/v1.0/mine/cfmotoservermine/app/Message/list_v2",
+                                        query: [("messageKind", "3"), ("page", "1"), ("pageSize", "1"),
+                                                ("userId", uid)], credential: credential)
+        let (integralResult, messageResult) = await (integralTask, messageTask)
+        let integral = value(integralResult).flatMap { $0["data"] as? [String: Any] }
+        let messages = value(messageResult).flatMap { $0["data"] as? [String: Any] }
+        // 未读取的是**总数** `noRead`，不是列表项里的 `unread`（那个是「1=已读」的反义字段）。
+        let unread = messages.flatMap { number($0["noRead"]) }.map { Int($0) }.flatMap { $0 >= 0 ? $0 : nil }
+        let total = integral.flatMap { number($0["integralTotal"]) }
+        if total == nil && unread == nil { return nil }
+        return (total, unread)
+    }
+
+    /// 从 myLikeInfo 系响应里取内部 uid（网页用 `ps0004_01_004_VO.id`）。
+    private static func accountID(in data: [String: Any]) -> String? {
+        func id(_ value: Any?) -> String? {
+            if let object = value as? [String: Any] {
+                if let text = text(object["id"]), !text.isEmpty { return text }
+            }
+            if let text = value as? String, !text.isEmpty { return text }
+            return nil
+        }
+        if let vo = data["ps0004_01_004_VO"] as? [String: Any], let found = id(vo) { return found }
+        // 备用：直接在 data 上找 id / userId。
+        return id(data["id"]) ?? id(data["userId"])
+    }
+
     private static func hasAnyStatistic(_ value: WidgetFetchedVehicle) -> Bool {
         value.voltage != nil || value.current != nil || value.power != nil
             || value.lockState != nil || value.seatState != nil || value.online != nil
             || value.todayMileKm != nil || value.lastMileKm != nil || value.lastRideMinutes != nil
             || value.totalMileKm != nil || value.rangeKm != nil
+            || value.integral != nil || value.unread != nil
             || value.tireFrontBar != nil || value.tireRearBar != nil
             || value.tireFrontTemp != nil || value.tireRearTemp != nil
     }

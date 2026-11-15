@@ -1564,6 +1564,27 @@ final class IOSSystemSurfacesService: NSObject, IOSBridgeService, IOSBridgeCance
                             switch options["key"] as? String {
                             case "showName": settings.showName = options["value"] as? Bool ?? settings.showName
                             case "showTime": settings.showTime = options["value"] as? Bool ?? settings.showTime
+                            case "dark", "darkMode":
+                                // -1 跟随系统 / 0 浅色 / 1 深色，与 Android widget_dark 同语义。
+                                // 之前这里直接落到 default 抛 system_widget_style_managed，
+                                // 于是 App 内的「深浅色」对小组件完全无效（用户只能去系统编辑面板改）。
+                                guard let raw = try? IOSBridgePolicy.integer(options["value"]),
+                                      [-1, 0, 1].contains(raw) else {
+                                    throw SystemSnapshotError("invalid_widget_setting")
+                                }
+                                settings.darkMode = raw
+                            case "stats":
+                                // 统计槽位：接受 WidgetStatField 的稳定 id 数组（≤6，去重）。
+                                // 空数组 = 用该档默认顺序（与 SystemWidgetSettings 的语义一致）。
+                                guard let list = options["value"] as? [Any] else {
+                                    throw SystemSnapshotError("invalid_widget_setting")
+                                }
+                                let fields = list.compactMap { $0 as? String }.compactMap(WidgetStatField.init(rawValue:))
+                                guard fields.count == list.count, fields.count <= 6,
+                                      Set(fields).count == fields.count else {
+                                    throw SystemSnapshotError("invalid_widget_setting")
+                                }
+                                settings.stats = fields
                             case "vin", "vehicleID":
                                 // iOS 小组件只显示主页当前车辆，不支持按实例指定别的车。
                                 // 传空串等于「跟随当前车辆」，等价于清掉旧选择；传具体车则明确拒绝，
@@ -1598,8 +1619,14 @@ final class IOSSystemSurfacesService: NSObject, IOSBridgeService, IOSBridgeCance
                             "vin": "",
                             "effectiveVehicleID": expected.accountVINHash + "." + expected.scopeID,
                             "name": snapshot?.vehicle?.name ?? "", "vehicleName": snapshot?.vehicle?.name ?? "",
-                            "showName": settings.showName, "showTime": settings.showTime, "dark": -1, "timeMode": 0, "tap": 0,
-                            "statFields": [], "statSlots": 0, "stats": [], "statsDefault": true,
+                            "showName": settings.showName, "showTime": settings.showTime,
+                            // dark / stats 必须回真实值：以前写死 -1 与空数组，网页设置页
+                            // 永远显示「跟随系统」和空槽位，用户改完也看不出生效没有。
+                            "dark": settings.darkMode, "timeMode": 0, "tap": 0,
+                            "statFields": settings.stats.map { $0.rawValue }, "statSlots": 6,
+                            "stats": settings.stats.map { $0.rawValue },
+                            // statsDefault=true 表示「用该档默认顺序」，与空数组等价。
+                            "statsDefault": settings.stats.isEmpty,
                             "provider": Self.widgetKind, "configuration": "system_widget_editor", "instanceIDsSupported": false,
                             "vehicles": vehicles,
                             "followsCurrentVehicle": true,
