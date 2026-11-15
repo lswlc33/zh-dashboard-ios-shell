@@ -215,8 +215,7 @@ enum AccountBackupTest {
                                                 now: 1, newAccountID: ids("a_c"))
         expect(closedPlan.puts[AccountBackup.clearedKey] == "1", "legacyClosed 的文档要保留 cleared 标记")
         let closedPool = try AccountBackup.parsePool(closedPlan.puts[AccountBackup.poolKey] ?? "")
-        expect(closedPool.object["legacyClosed"] as? Bool == true, "legacyClosed 字段本身不能丢")
-
+        expect(AccountBackup.isTrue(closedPool.object["legacyClosed"]), "legacyClosed 字段本身不能丢")
         // 上限：恢复后超过 20 个直接拒
         var nineteen: [AccountBackup.Entry] = []
         for i in 0..<18 { nineteen.append(AccountBackup.Entry(token: "ntok\(i)", userid: "nuid\(i)")) }

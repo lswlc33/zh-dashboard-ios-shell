@@ -409,7 +409,11 @@ enum AccountBackup {
         var puts = [poolKey: text, tokenKey: try checkedToken(token)]
         // legacyClosed 的意思是「用户明确删过账号，别再拿旧源自动迁移」；恢复不能把它抹掉，
         // 但也不需要新写：保持原值即可（安卓在文档里带 true 时补写 cleared）。
-        if document["legacyClosed"] as? Bool == true { puts[clearedKey] = "1" }
+        //
+        // 判据要同时认 Bool 和 NSNumber：JSONSerialization 解析出来的是 NSNumber，
+        // 而 `as? Bool` 在部分路径上会失败（CI 实测漏写 cleared）。只有 CFBoolean 才当布尔，
+        // 其它 NSNumber 一律不算 true，避免 `"legacyClosed": 1` 被误认成开启。
+        if isTrue(document["legacyClosed"]) { puts[clearedKey] = "1" }
         return Plan(puts: puts, removes: [])
     }
 
@@ -423,5 +427,14 @@ enum AccountBackup {
     static func incremented(_ value: Any?) -> Int {
         let number = (value as? NSNumber)?.intValue ?? 0
         return max(1, number + 1)
+    }
+
+    /// JSON 布尔判定：只认真布尔，不认 `1` / `"true"` 这类近似值。
+    /// JSONSerialization 把 true 解成 NSNumber(CFBoolean)，`as? Bool` 不一定命中。
+    static func isTrue(_ value: Any?) -> Bool {
+        guard let number = value as? NSNumber, CFGetTypeID(number) == CFBooleanGetTypeID() else {
+            return (value as? Bool) == true
+        }
+        return number.boolValue
     }
 }
