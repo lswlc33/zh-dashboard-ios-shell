@@ -146,6 +146,17 @@ if [[ -f "$script_dir/account-backup-test.swift" ]]; then
 else
     printf '%s\n' 'note: account-backup-test 已跳过（缺 ios-shell/account-backup-test.swift）'
 fi
+# 后台凭据：用户报过「快捷指令一直说未导入后台凭据」但实际授权过的 bug，
+# 根因是旧 schema 解码失败 / 只导入一个域 / 钥匙串拒绝被压成同一个 no_credential。
+# 这条回归只依赖 Foundation + Security 的类型声明（不实际访问 Keychain），
+# 用来钉死「旧 JSON 必须仍能解码」「两个域可独立判定」这两条契约。
+if [[ -f "$script_dir/background-credential-test.swift" ]]; then
+    xcrun swiftc "$script_dir/BackgroundSigning.swift" "$script_dir/background-credential-test.swift" \
+        -o "$build_dir/background-credential-test"
+    "$build_dir/background-credential-test"
+else
+    printf '%s\n' 'note: background-credential-test 已跳过（缺 ios-shell/background-credential-test.swift）'
+fi
 
 gradle_args=(--project-dir "$shared_dir" --no-daemon --console=plain)
 if [[ "$offline" == true ]]; then gradle_args+=(--offline); fi

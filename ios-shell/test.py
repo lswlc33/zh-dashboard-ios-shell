@@ -197,13 +197,22 @@ def main():
                   '--scan-executable "$broadcast_dir/ZeehoCastBroadcast"',
                   '--scan-folder "$broadcast_dir/Frameworks"', 'Entitlements/Broadcast.entitlements'):
         assert token in build_sh, token
-    # Widget 用 StaticConfiguration + AppIntent（车控/刷新按钮）。
-    # 交互按钮需要 AppIntents metadata 索引：缺了它点按钮会静默无效
-    # （真机日志 linkd Missing: <bundle>:<Type>），所以构建脚本必须
+    # Widget 用 AppIntentConfiguration（iOS 17+ 原生编辑）+ StaticConfiguration（低系统兜底），
+    # 车控/刷新按钮走 AppIntent。
+    # 交互按钮与编辑面板都需要 AppIntents metadata 索引：缺了它点按钮会静默无效、
+    # 编辑面板会是空的（真机日志 linkd Missing: <bundle>:<Type>），所以构建脚本必须
     # 导出 const-values、跑 appintentsmetadataprocessor、并在签名之前生成索引。
     widget_bundle = (root / 'Widgets/ZeehoWidgets.swift').read_text(encoding='utf-8')
-    assert 'ZeehoVehicleWidget()' in widget_bundle, 'Widget bundle 必须注册 StaticConfiguration 控件'
-    assert 'AppIntentConfiguration(' not in widget_bundle, '仍只用 StaticConfiguration 承载控件'
+    assert 'ZeehoVehicleWidget()' in widget_bundle, 'Widget bundle 必须仍注册 StaticConfiguration 控件'
+    # Widget.body / WidgetBundle.body 都没有 result builder，不能写 if #available；
+    # 必须用 static main() 在两条 bundle 之间分派，且两边 kind 必须相同。
+    assert 'static func main()' in widget_bundle, '可编辑/静态两套控件必须用 static main() 分派'
+    assert 'ZeehoModernWidgets.main()' in widget_bundle and 'ZeehoLegacyWidgets.main()' in widget_bundle, \
+        'static main() 必须按 iOS 17 可用性分派两条 WidgetBundle'
+    widget_config = (root / 'Widgets/WidgetConfiguration.swift').read_text(encoding='utf-8')
+    assert 'AppIntentConfiguration(' in widget_bundle, 'iOS 17+ 原生编辑必须用 AppIntentConfiguration'
+    assert 'WidgetConfigurationIntent' in widget_config, '编辑面板必须声明 WidgetConfigurationIntent'
+    assert 'ZeehoWidgetKind.vehicle' in widget_bundle, '两套控件必须共用同一个 kind（WidgetCenter 按它重载）'
     assert 'appintentsmetadataprocessor' in build_sh, '交互按钮必须生成 AppIntents metadata，否则点击无效'
     # 判据是「索引目录里有文件」，不再死认 extract.actionsdata：Xcode 版本间改过名，
     # 写死文件名会在明明成功的机器上误报（CI 实测 Xcode 16.4）。
@@ -219,6 +228,10 @@ def main():
     assert 'ZeehoWidgetCommandIntent' in widget_commands and 'Button(intent:' in widget_commands, \
         '车控按钮必须走 AppIntent'
     assert 'ZeehoWidgetCommandMailbox.post' in widget_commands, '按钮必须投递命令给主 App 执行'
+    # 刷新按钮必须是真按钮：旧版 RefreshPill 是纯 Text（点不动），且 refresh intent 全仓零引用。
+    assert 'ZeehoWidgetRefreshIntent()' in widget_bundle or 'ZeehoWidgetRefreshIntent()' in widget_commands, \
+        '刷新必须绑定到 ZeehoWidgetRefreshIntent（不能是画出来的死控件）'
+    assert 'WidgetDataSource.load' in widget_commands, '刷新必须真的重新取数，而不是只重读旧快照'
     host_bridge = (root / 'Bridge.swift').read_text(encoding='utf-8')
     assert 'ZeehoWidgetCommandMailbox.consume()' in host_bridge, '主 App 必须消费小组件命令'
     assert '__zeehoWidgetCommand' in (root / 'bridge-bootstrap.js').read_text(encoding='utf-8'), \
@@ -357,11 +370,33 @@ def main():
     # 不注册 AppShortcutsProvider 的话，快捷指令里根本看不到这些 intent。
     assert 'AppShortcutsProvider' in intents and 'appShortcuts' in intents, \
         '必须提供 AppShortcutsProvider 才能出现在快捷指令里'
+
+    # 车况查询类 intent（VehicleIntents.swift）：只读快照，绝不联网。
+    # 这些规则不靠注释维持——谁给它加上网络请求/写盘，下面立刻失败。
+    vehicle_intents = strip_comments((root / 'VehicleIntents.swift').read_text(encoding='utf-8'))
+    assert 'IntentModes' not in vehicle_intents, \
+        '车况 intent 也不能用 IntentModes（iOS 26 API，CI 编不过）'
+    for name in ('ZeehoVehicleStatusIntent', 'ZeehoBatteryIntent',
+                 'ZeehoChargingStatusIntent', 'ZeehoLockStateIntent'):
+        assert f'struct {name}: AppIntent' in vehicle_intents, f'缺少车况查询 intent：{name}'
+        assert f'intent: {name}()' in intents, f'{name} 没注册进 AppShortcutsProvider，快捷指令里看不到'
+    assert 'openAppWhenRun: Bool = false' in vehicle_intents, \
+        '车况查询是只读 intent，必须 openAppWhenRun = false（不该拉起 App）'
+    # 硬约束：只读快照。出现网络/蓝牙字眼说明有人把「查询」实现成了「现拉接口」——
+    # 那会让 Siri 等网络往返，而且扩展进程根本没有凭据。
+    for forbidden in ('URLSession', 'URLRequest', 'dataTask(', 'CoreBluetooth', 'CBCentralManager'):
+        assert forbidden not in vehicle_intents, \
+            f'车况 intent 必须只读快照，不能出现 {forbidden}（扩展进程无凭据，也不能联网）'
+    # 短语必须带 applicationName，否则系统不会把它收进「App 快捷指令」面板。
+    phrase_blocks = re.findall(r'phrases:\s*\[([^\]]*)\]', intents)
+    assert phrase_blocks, 'AppShortcutsProvider 必须声明 phrases'
+    for block in phrase_blocks:
+        assert '.applicationName' in block, f'Siri 短语必须包含 applicationName：{block[:60]}'
     # 同名类型只能定义一次：CI 实测重写文件时漏删旧定义，报
     # "'X' is ambiguous for type lookup in this context"。
     declarations = {}
     for name in ('BackgroundTasks.swift', 'BackgroundSigning.swift', 'BackgroundRunner.swift',
-                 'BackgroundService.swift', 'BackgroundIntents.swift'):
+                 'BackgroundService.swift', 'BackgroundIntents.swift', 'VehicleIntents.swift'):
         source = strip_comments((root / name).read_text(encoding='utf-8'))
         for declared in re.findall(r'^(?:public )?(?:struct|enum|final class|class) (\w+)', source, re.M):
             declarations.setdefault(declared, []).append(name)

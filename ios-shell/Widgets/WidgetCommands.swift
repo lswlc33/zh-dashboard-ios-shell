@@ -15,6 +15,12 @@ import ZeehoSystemShared
 //   3) 再签名（保证索引进签名封条）
 // 见 build.sh 的 appintents-metadata 段与 test.py 的对应断言。
 
+/// 小组件唯一 kind。`WidgetCenter.reloadTimelines(ofKind:)` 与宿主侧的
+/// `IOSSystemSurfacesService.widgetKind` 都靠这个字符串对上，改一处必须改两处。
+enum ZeehoWidgetKind {
+    static let vehicle = "ZeehoVehicleWidget"
+}
+
 /// 车控动作（与 Android CAR_CMDS 的四个按钮一一对应）。
 enum ZeehoWidgetCommand: String, CaseIterable, Hashable, Sendable {
     case unlock, lock, horn, seat
@@ -67,22 +73,30 @@ struct ZeehoWidgetCommandIntent: AppIntent {
         let owner = try? SystemSnapshotStore.currentOwner()
         _ = ZeehoWidgetCommandMailbox.post(command.rawValue, owner: owner)
         // 立刻请求刷新，让界面尽快反映「已受理」（不代表车已执行）。
-        WidgetCenter.shared.reloadTimelines(ofKind: "ZeehoVehicleWidget")
+        WidgetCenter.shared.reloadTimelines(ofKind: ZeehoWidgetKind.vehicle)
         return .result()
     }
 }
 
-/// 小组件刷新 intent：点「刷新」时让扩展重新读一次共享快照。
+/// 小组件刷新 intent：点「刷新」时扩展自己拉一次车况（不再只是重读旧快照）。
+///
+/// 旧版这里只调 `WidgetCenter.reloadTimelines`，等于「把同一份旧数据再渲染一遍」，
+/// 用户点了没有任何变化——而且 `RefreshPill` 当时是个纯 `Text`，连点都点不动。
+/// 现在按官方 `ZHWidgetExtension` 的做法：intent 里真的发请求（`WidgetDataSource.load(force:)`），
+/// 落缓存后再让系统重读时间线。失败时保留最后已知值，只把原因记进诊断。
 @available(iOS 17.0, *)
 struct ZeehoWidgetRefreshIntent: AppIntent {
     static var title: LocalizedStringResource = "刷新车况"
-    static var description = IntentDescription("重新读取最近一次同步的车况")
+    static var description = IntentDescription("立刻重新查询一次车辆状态并更新小组件。")
     static var openAppWhenRun: Bool = false
 
     init() {}
 
     func perform() async throws -> some IntentResult {
-        WidgetCenter.shared.reloadTimelines(ofKind: "ZeehoVehicleWidget")
+        // 必须在 perform 返回之前 await 完：返回后系统就会重建时间线，
+        // 没写完缓存等于这次刷新白点。
+        _ = await WidgetDataSource.load(at: Date(), force: true)
+        WidgetCenter.shared.reloadTimelines(ofKind: ZeehoWidgetKind.vehicle)
         return .result()
     }
 }

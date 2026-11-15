@@ -44,17 +44,67 @@ struct IOSBackgroundCredential: Codable, Equatable, Sendable {
     var h5AppID: String
     var updatedAt: Int64
 
-    var isValid: Bool {
-        [accountID, vin, token, appSecret, h5Secret, appID, h5AppID].allSatisfy { value in
-            !value.isEmpty && value.utf8.count <= 512
-                && !value.unicodeScalars.contains { CharacterSet.controlCharacters.contains($0) }
+    /// 向后兼容解码：老版本存进 Keychain 的 JSON 可能**缺字段**（例如还没有
+    /// `signinToken`/`h5Secret`/`h5AppID` 的年代）。合成 `Codable` 遇到缺键会整体
+    /// 解码失败 → `load()` 返回 nil → 用户看到 `no_credential`，但实际上他授权过。
+    /// 这正是「快捷指令一直提示未导入后台凭据」的一个真实成因。
+    ///
+    /// 所以每个字段都按「缺键 = 空串」解码，再由 `isValid` 按域分别判定够不够用。
+    /// 不用 `decodeIfPresent` + `?? ""` 逐个写，是因为那样新增字段仍会漏；这里用
+    /// 统一容器，未来加字段也不会再炸老凭据。
+    init(from decoder: Decoder) throws {
+        let box = try decoder.container(keyedBy: CodingKeys.self)
+        func text(_ key: CodingKeys) -> String {
+            (try? box.decodeIfPresent(String.self, forKey: key)) ?? ""
         }
+        accountID = text(.accountID)
+        vin = text(.vin)
+        token = text(.token)
+        signinToken = text(.signinToken)
+        appSecret = text(.appSecret)
+        h5Secret = text(.h5Secret)
+        appID = text(.appID)
+        h5AppID = text(.h5AppID)
+        updatedAt = (try? box.decodeIfPresent(Int64.self, forKey: .updatedAt)) ?? 0
     }
 
-    /// 做签到是否可行（h5 域）。
-    var canSignIn: Bool { isValid && !(signinToken.isEmpty && token.isEmpty) }
-    /// 拉车况是否可行（app 域）。
-    var canSampleVehicle: Bool { isValid }
+    init(accountID: String, vin: String, token: String, signinToken: String,
+         appSecret: String, h5Secret: String, appID: String, h5AppID: String, updatedAt: Int64) {
+        self.accountID = accountID; self.vin = vin; self.token = token; self.signinToken = signinToken
+        self.appSecret = appSecret; self.h5Secret = h5Secret
+        self.appID = appID; self.h5AppID = h5AppID; self.updatedAt = updatedAt
+    }
+
+    /// 单字段合法性：非空、不超长、无控制字符。
+    private static func ok(_ value: String) -> Bool {
+        !value.isEmpty && value.utf8.count <= 512
+            && !value.unicodeScalars.contains { CharacterSet.controlCharacters.contains($0) }
+    }
+
+    /// app 域够用就能拉车况（`vehicleHomePageV2`）。
+    ///
+    /// **这里刻意不再要求 h5 字段**：车况采样只用 `token`/`appID`/`appSecret`。
+    /// 旧实现把 `isValid`（要求 h5 全齐）当成采样前提，于是「只导入了 app 域
+    /// 凭据」的账号采样必然失败并报 `no_credential` —— 第二个真实成因。
+    var canSampleVehicle: Bool {
+        Self.ok(accountID) && Self.ok(vin) && Self.ok(token) && Self.ok(appSecret) && Self.ok(appID)
+    }
+
+    /// h5 域够用才能签到。签到要 h5 的 appId/secret，token 可以用 app 域顶替。
+    var canSignIn: Bool {
+        Self.ok(vin) && (!signinToken.isEmpty || !token.isEmpty) && Self.ok(h5Secret) && Self.ok(h5AppID)
+    }
+
+    /// 两个域至少有一样能用。全废的凭据视为无效，`load()` 会当作没有。
+    var isValid: Bool { canSampleVehicle || canSignIn }
+
+    /// 诊断用：告诉用户到底缺哪个域（界面/回执文案直接用它，不猜）。
+    var grantedScopes: [String] {
+        var scopes: [String] = []
+        if canSampleVehicle { scopes.append("app") }
+        if canSignIn { scopes.append("h5") }
+        return scopes
+    }
 
     /// 擦除敏感字段后再丢弃，避免 JSON 副本在内存里留一层。
     mutating func clear() {
@@ -71,12 +121,41 @@ enum IOSBackgroundCredentialStore {
     private static let service = "io.github.lswlc33.dashboard.ios.background.credential"
     private static let account = "active"
 
-    static func load() -> IOSBackgroundCredential? {
-        guard let data = read() else { return nil }
-        defer { var mutable = data; _ = mutable }
-        guard let value = try? JSONDecoder().decode(IOSBackgroundCredential.self, from: data),
-              value.isValid else { return nil }
-        return value
+    /// 读取结果。**必须区分「没有」和「有但坏了」**，否则两类完全不同的原因
+    /// 会被压成同一个 `no_credential`，用户永远不知道该重新授权还是重装 App。
+    enum LoadOutcome: Equatable {
+        /// Keychain 里根本没有这一项：用户从没授权过，或重签/重装把它清掉了。
+        case missing
+        /// 有原始数据但解不开 / 两个域都不完整：凭据残留但不可用。
+        case unusable(reason: String)
+        /// 可用。
+        case ready(IOSBackgroundCredential)
+
+        var credential: IOSBackgroundCredential? {
+            if case let .ready(value) = self { return value }
+            return nil
+        }
+    }
+
+    /// 保留旧签名给不关心原因的调用方用。
+    static func load() -> IOSBackgroundCredential? { outcome().credential }
+
+    /// 需要给用户解释原因时用这个。
+    static func outcome() -> LoadOutcome {
+        switch read() {
+        case .nothing: return .missing
+        case let .failure(status): return .unusable(reason: "keychain_\(status)")
+        case let .success(data):
+            guard let value = try? JSONDecoder().decode(IOSBackgroundCredential.self, from: data) else {
+                return .unusable(reason: "credential_decode_failed")
+            }
+            guard value.isValid else {
+                // 哪一路还活着就说哪一路，别只说「无效」。
+                let scopes = value.grantedScopes
+                return .unusable(reason: scopes.isEmpty ? "credential_incomplete" : "credential_partial")
+            }
+            return .ready(value)
+        }
     }
 
     static func save(_ value: IOSBackgroundCredential) -> Bool {
@@ -103,7 +182,16 @@ enum IOSBackgroundCredentialStore {
         SecItemDelete(query as CFDictionary)
     }
 
-    private static func read() -> Data? {
+    private enum ReadResult {
+        case nothing
+        /// 带上 OSStatus（负数），诊断时能分清 `errSecInteractionNotAllowed`（-25308，
+        /// 锁屏且未解锁过一次）与 `errSecAuthFailed`（-25293，重签后权限变了）
+        /// 这类环境问题，而不是笼统的「没授权」。
+        case failure(Int32)
+        case success(Data)
+    }
+
+    private static func read() -> ReadResult {
         let query: [String: Any] = [
             kSecClass as String: kSecClassGenericPassword,
             kSecAttrService as String: service,
@@ -112,14 +200,56 @@ enum IOSBackgroundCredentialStore {
             kSecMatchLimit as String: kSecMatchLimitOne
         ]
         var result: CFTypeRef?
-        guard SecItemCopyMatching(query as CFDictionary, &result) == errSecSuccess else { return nil }
-        return result as? Data
+        let status = SecItemCopyMatching(query as CFDictionary, &result)
+        if status == errSecItemNotFound { return .nothing }
+        guard status == errSecSuccess else { return .failure(status) }
+        guard let data = result as? Data else { return .nothing }
+        return .success(data)
+    }
+}
+
+/// 凭据不可用时的**细分原因码**。
+///
+/// 之前这些情况全报 `no_credential`，用户只能看到「未导入后台凭据」一句话，
+/// 分不清是该重新授权、还是该退出重进解锁一次钥匙串。现在每一类单独成码，
+/// 界面按码给不同的动作建议；`no_credential` 只保留给真正的「从没授权」。
+enum IOSBackgroundCredentialIssue: String {
+    /// Keychain 里没有这一项 —— 从没授权，或重签/重装被清掉。**这才是 no_credential**。
+    case neverGranted = "no_credential"
+    /// 有数据但解不开（旧版本 schema / 数据被截断）。
+    case decodeFailed = "credential_decode_failed"
+    /// 解开了，但两个域都不完整。
+    case incomplete = "credential_incomplete"
+    /// 某一域可用、另一域不可用（例如只导入了 app 域，签到会失败）。
+    case partial = "credential_partial"
+    /// 钥匙串访问被系统拒绝（锁屏未解锁过一次 / 重签后权限变化）。
+    case keychainLocked = "keychain_locked"
+    case keychainUnavailable = "keychain_unavailable"
+
+    /// 把 `LoadOutcome` 映射成用户能据以行动的码。
+    static func from(_ outcome: IOSBackgroundCredentialStore.LoadOutcome) -> IOSBackgroundCredentialIssue? {
+        switch outcome {
+        case .ready: return nil
+        case .missing: return .neverGranted
+        case let .unusable(reason):
+            if reason.hasPrefix("keychain_") {
+                // -25308 errSecInteractionNotAllowed：设备锁着且本进程还没解锁过钥匙串。
+                // 后台唤醒时常见，属于「稍后重试即可」，不是用户操作问题。
+                if reason.contains("25308") { return .keychainLocked }
+                return .keychainUnavailable
+            }
+            if reason == "credential_decode_failed" { return .decodeFailed }
+            if reason == "credential_partial" { return .partial }
+            return .incomplete
+        }
     }
 }
 
 /// 后台请求的失败分类。每个码都要能直接写进回执，界面上不做二次翻译。
 enum IOSBackgroundError: Error, Equatable {
-    case noCredential
+    /// 凭据不可用。**带原因码**，否则「没授权」和「授权了但缺一半」会被混为一谈
+    /// （用户报的那个 bug 就是这么来的）。默认值保持向后兼容的 `no_credential`。
+    case noCredential(IOSBackgroundCredentialIssue = .neverGranted)
     case unauthorized          // 401：token 失效，需要用户重新登录
     case throttled             // 429 / 服务端限流
     case server(Int)           // 其它 4xx/5xx
@@ -128,7 +258,7 @@ enum IOSBackgroundError: Error, Equatable {
 
     var code: String {
         switch self {
-        case .noCredential: return "no_credential"
+        case let .noCredential(issue): return issue.rawValue
         case .unauthorized: return "http_401"
         case .throttled: return "http_429"
         case let .server(status): return "http_\(status)"
@@ -137,6 +267,7 @@ enum IOSBackgroundError: Error, Equatable {
         }
     }
 }
+
 
 /// 签名算法的纯函数部分。不持有任何密钥，便于单测与复用。
 enum IOSBackgroundSigning {
@@ -231,7 +362,9 @@ final class IOSBackgroundClient {
     /// **绝不能改成调原生 PsModel 式端点**（Android 侧教训：那会让全局 401 映射把
     /// 登录态清掉并弹「登录已过期」）。h5 通道的 401 只影响本次结果。
     func signIn(credential: IOSBackgroundCredential) async -> Result<SignInResult, IOSBackgroundError> {
-        guard credential.canSignIn else { return .failure(.noCredential) }
+        // 越界防御：Runner 已按 canSignIn 拦过一次，这里是第二道。
+        // 走到这里说明凭据**缺 h5 域**（不是完全没授权），所以报 partial 而不是 neverGranted。
+        guard credential.canSignIn else { return .failure(.noCredential(.partial)) }
         let token = credential.signinToken.isEmpty ? credential.token : credential.signinToken
         let body = "{}"
         let param = IOSBackgroundSigning.param(
@@ -302,7 +435,8 @@ final class IOSBackgroundClient {
     /// 一律按未充电，缺失才是未知。Android 的通知 getter 还兼容 "true"，那是历史偏差，
     /// 不要照抄过来。
     func vehicleSample(credential: IOSBackgroundCredential) async -> Result<VehicleSample, IOSBackgroundError> {
-        guard credential.canSampleVehicle else { return .failure(.noCredential) }
+        // 同上：缺 app 域时是部分授权，不是完全没授权。
+        guard credential.canSampleVehicle else { return .failure(.noCredential(.partial)) }
         let path = "/v1.0/app/cfmotoserverapp/vehicleHomePageV2/\(credential.vin)"
         let timestamp = Int64(Date().timeIntervalSince1970 * 1000)
         let param = IOSBackgroundSigning.param(

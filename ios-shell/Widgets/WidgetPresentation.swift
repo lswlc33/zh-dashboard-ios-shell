@@ -10,6 +10,8 @@ enum WidgetStrings {
     static let vehicle = "车辆"
     static let displayName = "车辆状态"
     static let description = "显示 App 最近同步的电量与充电状态；系统决定刷新时间。"
+    /// iOS 17+ 可编辑版的描述：额外提一句支持按实例编辑，用户才知道长按能改。
+    static let configurableDescription = "显示电量与充电状态，长按小组件可编辑外观、车名和统计内容。"
     static let unavailable = "车况暂无数据"
     static let unavailableShort = "打开 App 主页同步"
     static let unavailableHint = "打开 App 进入主页即可同步当前车辆；系统决定小组件的刷新时间。"

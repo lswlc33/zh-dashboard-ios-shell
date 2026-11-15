@@ -74,8 +74,10 @@ struct ZeehoRunBackgroundTaskIntent: AppIntent {
             switch report.lastResult {
             case "ok":
                 parts.append("车况已更新")
-            case "no_credential":
-                parts.append("车况采样失败（未导入后台凭据）")
+            case _ where ZeehoCredentialIssueText.isCredentialIssue(report.lastResult):
+                // 凭据侧的原因按真实码翻译，并给出**下一步该做什么**：
+                // 「未导入后台凭据」这句话在用户明明授权过时只会让他反复重试。
+                parts.append("车况采样失败（" + ZeehoCredentialIssueText.text(report.lastResult) + "）")
             default:
                 parts.append("车况采样失败（\(report.lastResult)）")
             }
@@ -100,10 +102,10 @@ struct ZeehoRunBackgroundTaskIntent: AppIntent {
             switch report.lastResult {
             case "already_signed", "signed":
                 parts.append((report.lastResult == "already_signed" ? "今日已签到" : "签到成功") + daysPart)
-            case "no_credential":
+            case _ where ZeehoCredentialIssueText.isCredentialIssue(report.lastResult):
                 // runSignIn 在缺凭据时回 completion(true)，那是给系统调度评分用的
                 // （缺凭据不是运行失败，不该扣分）；对用户来说这次确实没签上，不能报成功。
-                parts.append("签到失败（未导入后台凭据）")
+                parts.append("签到失败（" + ZeehoCredentialIssueText.text(report.lastResult) + "）")
             default:
                 parts.append("签到失败（\(report.lastResult)）")
             }
@@ -130,7 +132,15 @@ struct ZeehoOpenPanelIntent: AppIntent {
     }
 }
 
-/// 把两个 intent 暴露给快捷指令 App 的「App 快捷指令」列表。
+/// 把 intent 暴露给快捷指令 App 的「App 快捷指令」列表。
+///
+/// 分成两类：
+/// 1. **后台任务类**（签到/采样）—— iOS 上唯一有系统保证的定时入口；
+/// 2. **车况查询类**（车况/电量/充电/锁状态）—— 见 `VehicleIntents.swift`，
+///    纯只读本地快照，可以安全地放进自动化里反复跑。
+///
+/// 短语必须包含 `\(.applicationName)`，否则系统不会把它收进「App 快捷指令」面板。
+/// 每条短语按用户真的会说的话写（Siri 匹配靠短语，不是靠 shortTitle）。
 @available(iOS 17.0, *)
 struct ZeehoAppShortcuts: AppShortcutsProvider {
     static var appShortcuts: [AppShortcut] {
@@ -139,6 +149,36 @@ struct ZeehoAppShortcuts: AppShortcutsProvider {
             phrases: ["用 \(.applicationName) 签到", "让 \(.applicationName) 补采车况"],
             shortTitle: "后台任务",
             systemImageName: "bolt.badge.clock")
+        AppShortcut(
+            intent: ZeehoBackgroundStatusIntent(),
+            phrases: ["用 \(.applicationName) 查后台任务", "问 \(.applicationName) 自动签到生效了吗"],
+            shortTitle: "后台状态",
+            systemImageName: "checkmark.seal")
+        AppShortcut(
+            intent: ZeehoGrantBackgroundIntent(),
+            phrases: ["用 \(.applicationName) 授权后台任务", "让 \(.applicationName) 打开后台授权"],
+            shortTitle: "授权后台",
+            systemImageName: "key.horizontal")
+        AppShortcut(
+            intent: ZeehoVehicleStatusIntent(),
+            phrases: ["用 \(.applicationName) 查车况", "问问 \(.applicationName) 车怎么样了"],
+            shortTitle: "查询车况",
+            systemImageName: "car.side")
+        AppShortcut(
+            intent: ZeehoBatteryIntent(),
+            phrases: ["用 \(.applicationName) 查电量", "问 \(.applicationName) 还有多少电"],
+            shortTitle: "剩余电量",
+            systemImageName: "battery.75")
+        AppShortcut(
+            intent: ZeehoChargingStatusIntent(),
+            phrases: ["用 \(.applicationName) 查充电", "问 \(.applicationName) 在充电吗"],
+            shortTitle: "充电状态",
+            systemImageName: "bolt.car")
+        AppShortcut(
+            intent: ZeehoLockStateIntent(),
+            phrases: ["用 \(.applicationName) 查车锁", "问 \(.applicationName) 锁车了吗"],
+            shortTitle: "车锁状态",
+            systemImageName: "lock.shield")
         AppShortcut(
             intent: ZeehoOpenPanelIntent(),
             phrases: ["打开 \(.applicationName)"],

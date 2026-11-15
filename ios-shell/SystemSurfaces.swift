@@ -301,6 +301,8 @@ private actor IOSLiveActivityManager {
 final class IOSSystemSurfacesService: NSObject, IOSBridgeService, IOSBridgeCancellableService,
                                       IOSSystemSurfacePublisher {
     let methods = ["system.surfaces.status", "system.snapshot", "liveActivity.start", "liveActivity.update", "liveActivity.end", "widgets.reload"]
+    // 与扩展里的 `ZeehoWidgetKind.vehicle` 必须是同一个字符串（扩展在 Widgets 模块，
+    // Host 不链接它，所以只能各写一份常量）。test.py 会断言两边一致。
     static let widgetKind = "ZeehoVehicleWidget"
     private let worker = DispatchQueue(label: "io.github.lswlc33.dashboard.system-surfaces", qos: .utility)
     private var scopeProvider: (() -> IOSRideScope?)?
@@ -1038,6 +1040,17 @@ final class IOSSystemSurfacesService: NSObject, IOSBridgeService, IOSBridgeCance
                     // 写回调不能让活动车速倒退到排队前；车况沿用本次成功值，原生源使用最新已接受样本。
                     self.latest = (try? self.candidate(vehicle: value.vehicle)) ?? value
                     self.lastError = nil
+                    // App 在前台跑起来就顺手把小组件取数凭据同步一次：用户要求的是
+                    // 「APP 运行的时候把 token 等关键信息给小组件，由小组件自己发请求」，
+                    // 而不是必须先去后台任务面板点授权。没有已授权凭据时这里是 no-op，
+                    // 小组件继续走读快照的老路。
+                    // 走 worker：这里读 Keychain + 写 4KB 文件，放主线程会卡首屏。
+                    // 用显式捕获列表把值类型带进去：Swift 5 的非 Sendable 闭包里直接引用
+                    // 外部 `let` 会在 strict concurrency 下报 data race 警告。
+                    let credentialOwner = value.owner
+                    self.worker.async { [credentialOwner, selectedScope] in
+                        Self.refreshWidgetCredential(for: credentialOwner, scope: selectedScope)
+                    }
                     self.reloadWidgets(force: false, snapshot: value)
                     // 充电结束就自动收起充电活动：用户此时已经不需要盯着进度条，
                     // 留着会被系统算到 8 小时上限里，还占着灵动岛位置。
@@ -1432,6 +1445,55 @@ final class IOSSystemSurfacesService: NSObject, IOSBridgeService, IOSBridgeCance
     static func anonymousAccount(_ accountID: String) -> String {
         let data = Data(("ios-system-summary-account-v1\u{0}" + accountID).utf8)
         return SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
+    }
+
+    /// 按 accountID + VIN 推导与快照完全一致的匿名 owner（供小组件凭据使用）。
+    ///
+    /// 小组件要自己拉接口，就必须知道「这份凭据属于哪个 owner」：否则换账号后
+    /// 旧凭据还会被拿来拉上一辆车（正是报告里点名的「残留 vehicleID」坑）。
+    /// 推导方式与 `scopeChanged` 完全一致：ownerHash = H(accountID, VIN)、
+    /// scopeID 取按 ownerHash 持久化的稳定值、accountHash 走同一摘要。
+    static func widgetOwner(accountID: String, vin: String) -> SystemSnapshotOwner? {
+        // generation 不参与 ownerHash（见 IOSRideScope.ownerHash），这里只借它做长度校验。
+        let scope = IOSRideScope(accountID: accountID, vin: vin, generation: "widget-credential")
+        guard scope.valid else { return nil }
+        return SystemSnapshotOwner(scopeID: stableScopeID(for: scope.ownerHash),
+                                   accountVINHash: scope.ownerHash,
+                                   accountHash: anonymousAccount(accountID))
+    }
+
+    /// 每次快照落盘成功后，把小组件取数凭据对齐到「当前这辆车」。
+    ///
+    /// 只在**已有已授权的后台凭据**且账号/VIN 与本帧一致时才镜像：小组件不能凭白拿到
+    /// 用户从没授权过的长期凭据。没有凭据时静默跳过（扩展继续读快照）。
+    /// 发现 owner 变了就先把旧投影清掉，绝不让扩展拿上一辆车的 token 去拉新车的接口。
+    static func refreshWidgetCredential(for owner: SystemSnapshotOwner, scope: IOSRideScope?) {
+        guard SystemSnapshotStore.isAvailable() else { return }
+        guard let scope = scope, let credential = IOSBackgroundCredentialStore.load(),
+              credential.canSampleVehicle,
+              credential.vin == scope.vin, credential.accountID == scope.accountID,
+              let derived = widgetOwner(accountID: credential.accountID, vin: credential.vin),
+              derived == owner else {
+            // 没有可镜像的凭据：如果共享区里还留着别的 owner 的投影，必须清掉。
+            if let existing = WidgetCredentialStore.read(), existing.ownerID != owner.ownerIdentifierString {
+                WidgetCredentialStore.clear()
+                WidgetFetchCache.clear()
+            }
+            return
+        }
+        let existing = WidgetCredentialStore.read()
+        if existing?.ownerID == derived.ownerIdentifierString,
+           existing?.token == credential.token,
+           existing?.appSecret == credential.appSecret {
+            return // 已经是最新的，别每次快照都重写文件。
+        }
+        let value = WidgetCredential(ownerID: derived.ownerIdentifierString, vin: credential.vin,
+                                     token: credential.token, appID: credential.appID,
+                                     appSecret: credential.appSecret,
+                                     updatedAt: Int64(Date().timeIntervalSince1970 * 1000))
+        if !WidgetCredentialStore.save(value) { return }
+        // 换车/换账号后旧的拉取缓存必须作废，否则新卡片会先闪一下上一辆车的数据。
+        WidgetFetchCache.clear()
     }
 
     func compatibilityScopeOptions() throws -> [String: Any] {

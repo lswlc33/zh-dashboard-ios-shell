@@ -32,11 +32,17 @@ enum IOSBackgroundRunner {
         if force && !IOSBackgroundPreferences.autoSignInEnabled {
             IOSBackgroundLog.write("主动触发签到：忽略自动签到开关")
         }
-        guard let credential = IOSBackgroundCredentialStore.load() else {
-            IOSBackgroundLog.write("跳过签到：没有已授权的后台凭据")
+        // 凭据不可用时**按真实原因记账**，不再一律写 no_credential：
+        // 用户看到「未导入后台凭据」却其实授权过（旧 schema / 只导入一个域 /
+        // 重签后钥匙串拒绝访问），会反复授权、反复失败。
+        let signInOutcome = IOSBackgroundCredentialStore.outcome()
+        guard let credential = signInOutcome.credential, credential.canSignIn else {
+            let issue = IOSBackgroundCredentialIssue.from(signInOutcome)
+                ?? (credential == nil ? .neverGranted : .partial)
+            IOSBackgroundLog.write("跳过签到：凭据不可用 \(issue.rawValue) \(signInOutcome)")
             IOSBackgroundScheduler.record({ report in
                 report.lastRunAt = nowMs()
-                report.lastResult = "no_credential"
+                report.lastResult = issue.rawValue
                 report.runCount += 1
             }, identifier: IOSBackgroundTaskID.signIn)
             completion(true)   // 缺凭据不是运行失败，不该让系统扣我们的调度分
@@ -94,11 +100,15 @@ enum IOSBackgroundRunner {
     /// 想知道这一次到底取到没有，必须读 `IOSBackgroundScheduler.report(...).lastResult`
     /// （`ok` 才算真取到）。调用方按这两个不同语义各自取用，别拿布尔当成功判据。
     static func runRefresh(completion: @escaping (Bool) -> Void) {
-        guard let credential = IOSBackgroundCredentialStore.load() else {
-            IOSBackgroundLog.write("跳过采样：没有已授权的后台凭据")
+        // 与签到同款：按真实原因记账，且**只要求 app 域**（采样根本不用 h5 密钥）。
+        let sampleOutcome = IOSBackgroundCredentialStore.outcome()
+        guard let credential = sampleOutcome.credential, credential.canSampleVehicle else {
+            let issue = IOSBackgroundCredentialIssue.from(sampleOutcome)
+                ?? (credential == nil ? .neverGranted : .partial)
+            IOSBackgroundLog.write("跳过采样：凭据不可用 \(issue.rawValue) \(sampleOutcome)")
             IOSBackgroundScheduler.record({ report in
                 report.lastRunAt = nowMs()
-                report.lastResult = "no_credential"
+                report.lastResult = issue.rawValue
                 report.runCount += 1
             }, identifier: IOSBackgroundTaskID.refresh)
             completion(true)

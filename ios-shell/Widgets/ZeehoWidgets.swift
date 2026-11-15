@@ -18,6 +18,10 @@ struct ZeehoVehicleEntry: TimelineEntry {
     var darkMode: Int = -1
     /// 4×4 六格 / 4×2 两格的统计指标；空数组表示用该档默认顺序。
     var stats: [WidgetStatField] = []
+    /// 原生编辑面板里「隐藏统计」开关；true 时 4×4/4×2 的统计块整块不占位。
+    var statsHidden = false
+    /// 这一帧的数据来源（诊断用，也决定「打开面板同步」那句提示要不要出现）。
+    var origin: WidgetDataSourceResult.Origin = .snapshot
 
     var presentation: WidgetVehiclePresentation {
         // 桌面小组件过期后保留最后已知电量/充电状态，只把时间标注成过期，
@@ -51,6 +55,10 @@ struct ZeehoVehicleEntry: TimelineEntry {
 }
 
 // MARK: - 车况读取
+//
+// 数据来源优先级见 Shared/WidgetDataSource：「扩展自己拉 → 自己的缓存 → 宿主快照」。
+// 前两条对应官方 `ZHWidgetExtension` 的做法（扩展自带网络层，不依赖宿主存活），
+// 第三条保留原有兜底，未授权后台凭据/弱网时行为不变。
 
 struct ZeehoVehicleProvider: TimelineProvider {
     private static let refreshInterval: TimeInterval = 15 * 60
@@ -61,12 +69,19 @@ struct ZeehoVehicleProvider: TimelineProvider {
     }
 
     func getSnapshot(in context: Context, completion: @escaping (ZeehoVehicleEntry) -> Void) {
+        // 图库预览不联网：只读已有快照/缓存，避免添加小组件时卡住预览面板。
         completion(ZeehoWidgetReader.read(at: Date()))
     }
 
     func getTimeline(in context: Context, completion: @escaping (Timeline<ZeehoVehicleEntry>) -> Void) {
-        let now = Date()
-        completion(Self.timeline(entry: ZeehoWidgetReader.read(at: now), now: now))
+        // 系统给的时间预算很短，这里必须先产出 result 再算 entry：
+        // 网络失败也要交出 timeline（退回快照），绝不能让 completion 永不调用
+        // —— 那会让小组件一直停在占位态，且系统不会再给它机会。
+        Task {
+            let result = await WidgetDataSource.load(at: Date())
+            let now = Date()
+            completion(Self.timeline(entry: ZeehoWidgetReader.entry(result, at: now), now: now))
+        }
     }
 
     static func timeline(entry: ZeehoVehicleEntry, now: Date) -> Timeline<ZeehoVehicleEntry> {
@@ -83,7 +98,7 @@ struct ZeehoVehicleProvider: TimelineProvider {
             if deadline > now && deadline <= refreshAfter {
                 entries.append(ZeehoVehicleEntry(date: deadline, snapshot: snapshot, requiresRefresh: true,
                     showName: entry.showName, showTime: entry.showTime, darkMode: entry.darkMode,
-                    stats: entry.stats))
+                    stats: entry.stats, statsHidden: entry.statsHidden, origin: entry.origin))
             }
         }
         // 这是刷新请求，不是系统保证；不调用 WidgetCenter 反复催更。
@@ -93,32 +108,45 @@ struct ZeehoVehicleProvider: TimelineProvider {
 
 /// 共享层的读取入口：StaticConfiguration 与 AppIntentConfiguration 共用。
 enum ZeehoWidgetReader {
+    /// 同步读（只用于图库预览）：只走快照/缓存，不联网。
     static func read(at date: Date, vehicleID: String? = nil, showName: Bool? = nil,
                      showTime: Bool? = nil) -> ZeehoVehicleEntry {
-        guard SystemSnapshotStore.isAvailable() else {
-            return ZeehoVehicleEntry(date: date, snapshot: nil, requiresRefresh: false)
-        }
+        makeEntry(snapshot: readSnapshot(at: date, vehicleID: vehicleID),
+                  origin: .snapshot, at: date, showName: showName, showTime: showTime)
+    }
+
+    /// 把取数结果组装成 entry（Provider 用）。
+    static func entry(_ result: WidgetDataSourceResult, at date: Date,
+                      showName: Bool? = nil, showTime: Bool? = nil) -> ZeehoVehicleEntry {
+        makeEntry(snapshot: result.snapshot, origin: result.origin, at: date,
+                  showName: showName, showTime: showTime)
+    }
+
+    private static func makeEntry(snapshot: SystemSnapshot?, origin: WidgetDataSourceResult.Origin,
+                                 at date: Date, showName: Bool?, showTime: Bool?) -> ZeehoVehicleEntry {
+        // 显示开关只是装饰：配置文件坏了也必须照样显示车况，不能连带吞掉快照。
+        let settings = (try? SystemSnapshotStore.currentOwner())
+            .flatMap { try? SystemSnapshotStore.widgetSettings(expectedOwner: $0) }
+        return ZeehoVehicleEntry(date: date, snapshot: snapshot, requiresRefresh: false,
+            showName: showName ?? settings?.showName ?? true,
+            showTime: showTime ?? settings?.showTime ?? true,
+            darkMode: settings?.darkMode ?? -1,
+            stats: settings?.stats ?? [], statsHidden: false, origin: origin)
+    }
+
+    private static func readSnapshot(at date: Date, vehicleID: String?) -> SystemSnapshot? {
+        guard SystemSnapshotStore.isAvailable() else { return nil }
         do {
             // 指定了具体车辆就按匿名 id 精确定位；缺快照如实为空，绝不回退当前车。
-            let snapshot: SystemSnapshot?
             if let vehicleID = vehicleID, !vehicleID.isEmpty {
-                snapshot = try SystemSnapshotStore.readVehicle(identifier: vehicleID, now: date)
-            } else {
-                // iOS 端默认只显示「主页当前选中车辆」：不读 widget-settings 里的旧选车记录。
-                // 主 App 切换车辆时会把 active-owner.json 一起换掉，这里自然跟着变。
-                snapshot = try SystemSnapshotStore.readCurrent(now: date)
+                return try SystemSnapshotStore.readVehicle(identifier: vehicleID, now: date)
             }
-            // 显示开关只是装饰：配置文件坏了也必须照样显示车况，不能连带吞掉快照。
-            let settings = (try? SystemSnapshotStore.currentOwner())
-                .flatMap { try? SystemSnapshotStore.widgetSettings(expectedOwner: $0) }
-            return ZeehoVehicleEntry(date: date, snapshot: snapshot, requiresRefresh: false,
-                showName: showName ?? settings?.showName ?? true,
-                showTime: showTime ?? settings?.showTime ?? true,
-                darkMode: settings?.darkMode ?? -1,
-                stats: settings?.stats ?? [])
+            // iOS 端默认只显示「主页当前选中车辆」：不读 widget-settings 里的旧选车记录。
+            // 主 App 切换车辆时会把 active-owner.json 一起换掉，这里自然跟着变。
+            return try SystemSnapshotStore.readCurrent(now: date)
         } catch {
             // 未声明/未获准的组、缺文件、坏 JSON、版本和 owner 不符统一 fail closed。
-            return ZeehoVehicleEntry(date: date, snapshot: nil, requiresRefresh: false)
+            return nil
         }
     }
 }
@@ -166,6 +194,11 @@ private struct SOCProgress: View {
 }
 
 /// 刷新按钮（Android w_refresh：accent 文字、widget_btn 底、14dp 圆角）。
+///
+/// 以前这里只是个 `Text` —— 长得像按钮但点不动（`ZeehoWidgetRefreshIntent` 全仓零引用）。
+/// 现在按 iOS 17 的交互式小组件规范包成 `Button(intent:)`：点击在扩展进程里真的发请求，
+/// 系统随后重建时间线。低系统没有 `Button(intent:)`，保持原样（纯装饰），
+/// 而不是塞一个点了没反应的假按钮。
 private struct RefreshPill: View {
     let text: String
     let width: CGFloat
@@ -173,6 +206,17 @@ private struct RefreshPill: View {
     let colors: WidgetPalette.Colors
 
     var body: some View {
+        if #available(iOS 17.0, *) {
+            Button(intent: ZeehoWidgetRefreshIntent()) {
+                label
+            }
+            .buttonStyle(.plain)
+        } else {
+            label
+        }
+    }
+
+    private var label: some View {
         Text(text)
             .font(.system(size: fontSize))
             .foregroundColor(colors.accent)
@@ -385,22 +429,25 @@ struct ZeehoVehicleWidgetView: View {
                 }
                 .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .leading)
 
-                // 栏 2：两格统计（上行/下行，居中）
-                VStack(spacing: 0) {
-                    Spacer(minLength: 0)
-                    if let first = fields.first {
-                        statCell(first, vehicle: v, valueFont: WidgetFont.mMidValue,
-                                 labelFont: WidgetFont.mMidLabel, color: colors, now: now)
+                // 栏 2：两格统计（上行/下行，居中）；隐藏时不占位，电量按 Android
+                // w_stats GONE 的口径自动吃满剩余宽度。
+                if !entry.statsHidden {
+                    VStack(spacing: 0) {
+                        Spacer(minLength: 0)
+                        if let first = fields.first {
+                            statCell(first, vehicle: v, valueFont: WidgetFont.mMidValue,
+                                     labelFont: WidgetFont.mMidLabel, color: colors, now: now)
+                        }
+                        if fields.count > 1 {
+                            statCell(fields[1], vehicle: v, valueFont: WidgetFont.mMidValue,
+                                     labelFont: WidgetFont.mMidLabel, color: colors, now: now)
+                                .padding(.top, 4)
+                        }
+                        Spacer(minLength: 0)
                     }
-                    if fields.count > 1 {
-                        statCell(fields[1], vehicle: v, valueFont: WidgetFont.mMidValue,
-                                 labelFont: WidgetFont.mMidLabel, color: colors, now: now)
-                            .padding(.top, 4)
-                    }
-                    Spacer(minLength: 0)
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+                    .padding(.leading, 8)
                 }
-                .frame(maxWidth: .infinity, maxHeight: .infinity)
-                .padding(.leading, 8)
 
                 // 栏 3：车模（fitCenter，占满栏高）；缺图时整栏不占位，电量与统计按 Android
                 // w_car_box GONE 的口径自动吃满剩余宽度。
@@ -512,29 +559,31 @@ struct ZeehoVehicleWidgetView: View {
             .padding(.top, 2)
 
             // stats：3 列 × 2 行（列优先：0/3、1/4、2/5）
-            HStack(alignment: .top, spacing: 0) {
-                ForEach(0..<3, id: \.self) { column in
-                    VStack(alignment: .leading, spacing: 0) {
-                        let top = column
-                        let bottom = column + 3
-                        if top < fields.count {
-                            statCell(fields[top], vehicle: v, valueFont: WidgetFont.lStatValue,
-                                     labelFont: WidgetFont.lStatLabel, unitFont: WidgetFont.lStatUnit,
-                                     color: colors, now: now, alignedLeading: true)
+            if !entry.statsHidden {
+                HStack(alignment: .top, spacing: 0) {
+                    ForEach(0..<3, id: \.self) { column in
+                        VStack(alignment: .leading, spacing: 0) {
+                            let top = column
+                            let bottom = column + 3
+                            if top < fields.count {
+                                statCell(fields[top], vehicle: v, valueFont: WidgetFont.lStatValue,
+                                         labelFont: WidgetFont.lStatLabel, unitFont: WidgetFont.lStatUnit,
+                                         color: colors, now: now, alignedLeading: true)
+                            }
+                            if bottom < fields.count {
+                                statCell(fields[bottom], vehicle: v, valueFont: WidgetFont.lStatValue,
+                                         labelFont: WidgetFont.lStatLabel, unitFont: WidgetFont.lStatUnit,
+                                         color: colors, now: now, alignedLeading: true)
+                                    .padding(.top, 4)
+                            }
                         }
-                        if bottom < fields.count {
-                            statCell(fields[bottom], vehicle: v, valueFont: WidgetFont.lStatValue,
-                                     labelFont: WidgetFont.lStatLabel, unitFont: WidgetFont.lStatUnit,
-                                     color: colors, now: now, alignedLeading: true)
-                                .padding(.top, 4)
-                        }
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .padding(.leading, column == 0 ? 0 : 6)
                     }
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                    .padding(.leading, column == 0 ? 0 : 6)
                 }
+                .frame(minHeight: 72, alignment: .top)
+                .padding(.top, 2)
             }
-            .frame(minHeight: 72, alignment: .top)
-            .padding(.top, 2)
 
             // controls：4 个车控按钮（48dp）
             controlRow(height: WidgetMetrics.buttonHeightLarge, fontSize: WidgetFont.lButton)
@@ -636,8 +685,10 @@ struct ZeehoVehicleWidgetView: View {
 
 // MARK: - 小组件定义
 
+/// 老系统（iOS 15.4~16.x）用的静态配置版：没有编辑面板，数据来源仍是
+/// 「自己拉 → 缓存 → 宿主快照」（`WidgetDataSource`），只是不能按实例改显示项。
 struct ZeehoVehicleWidget: Widget {
-    let kind = "ZeehoVehicleWidget"
+    let kind = ZeehoWidgetKind.vehicle
 
     var body: some WidgetConfiguration {
         StaticConfiguration(kind: kind, provider: ZeehoVehicleProvider()) { entry in
@@ -649,12 +700,52 @@ struct ZeehoVehicleWidget: Widget {
     }
 }
 
+/// iOS 17+ 用支持原生编辑的版本（长按小组件 →「编辑小组件」）。
+@available(iOS 17.0, *)
+struct ZeehoConfigurableVehicleWidget: Widget {
+    let kind = ZeehoWidgetKind.vehicle
+
+    var body: some WidgetConfiguration {
+        AppIntentConfiguration(kind: kind, intent: ZeehoVehicleWidgetConfiguration.self,
+                               provider: ZeehoVehicleConfigProvider()) { entry in
+            ZeehoVehicleWidgetView(entry: entry)
+        }
+        .configurationDisplayName(WidgetStrings.displayName)
+        .description(WidgetStrings.configurableDescription)
+        .supportedFamilies([.systemSmall, .systemMedium, .systemLarge])
+    }
+}
+
+// 为什么不用 `if #available` 写在 `WidgetBundle.body` 里：
+// `Widget` 与 `WidgetBundle` 的 body 都**没有** result builder，苹果也没有提供
+// `WidgetConfigurationBuilder`（SDK 里查无此类型）。带 else 的 if #available 会直接
+// 编译失败（"closure containing control flow statement cannot be used with result builder"）。
+// 唯一可行的写法是把分派提到 builder 之上：用 `static func main()` 选一条 bundle，
+// 两个 bundle 用**同一个 kind**，且同一时刻只有一个被注册（kind 必须唯一）。
 @main
-struct ZeehoWidgets: WidgetBundle {
-    // 目标系统已是 iOS 27，不再保留 iOS 17 的 AppIntentConfiguration 分支：
-    // 那套需要 AppIntents metadata 提取，而手写 swiftc 流程产不出 const-values。
-    // 统一用 StaticConfiguration，组件按 SystemWidgetSettings 的默认车辆显示；
-    // Live Activity 仍从 iOS 16.1 起条件注册。
+struct ZeehoWidgets {
+    static func main() {
+        if #available(iOS 17.0, *) {
+            ZeehoModernWidgets.main()
+        } else {
+            ZeehoLegacyWidgets.main()
+        }
+    }
+}
+
+/// iOS 17+：可编辑的车辆小组件 + Live Activity。
+@available(iOS 17.0, *)
+struct ZeehoModernWidgets: WidgetBundle {
+    var body: some Widget {
+        ZeehoConfigurableVehicleWidget()
+        if #available(iOS 16.1, *) {
+            ZeehoLiveActivityWidget()
+        }
+    }
+}
+
+/// iOS 15.4~16.x：静态配置的车辆小组件 + Live Activity。
+struct ZeehoLegacyWidgets: WidgetBundle {
     var body: some Widget {
         ZeehoVehicleWidget()
         if #available(iOS 16.1, *) {

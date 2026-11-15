@@ -61,6 +61,10 @@ final class IOSBackgroundService: NSObject, IOSBridgeService, IOSBridgeCancellab
             case "background.credential.clear":
                 try requireEmpty(args)
                 IOSBackgroundCredentialStore.remove()
+                // 小组件那份投影必须一起清：只清 Keychain 会让扩展继续用旧 token 打接口，
+                // 用户点了「清除凭据」却发现小组件还在联网，属于权限与预期双重不符。
+                WidgetCredentialStore.clear()
+                WidgetFetchCache.clear()
                 IOSBackgroundScheduler.shared.cancel(IOSBackgroundTaskID.signIn)
                 IOSBackgroundLog.write("凭据已清除，签到任务取消排队")
                 reply(statusPayload(), nil)
@@ -91,7 +95,10 @@ final class IOSBackgroundService: NSObject, IOSBridgeService, IOSBridgeCancellab
     /// 桥回执会让状态页卡 0.2 秒。授权状态由既有的 `notifications.status` 负责，
     /// 界面把两个回执拼起来即可。
     private func statusPayload() -> [String: Any] {
-        let credential = IOSBackgroundCredentialStore.load()
+        // 用 outcome() 而不是 load()：界面需要区分「从没授权」与「授权过但读不到」。
+        let outcome = IOSBackgroundCredentialStore.outcome()
+        let credential = outcome.credential
+        let issue = IOSBackgroundCredentialIssue.from(outcome)
         let signIn = IOSBackgroundScheduler.report(IOSBackgroundTaskID.signIn)
         let refresh = IOSBackgroundScheduler.report(IOSBackgroundTaskID.refresh)
         return [
@@ -105,6 +112,15 @@ final class IOSBackgroundService: NSObject, IOSBridgeService, IOSBridgeCancellab
             "chargeNotifyEnabled": IOSBackgroundPreferences.chargeNotifyEnabled,
             "taskNotifyEnabled": IOSBackgroundPreferences.taskNotifyEnabled,
             "credentialPresent": credential != nil,
+            // 凭据异常时给出可据以行动的原因码（null 表示没问题）。
+            // 只报 credentialPresent=false 会让用户分不清是没授权还是读不到。
+            "credentialIssue": issue?.rawValue ?? NSNull(),
+            "credentialIssueText": issue.map { ZeehoCredentialIssueText.text($0.rawValue) } ?? "",
+            // 授权了哪几个域：只有 app 域时签到会失败、只有 h5 域时采样会失败，
+            // 界面据此提示「请补全授权」，而不是笼统说已授权。
+            "credentialScopes": credential?.grantedScopes ?? [],
+            "credentialCanSignIn": credential?.canSignIn ?? false,
+            "credentialCanSample": credential?.canSampleVehicle ?? false,
             "credentialVIN": credential?.vin ?? "",
             "credentialAccount": credential?.accountID ?? "",
             "credentialUpdatedAt": credential?.updatedAt ?? 0,
@@ -136,6 +152,20 @@ final class IOSBackgroundService: NSObject, IOSBridgeService, IOSBridgeCancellab
 
     // MARK: - 授权凭据
 
+    /// 把小组件取数需要的最小凭据投影进 App Group。
+    ///
+    /// 静默失败（App Group 未授权时容器为空），**绝不因此让后台授权失败**：
+    /// 小组件自己拉是增强路径，拿不到就退回原来的「读宿主快照」。
+    static func mirrorWidgetCredential(accountID: String, vin: String, token: String,
+                                       appID: String, appSecret: String) {
+        guard SystemSnapshotStore.isAvailable(),
+              let owner = IOSSystemSurfacesService.widgetOwner(accountID: accountID, vin: vin) else { return }
+        let value = WidgetCredential(ownerID: owner.ownerIdentifierString, vin: vin, token: token,
+                                     appID: appID, appSecret: appSecret,
+                                     updatedAt: Int64(Date().timeIntervalSince1970 * 1000))
+        _ = WidgetCredentialStore.save(value)
+    }
+
     private func grant(_ args: [Any], reply: @escaping Reply) throws {
         guard args.count == 1, let value = args[0] as? [String: Any] else { throw BackgroundArgumentError("invalid_args") }
         let allowed: Set<String> = ["accountId", "vin", "token", "signinToken", "appId", "appSecret",
@@ -143,17 +173,25 @@ final class IOSBackgroundService: NSObject, IOSBridgeService, IOSBridgeCancellab
         guard Set(value.keys).isSubset(of: allowed) else { throw BackgroundArgumentError("invalid_args") }
         let accountID = try text(value["accountId"], limit: 128)
         let vin = try text(value["vin"], limit: 128)
-        let token = try text(value["token"], limit: 4096)
+        let token = try optionalText(value["token"], limit: 4096) ?? ""
         let signinToken = try optionalText(value["signinToken"], limit: 4096) ?? ""
-        let appID = try text(value["appId"], limit: 128)
-        let appSecret = try text(value["appSecret"], limit: 512)
-        let h5AppID = try text(value["h5AppId"], limit: 128)
-        let h5Secret = try text(value["h5Secret"], limit: 512)
+        // **每个域独立可选**：面板某一版本只导出 app 域密钥（或只有 h5 域）时，
+        // 旧实现用 `try text(...)` 强取会让整个授权直接失败，用户只会看到
+        // 「当前面板版本不支持后台授权」这种含糊结果。缺失的域按空串存，
+        // 由 canSampleVehicle / canSignIn 分别判定，缺哪半就只影响那半的功能。
+        let appID = try optionalText(value["appId"], limit: 128) ?? ""
+        let appSecret = try optionalText(value["appSecret"], limit: 512) ?? ""
+        let h5AppID = try optionalText(value["h5AppId"], limit: 128) ?? ""
+        let h5Secret = try optionalText(value["h5Secret"], limit: 512) ?? ""
         var credential = IOSBackgroundCredential(
             accountID: accountID, vin: vin, token: token, signinToken: signinToken,
             appSecret: appSecret, h5Secret: h5Secret, appID: appID, h5AppID: h5AppID,
             updatedAt: Int64(Date().timeIntervalSince1970 * 1000))
-        guard credential.isValid else { throw BackgroundArgumentError("invalid_args") }
+        // 至少要有一个域可用才值得存；两个都不行说明调用方传错了。
+        guard credential.isValid else { throw BackgroundArgumentError("credential_incomplete") }
+        // 只导入一半时明确回给调用方，界面可以立刻提示「签到仍不可用」，
+        // 而不是等用户下次跑快捷指令才发现。
+        let scopes = credential.grantedScopes
 
         // 长期凭据必须二次确认：网页可能被注入脚本，不能让它在启动时静默写入。
         confirm(title: "启用后台自动任务",
@@ -172,9 +210,20 @@ final class IOSBackgroundService: NSObject, IOSBridgeService, IOSBridgeCancellab
             let auto = (value["autoSignIn"] as? Bool) ?? IOSBackgroundPreferences.autoSignInEnabled
             IOSBackgroundPreferences.autoSignInEnabled = auto
             IOSBackgroundScheduler.shared.scheduleAll()
-            IOSBackgroundLog.write("后台凭据已保存 vin=\(vin) autoSignIn=\(auto)")
+            // 顺手把一份**最小投影**放进 App Group，让桌面小组件能自己拉车况
+            // （官方 ZHWidgetExtension 的做法：扩展自带网络层，不依赖宿主存活）。
+            // 两份凭据语义不同：Keychain 那份给后台任务用（长期、可被系统定时唤醒）；
+            // App Group 这份只给小组件展示用（随前台会话刷新，清除时一起删）。
+            // 必须在 credential.clear() 之前调用。
+            Self.mirrorWidgetCredential(accountID: accountID, vin: vin, token: token,
+                                        appID: appID, appSecret: appSecret)
+            IOSBackgroundLog.write("后台凭据已保存 vin=\(vin) autoSignIn=\(auto) scopes=\(scopes.joined(separator: "+"))")
             credential.clear()
-            reply(self.statusPayload(), nil)
+            var payload = self.statusPayload()
+            // partial=true 时界面应立刻提示补全；两个域都齐才是完整授权。
+            payload["grantedScopes"] = scopes
+            payload["partial"] = scopes.count < 2
+            reply(payload, nil)
         }
     }
 
