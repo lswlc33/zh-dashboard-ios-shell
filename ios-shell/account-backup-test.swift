@@ -161,9 +161,15 @@ enum AccountBackupTest {
         _ = try AccountBackup.preview(Array(many.prefix(18)), snapshot: summary)
 
         // ---- 恢复计划 ----
+        // 生成器必须每次返回不同 id：同一份计划里可能有多个新增账号，
+        // 固定值会撞车（早期版本正是这样死循环卡住了 CI）。
+        func ids(_ prefix: String) -> () -> String {
+            var n = 0
+            return { n += 1; return "\(prefix)\(n)" }
+        }
         // KEEP：冲突账号保留本地凭据，其它新增照常写入
         let keepPlan = try AccountBackup.plan(mixed, policy: .keepExisting, snapshot: summary,
-                                              now: 1_700_000_000_000, newAccountID: { "a_new" })
+                                              now: 1_700_000_000_000, newAccountID: ids("a_new"))
         let keptPool = try AccountBackup.parsePool(keepPlan.puts[AccountBackup.poolKey] ?? "")
         expect(keptPool.accounts.count == 3, "KEEP 也要把新账号加进去")
         let keptU2 = keptPool.accounts.first { (try? AccountBackup.rowUserID($0)) == "10023" }
@@ -173,7 +179,7 @@ enum AccountBackupTest {
 
         // REPLACE：冲突账号换成备份凭据，并抬 credentialRev
         let replacePlan = try AccountBackup.plan(mixed, policy: .replaceExisting, snapshot: summary,
-                                                 now: 1_700_000_000_000, newAccountID: { "a_new" })
+                                                 now: 1_700_000_000_000, newAccountID: ids("a_new"))
         let replacedPool = try AccountBackup.parsePool(replacePlan.puts[AccountBackup.poolKey] ?? "")
         let replacedU2 = replacedPool.accounts.first { (try? AccountBackup.rowUserID($0)) == "10023" }
         expect(replacedU2?["token"] as? String == "t2-new", "REPLACE 要写入备份凭据")
@@ -195,9 +201,9 @@ enum AccountBackupTest {
 
         // 空池恢复：active 指向第一个新账号，legacyClosed 保持不写
         let emptyPlan = try AccountBackup.plan(fresh, policy: nil, snapshot: empty,
-                                               now: 1_700_000_000_000, newAccountID: { "a_first" })
+                                               now: 1_700_000_000_000, newAccountID: ids("a_first"))
         let emptyPool = try AccountBackup.parsePool(emptyPlan.puts[AccountBackup.poolKey] ?? "")
-        expect(emptyPool.active == "a_first", "空池恢复后 current 应指向第一个账号")
+        expect(emptyPool.active == "a_first1", "空池恢复后 current 应指向第一个账号")
         expect(emptyPlan.puts[AccountBackup.clearedKey] == nil, "legacyClosed 为假时不能凭空写 cleared")
         expect(emptyPlan.puts[AccountBackup.tokenKey] == "n1", "空池恢复后镜像应指向 current")
 
@@ -206,7 +212,7 @@ enum AccountBackupTest {
         let closed = AccountBackup.snapshot(values: [AccountBackup.poolKey: closedRaw], revision: 4, readError: nil)
         let closedPreview = try AccountBackup.preview([AccountBackup.Entry(token: "n", userid: "nu")], snapshot: closed)
         let closedPlan = try AccountBackup.plan(closedPreview, policy: nil, snapshot: closed,
-                                                now: 1, newAccountID: { "a_c" })
+                                                now: 1, newAccountID: ids("a_c"))
         expect(closedPlan.puts[AccountBackup.clearedKey] == "1", "legacyClosed 的文档要保留 cleared 标记")
         let closedPool = try AccountBackup.parsePool(closedPlan.puts[AccountBackup.poolKey] ?? "")
         expect(closedPool.object["legacyClosed"] as? Bool == true, "legacyClosed 字段本身不能丢")
@@ -217,6 +223,15 @@ enum AccountBackupTest {
         let fullPool = makePool(accounts: (0..<3).map { ("a\($0)", "p\($0)", "pu\($0)") }, active: "a0", rev: 1)
         let full = AccountBackup.snapshot(values: [AccountBackup.poolKey: fullPool], revision: 2, readError: nil)
         rejects("恢复后超过上限") { try AccountBackup.preview(nineteen, snapshot: full) }
+
+        // 注入固定 id 的生成器也必须能终止：早期版本用无界 while 等新 id，
+        // 生成器一直返回同一个已用值时直接死循环（CI 上真卡住过）。
+        // 这里用「永远返回 a_1」的生成器恢复两个账号，要求它自己退回随机 id 完成。
+        let stuckPlan = try AccountBackup.plan(fresh, policy: nil, snapshot: empty,
+                                               now: 1, newAccountID: { "a_1" })
+        let stuckPool = try AccountBackup.parsePool(stuckPlan.puts[AccountBackup.poolKey] ?? "")
+        expect(stuckPool.accounts.count == 2, "固定 id 生成器下仍要写完两个账号")
+        expect(Set(stuckPool.accounts.compactMap { $0["id"] as? String }).count == 2, "生成的 id 必须互不相同")
     }
 
     /// 拼一份合法的账号池 JSON，省得每处都手写。

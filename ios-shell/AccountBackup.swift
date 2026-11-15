@@ -381,9 +381,16 @@ enum AccountBackup {
                     rows[index] = row
                 }
             } else {
+                // 生成一个未被占用的 id。注入的生成器如果一直返回同一个已用 id
+                // （单测里就传过固定值），无界 while 会死循环——CI 上实测卡在这个位置。
+                // 所以只让注入生成器试有限次，之后退回真随机 UUID，保证一定终止。
                 var id = newAccountID()
-                // UUID 撞车概率极低，但撞了就会写出一份被 parsePool 判损坏的存档。
-                while usedIDs.contains(id) { id = newAccountID() }
+                var attempts = 0
+                while usedIDs.contains(id), attempts < 8 {
+                    id = newAccountID()
+                    attempts += 1
+                }
+                while usedIDs.contains(id) { id = "a_" + UUID().uuidString.replacingOccurrences(of: "-", with: "") }
                 usedIDs.insert(id)
                 rows.append(newAccountRow(entry, id: id, now: now))
             }
