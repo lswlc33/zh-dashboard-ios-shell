@@ -34,6 +34,10 @@ enum IOSBackgroundTaskID {
     static let refresh = "io.github.lswlc33.dashboard.ios.refresh"
     /// 每日自动签到。
     static let signIn = "io.github.lswlc33.dashboard.ios.signin"
+    /// 每日任务（发帖/点赞/分享）。与签到分开一个 identifier，因为：
+    /// 两者的用户开关、凭据要求（任务还要内部 uid）、失败后果都不一样；
+    /// 合成一条的话「只签到不跑任务」的用户就没法选了。
+    static let dailyTasks = "io.github.lswlc33.dashboard.ios.tasks"
     /// 处理型任务（可跑几分钟，但只在设备空闲时）。留给以后的大批量回填，
     /// 现在不注册也不提交，避免占掉 10 个 processing 槽位。
 }
@@ -53,9 +57,45 @@ struct IOSBackgroundTaskReport: Codable, Equatable, Sendable {
     var lastCharging: Bool?
     /// 上次签到成功的连签天数。
     var lastSignInDays: Int?
+    /// 每日任务：今日已完成项数（含签到）。只有 dailyTasks 任务会写。
+    var lastDailyDone: Int?
+    /// 每日任务：今日可执行项总数（签到 + 发帖/点赞/分享）。
+    var lastDailyTotal: Int?
+    /// 每日任务：上次逐项结果的极简描述，例如「签到、点赞、分享｜发帖失败」。
+    /// 只放**已完成项的名字**，不放失败原因以外的任何内容。
+    var lastDailySummary: String?
     /// 累计成功次数，用来在界面上证明「确实跑过」。
     var runCount: Int
     var successCount: Int
+
+    /// 缺键兼容：App Group 里已经躺着老版本写下的报告（没有 lastDaily* 三个字段）。
+    /// 合成 Codable 遇到缺键会整份解码失败 → `report()` 回落到「从未运行」，
+    /// 用户会看到明明跑过的任务显示「从未运行」。所以这里统一按缺键=空值解码。
+    init(from decoder: Decoder) throws {
+        let box = try decoder.container(keyedBy: CodingKeys.self)
+        lastRunAt = try? box.decodeIfPresent(Int64.self, forKey: .lastRunAt)
+        lastResult = (try? box.decodeIfPresent(String.self, forKey: .lastResult)) ?? "never"
+        lastSocPercent = try? box.decodeIfPresent(Double.self, forKey: .lastSocPercent)
+        lastCharging = try? box.decodeIfPresent(Bool.self, forKey: .lastCharging)
+        lastSignInDays = try? box.decodeIfPresent(Int.self, forKey: .lastSignInDays)
+        lastDailyDone = try? box.decodeIfPresent(Int.self, forKey: .lastDailyDone)
+        lastDailyTotal = try? box.decodeIfPresent(Int.self, forKey: .lastDailyTotal)
+        lastDailySummary = try? box.decodeIfPresent(String.self, forKey: .lastDailySummary)
+        runCount = (try? box.decodeIfPresent(Int.self, forKey: .runCount)) ?? 0
+        successCount = (try? box.decodeIfPresent(Int.self, forKey: .successCount)) ?? 0
+    }
+
+    init(lastRunAt: Int64? = nil, lastResult: String, lastSocPercent: Double? = nil,
+         lastCharging: Bool? = nil, lastSignInDays: Int? = nil, lastDailyDone: Int? = nil,
+         lastDailyTotal: Int? = nil, lastDailySummary: String? = nil,
+         runCount: Int, successCount: Int) {
+        self.lastRunAt = lastRunAt; self.lastResult = lastResult
+        self.lastSocPercent = lastSocPercent; self.lastCharging = lastCharging
+        self.lastSignInDays = lastSignInDays
+        self.lastDailyDone = lastDailyDone; self.lastDailyTotal = lastDailyTotal
+        self.lastDailySummary = lastDailySummary
+        self.runCount = runCount; self.successCount = successCount
+    }
 }
 
 /// 后台任务调度器。
@@ -79,7 +119,8 @@ final class IOSBackgroundScheduler {
 
     /// 在 AppDelegate.didFinishLaunching 调用一次。重复调用安全。
     func register(refresh: @escaping (@escaping (Bool) -> Void) -> Void,
-                  signIn: @escaping (@escaping (Bool) -> Void) -> Void) {
+                  signIn: @escaping (@escaping (Bool) -> Void) -> Void,
+                  dailyTasks: (@escaping (@escaping (Bool) -> Void) -> Void)? = nil) {
         guard !registered else { return }
         registered = true
         handlers[IOSBackgroundTaskID.refresh] = { task in
@@ -89,6 +130,14 @@ final class IOSBackgroundScheduler {
         handlers[IOSBackgroundTaskID.signIn] = { task in
             guard let task = task as? BGAppRefreshTask else { return }
             Self.run(task: task, name: IOSBackgroundTaskID.signIn, reportKind: .signIn, body: signIn)
+        }
+        // dailyTasks 是**可选**的：老调用点（不传这个参数）仍然只注册两个任务，
+        // 不会因为 Info.plist 里还没加 identifier 就在启动时报错。
+        if let dailyTasks = dailyTasks {
+            handlers[IOSBackgroundTaskID.dailyTasks] = { task in
+                guard let task = task as? BGAppRefreshTask else { return }
+                Self.run(task: task, name: IOSBackgroundTaskID.dailyTasks, reportKind: .dailyTasks, body: dailyTasks)
+            }
         }
         for (identifier, handler) in handlers {
             // register 失败只可能是 Info.plist 缺 identifier 或已被别的 App 注册；
@@ -104,7 +153,7 @@ final class IOSBackgroundScheduler {
         }
     }
 
-    private enum ReportKind { case refresh, signIn }
+    private enum ReportKind { case refresh, signIn, dailyTasks }
 
     private static func run(task: BGAppRefreshTask, name: String, reportKind: ReportKind,
                             body: @escaping (@escaping (Bool) -> Void) -> Void) {
@@ -142,10 +191,11 @@ final class IOSBackgroundScheduler {
         }
     }
 
-    /// 提交两个任务（App 启动完成、以及用户开启相应功能时调用）。
+    /// 提交全部任务（App 启动完成、以及用户开启相应功能时调用）。
     func scheduleAll() {
         reschedule(IOSBackgroundTaskID.refresh)
         reschedule(IOSBackgroundTaskID.signIn)
+        reschedule(IOSBackgroundTaskID.dailyTasks)
     }
 
     /// 取消某个任务的排队。用户关掉自动签到时要调用，否则后台还会继续跑。
@@ -159,8 +209,7 @@ final class IOSBackgroundScheduler {
     static func report(_ identifier: String) -> IOSBackgroundTaskReport {
         guard let data = SystemSnapshotStore.readBackgroundReport(identifier),
               let value = try? JSONDecoder().decode(IOSBackgroundTaskReport.self, from: data) else {
-            return IOSBackgroundTaskReport(lastRunAt: nil, lastResult: "never", lastSocPercent: nil,
-                                           lastCharging: nil, lastSignInDays: nil, runCount: 0, successCount: 0)
+            return IOSBackgroundTaskReport(lastResult: "never", runCount: 0, successCount: 0)
         }
         return value
     }
@@ -179,9 +228,12 @@ final class IOSBackgroundScheduler {
     }
 
     private func isEnabled(_ identifier: String) -> Bool {
-        // 签到任务受用户开关控制；refresh 默认开（只做采样与通知，不改任何云端状态）。
+        // 签到与每日任务都受各自开关控制；refresh 默认开（只做采样与通知，不改任何云端状态）。
         if identifier == IOSBackgroundTaskID.signIn {
             return IOSBackgroundPreferences.autoSignInEnabled
+        }
+        if identifier == IOSBackgroundTaskID.dailyTasks {
+            return IOSBackgroundPreferences.autoDailyTasksEnabled
         }
         return true
     }
@@ -191,12 +243,22 @@ final class IOSBackgroundScheduler {
 /// 这是用户在本 App 里的选择，扩展不需要知道）。
 enum IOSBackgroundPreferences {
     private static let autoSignInKey = "io.github.lswlc33.dashboard.ios.bg.autoSignIn"
+    private static let autoDailyTasksKey = "io.github.lswlc33.dashboard.ios.bg.autoDailyTasks"
     private static let chargeNotifyKey = "io.github.lswlc33.dashboard.ios.bg.chargeNotify"
     private static let taskNotifyKey = "io.github.lswlc33.dashboard.ios.bg.taskNotify"
 
     static var autoSignInEnabled: Bool {
         get { UserDefaults.standard.bool(forKey: autoSignInKey) }
         set { UserDefaults.standard.set(newValue, forKey: autoSignInKey) }
+    }
+    /// 后台自动跑每日任务（发帖/点赞/分享）。
+    ///
+    /// 默认关：这些是**写操作**（会真的发一条动态到广场），不能因为用户授权了凭据
+    /// 就默认替他发内容。想要的话由用户显式打开，或直接用快捷指令主动触发
+    /// （主动触发走 force 路径，不看这个开关）。
+    static var autoDailyTasksEnabled: Bool {
+        get { UserDefaults.standard.bool(forKey: autoDailyTasksKey) }
+        set { UserDefaults.standard.set(newValue, forKey: autoDailyTasksKey) }
     }
     /// 充电开始/结束提醒。默认关：需要能后台拿到车况，做不到时不该给用户假承诺。
     static var chargeNotifyEnabled: Bool {

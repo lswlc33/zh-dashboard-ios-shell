@@ -24,14 +24,25 @@ import UIKit
 enum IOSBackgroundIntentAction: String, AppEnum {
     case signIn = "signin"
     case sample = "sample"
+    case tasks = "tasks"
     case both = "both"
+    case all = "all"
 
     static var typeDisplayRepresentation = TypeDisplayRepresentation(name: "后台任务")
     static var caseDisplayRepresentations: [IOSBackgroundIntentAction: DisplayRepresentation] = [
         .signIn: DisplayRepresentation(title: "自动签到"),
         .sample: DisplayRepresentation(title: "补采车况与电量"),
+        .tasks: DisplayRepresentation(title: "每日任务（发帖/点赞/分享）"),
         .both: DisplayRepresentation(title: "签到 + 采样"),
+        .all: DisplayRepresentation(title: "全部（签到 + 任务 + 采样）"),
     ]
+
+    /// 是否要跑签到。
+    var wantsSignIn: Bool { self == .signIn || self == .both || self == .all }
+    /// 是否要跑车况采样。
+    var wantsSample: Bool { self == .sample || self == .both || self == .all }
+    /// 是否要跑每日任务（发帖/点赞/分享）。
+    var wantsDailyTasks: Bool { self == .tasks || self == .all }
 }
 
 /// 在快捷指令/自动化里执行一次后台任务。
@@ -58,10 +69,54 @@ struct ZeehoRunBackgroundTaskIntent: AppIntent {
     init(action: IOSBackgroundIntentAction) { self.action = action }
 
     func perform() async throws -> some IntentResult & ProvidesDialog {
-        let wantsSignIn = action == .signIn || action == .both
-        let wantsSample = action == .sample || action == .both
         var parts: [String] = []
-        if wantsSample {
+        // 签到先跑：每日任务的进度里要把签到算成一项（N/M 的 M 含签到），
+        // 而且签到更快，先拿下它，万一步骤超预算也不会连签到都做不完。
+        var signInDone = false
+        if action.wantsSignIn {
+            // 这里**故意不看**设置里的自动签到开关：快捷指令 / 个人自动化是用户主动触发的一次
+            // 执行，不是系统在后台定时自动跑。那个开关的语义只是「允许系统自己定时签到」，
+            // 拿它挡住用户手动触发，就会出现「我明明点了签到，却只回一句自动签到未开启」。
+            // 系统定时路径（BGAppRefreshTask -> IOSBackgroundRunner.runSignIn 默认参数）仍然
+            // 尊重该开关，两条路径的区分写在 runSignIn 的注释里。
+            //
+            // 回执必须在 completion 回调里读：runSignIn 是异步的，请求发出后才会记账，
+            // 在 await 之前读到的还是上一条旧记录。
+            let report = await withCheckedContinuation { continuation in
+                IOSBackgroundRunner.runSignIn(force: true) { _ in
+                    continuation.resume(returning: IOSBackgroundScheduler.report(IOSBackgroundTaskID.signIn))
+                }
+            }
+            let daysPart = report.lastSignInDays.map { "（连签 \($0) 天）" } ?? ""
+            switch report.lastResult {
+            case "already_signed", "signed":
+                signInDone = true
+                parts.append((report.lastResult == "already_signed" ? "今日已签到" : "签到成功") + daysPart)
+            case _ where ZeehoCredentialIssueText.isCredentialIssue(report.lastResult):
+                // runSignIn 在缺凭据时回 completion(true)，那是给系统调度评分用的
+                // （缺凭据不是运行失败，不该扣分）；对用户来说这次确实没签上，不能报成功。
+                parts.append("签到失败（" + ZeehoCredentialIssueText.text(report.lastResult) + "）")
+            default:
+                parts.append("签到失败（\(report.lastResult)）")
+            }
+        }
+        if action.wantsDailyTasks {
+            // 预算分配：签到已经吃掉一部分时间，任务这边按剩余量给（最少 8s，最多 25s）。
+            // 两个都跑时压缩到 20s，避免加起来越过 AppIntent 的 30 秒硬上限。
+            let budget: TimeInterval = action.wantsSignIn ? 20 : 25
+            let report = await withCheckedContinuation { continuation in
+                IOSBackgroundRunner.runDailyTasks(force: true, signInDone: signInDone, budget: budget) {
+                    continuation.resume(returning: $0)
+                }
+            }
+            // 进度文案：这是用户主动触发时唯一能立刻看到结果的地方，必须写全 N/M。
+            parts.append(IOSBackgroundRunner.summary(report))
+            if !report.completed.isEmpty { parts.append("完成 " + report.completed.joined(separator: "、")) }
+            // 失败项带上原因码，用户在快捷指令里就能看出是网络还是凭据问题。
+            for item in report.failed { parts.append("\(item.name)失败（\(item.reason)）") }
+            if report.result == "credential_partial" { parts.append("请在面板里重新授权后台任务以补全账号 id") }
+        }
+        if action.wantsSample {
             // 与签到同样的道理：runRefresh 的布尔是「运行是否正常走完」，不是「取数是否成功」，
             // 网络失败与缺凭据都回 true（那是给系统调度评分用的，不是给用户看的结论）。
             // 所以成败一律按 completion 回调里读到的 lastResult 判定，`ok` 才算真取到；
@@ -81,34 +136,8 @@ struct ZeehoRunBackgroundTaskIntent: AppIntent {
             default:
                 parts.append("车况采样失败（\(report.lastResult)）")
             }
-            // 采样失败只记账、不提前 return：both 动作里签到是独立的另一件事，
-            // 不能因为取车况失败就把用户的签到也一起放弃。两条结果用「；」拼接。
-        }
-        if wantsSignIn {
-            // 这里**故意不看**设置里的自动签到开关：快捷指令 / 个人自动化是用户主动触发的一次
-            // 执行，不是系统在后台定时自动跑。那个开关的语义只是「允许系统自己定时签到」，
-            // 拿它挡住用户手动触发，就会出现「我明明点了签到，却只回一句自动签到未开启」。
-            // 系统定时路径（BGAppRefreshTask -> IOSBackgroundRunner.runSignIn 默认参数）仍然
-            // 尊重该开关，两条路径的区分写在 runSignIn 的注释里。
-            //
-            // 回执必须在 completion 回调里读：runSignIn 是异步的，请求发出后才会记账，
-            // 在 await 之前读到的还是上一条旧记录。
-            let report = await withCheckedContinuation { continuation in
-                IOSBackgroundRunner.runSignIn(force: true) { _ in
-                    continuation.resume(returning: IOSBackgroundScheduler.report(IOSBackgroundTaskID.signIn))
-                }
-            }
-            let daysPart = report.lastSignInDays.map { "（连签 \($0) 天）" } ?? ""
-            switch report.lastResult {
-            case "already_signed", "signed":
-                parts.append((report.lastResult == "already_signed" ? "今日已签到" : "签到成功") + daysPart)
-            case _ where ZeehoCredentialIssueText.isCredentialIssue(report.lastResult):
-                // runSignIn 在缺凭据时回 completion(true)，那是给系统调度评分用的
-                // （缺凭据不是运行失败，不该扣分）；对用户来说这次确实没签上，不能报成功。
-                parts.append("签到失败（" + ZeehoCredentialIssueText.text(report.lastResult) + "）")
-            default:
-                parts.append("签到失败（\(report.lastResult)）")
-            }
+            // 采样失败只记账、不提前 return：签到与任务是独立的另外两件事，
+            // 不能因为取车况失败就把它们也一起放弃。用「；」拼接。
         }
         return .result(dialog: IntentDialog(stringLiteral: parts.isEmpty ? "没有要执行的动作" : parts.joined(separator: "；")))
     }
@@ -145,10 +174,21 @@ struct ZeehoOpenPanelIntent: AppIntent {
 struct ZeehoAppShortcuts: AppShortcutsProvider {
     static var appShortcuts: [AppShortcut] {
         AppShortcut(
-            intent: ZeehoRunBackgroundTaskIntent(action: .both),
-            phrases: ["用 \(.applicationName) 签到", "让 \(.applicationName) 补采车况"],
-            shortTitle: "后台任务",
+            intent: ZeehoRunBackgroundTaskIntent(action: .all),
+            phrases: ["用 \(.applicationName) 跑每日任务", "用 \(.applicationName) 签到和做任务",
+                      "让 \(.applicationName) 完成今天全部任务"],
+            shortTitle: "每日任务",
+            systemImageName: "checklist")
+        AppShortcut(
+            intent: ZeehoRunBackgroundTaskIntent(action: .signIn),
+            phrases: ["用 \(.applicationName) 签到"],
+            shortTitle: "自动签到",
             systemImageName: "bolt.badge.clock")
+        AppShortcut(
+            intent: ZeehoRunBackgroundTaskIntent(action: .sample),
+            phrases: ["让 \(.applicationName) 补采车况"],
+            shortTitle: "补采车况",
+            systemImageName: "gauge")
         AppShortcut(
             intent: ZeehoBackgroundStatusIntent(),
             phrases: ["用 \(.applicationName) 查后台任务", "问 \(.applicationName) 自动签到生效了吗"],

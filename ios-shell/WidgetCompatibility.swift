@@ -53,10 +53,14 @@ final class IOSWidgetCompatibilityService: IOSBridgeService, IOSBridgeCancellabl
                     guard var value = value as? [String: Any], value["ok"] as? Bool == true else { reply(value, error); return }
                     let live = value["liveActivities"] as? [String: Any] ?? [:]
                     // 不谎报本地通知各组已配置；只有 charge_progress 映射当前 charging Live Activity。
+                    // `task` 是「每日任务结算」那一组：iOS 侧确实会发（见 IOSBackgroundRunner.runDailyTasks
+                    // 的完成通知），所以它是本 App 的本地通知而不是系统服务 —— supported=true、
+                    // systemService=unavailable（系统没有对应通道可映射，不能谎称有）。
                     value["allowed"] = live["authorizationEnabled"] as? Bool == true
-                    value["groups"] = ["service", "message", "charge_start", "charge_progress", "charge_full", "charge_stop"].map {
+                    value["groups"] = ["service", "message", "task", "charge_start", "charge_progress", "charge_full", "charge_stop"].map {
                         ["id": $0, "on": $0 == "charge_progress" && live["running"] as? Bool == true && live["kind"] as? String == "charging",
-                         "supported": $0 == "charge_progress", "systemService": $0 == "charge_progress" ? "ActivityKit" : "unavailable"] as [String: Any]
+                         "supported": $0 == "charge_progress" || $0 == "task",
+                         "systemService": $0 == "charge_progress" ? "ActivityKit" : "unavailable"] as [String: Any]
                     }
                     reply(value, error)
                 }

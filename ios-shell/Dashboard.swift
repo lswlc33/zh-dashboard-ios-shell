@@ -27,7 +27,12 @@ final class AppDelegate: UIResponder, UIApplicationDelegate {
         if #available(iOS 13.0, *) {
             IOSBackgroundScheduler.shared.register(
                 refresh: { completion in IOSBackgroundRunner.runRefresh(completion: completion) },
-                signIn: { completion in IOSBackgroundRunner.runSignIn(completion: completion) })
+                signIn: { completion in IOSBackgroundRunner.runSignIn(completion: completion) },
+                // 每日任务（发帖/点赞/分享）：只在用户开了「自动执行」或快捷指令主动触发时才跑，
+                // isEnabled 会挡住未开启的情况，不会偷偷往广场发动态。
+                dailyTasks: { completion in
+                    IOSBackgroundRunner.runDailyTasks { _ in completion(true) }
+                })
             // 这里只重排一次，让「上次卸载/关机导致队列清空」的情况能自己恢复。
             // 用户关掉自动签到时 signIn 会被 isEnabled 挡掉，不会偷偷跑。
             IOSBackgroundScheduler.shared.scheduleAll()

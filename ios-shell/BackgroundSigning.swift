@@ -42,11 +42,19 @@ struct IOSBackgroundCredential: Codable, Equatable, Sendable {
     var appID: String
     /// h5 域 appId（与网页 tasks.js 的 H5_APP_ID 同一个值）。
     var h5AppID: String
+    /// 云端**内部用户 id**（17 位数字），积分任务列表与「我的动态」都只认它。
+    ///
+    /// 与 `accountID` 不是一回事：`accountID` 是账号池里的稳定标识（可能为空串、
+    /// 也可能是用户自填的昵称），而 `integral/getByUserId` 必须传这个内部 id，
+    /// 传错服务端不报错、只回空列表（见 docs/开发笔记.md:1812）。
+    /// 老凭据没有这个字段时按空串解码，`canRunDailyTasks` 会因此为 false，
+    /// 界面提示「重新授权」——绝不猜一个 uid 去发请求。
+    var uid: String
     var updatedAt: Int64
 
     /// 向后兼容解码：老版本存进 Keychain 的 JSON 可能**缺字段**（例如还没有
-    /// `signinToken`/`h5Secret`/`h5AppID` 的年代）。合成 `Codable` 遇到缺键会整体
-    /// 解码失败 → `load()` 返回 nil → 用户看到 `no_credential`，但实际上他授权过。
+    /// `signinToken`/`h5Secret`/`h5AppID` 的年代，以及还没有 `uid` 的现在）。合成 `Codable`
+    /// 遇到缺键会整体解码失败 → `load()` 返回 nil → 用户看到 `no_credential`，但实际上他授权过。
     /// 这正是「快捷指令一直提示未导入后台凭据」的一个真实成因。
     ///
     /// 所以每个字段都按「缺键 = 空串」解码，再由 `isValid` 按域分别判定够不够用。
@@ -65,14 +73,17 @@ struct IOSBackgroundCredential: Codable, Equatable, Sendable {
         h5Secret = text(.h5Secret)
         appID = text(.appID)
         h5AppID = text(.h5AppID)
+        uid = text(.uid)
         updatedAt = (try? box.decodeIfPresent(Int64.self, forKey: .updatedAt)) ?? 0
     }
 
     init(accountID: String, vin: String, token: String, signinToken: String,
-         appSecret: String, h5Secret: String, appID: String, h5AppID: String, updatedAt: Int64) {
+         appSecret: String, h5Secret: String, appID: String, h5AppID: String,
+         uid: String = "", updatedAt: Int64) {
         self.accountID = accountID; self.vin = vin; self.token = token; self.signinToken = signinToken
         self.appSecret = appSecret; self.h5Secret = h5Secret
-        self.appID = appID; self.h5AppID = h5AppID; self.updatedAt = updatedAt
+        self.appID = appID; self.h5AppID = h5AppID; self.uid = uid
+        self.updatedAt = updatedAt
     }
 
     /// 单字段合法性：非空、不超长、无控制字符。
@@ -95,6 +106,16 @@ struct IOSBackgroundCredential: Codable, Equatable, Sendable {
         Self.ok(vin) && (!signinToken.isEmpty || !token.isEmpty) && Self.ok(h5Secret) && Self.ok(h5AppID)
     }
 
+    /// 跑每日任务要 app 域凭据 + 内部 uid。
+    ///
+    /// uid 是硬门槛：任务列表 `/integral/getByUserId?userId=`、「我的动态」
+    /// `/community/mineArticleInfo?userId=` 都只认 17 位内部 id，传错服务端会安静地
+    /// 回一个空列表（不报错），于是「任务读到了 0 项」看起来像「今天全做完了」。
+    /// 所以缺 uid 时明确判不可跑，让界面提示重新授权，绝不猜一个 uid 发请求。
+    var canRunDailyTasks: Bool {
+        canSampleVehicle && Self.ok(uid)
+    }
+
     /// 两个域至少有一样能用。全废的凭据视为无效，`load()` 会当作没有。
     var isValid: Bool { canSampleVehicle || canSignIn }
 
@@ -103,6 +124,7 @@ struct IOSBackgroundCredential: Codable, Equatable, Sendable {
         var scopes: [String] = []
         if canSampleVehicle { scopes.append("app") }
         if canSignIn { scopes.append("h5") }
+        if canRunDailyTasks { scopes.append("tasks") }
         return scopes
     }
 

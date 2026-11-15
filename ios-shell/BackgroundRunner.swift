@@ -155,6 +155,92 @@ enum IOSBackgroundRunner {
         }
     }
 
+    /// 每日任务：签到之外的 4 项里可自动完成的 3 项（发帖/点赞/分享）。
+    ///
+    /// ## 与签到分开的原因
+    ///
+    /// 签到是 h5 域、只写一个签到状态；每日任务是 app 域、会**发一条真实动态到广场**。
+    /// 两者凭据不同（任务还要内部 uid）、后果不同（发帖是写操作），合成一条会让
+    /// 「只想签到」的用户被迫承担发帖风险。
+    ///
+    /// ## 30 秒预算
+    ///
+    /// AppIntent 在后台执行时（快捷指令手动/自动化触发都是）只有约 30 秒
+    /// （Apple 文档 LongRunningIntent / IntentCancellationReason.timeout，WWDC26 逐字稿）。
+    /// 所以这里给整轮 25s 预算，到点就停下、把已完成项照实报出去——绝不为了凑满
+    /// 4/4 去重试写操作。
+    ///
+    /// `force == true` 是快捷指令主动触发，与 runSignIn 同款语义：忽略「自动执行」开关。
+    static func runDailyTasks(force: Bool = false, signInDone: Bool = false,
+                              budget: TimeInterval = 25,
+                              completion: @escaping (IOSDailyTasksReport) -> Void) {
+        guard force || IOSBackgroundPreferences.autoDailyTasksEnabled else {
+            IOSBackgroundLog.write("跳过每日任务：用户未开启自动执行")
+            var report = IOSDailyTasksReport()
+            report.skipped = ["每日任务"]
+            report.result = "disabled"
+            completion(report)
+            return
+        }
+        if force && !IOSBackgroundPreferences.autoDailyTasksEnabled {
+            IOSBackgroundLog.write("主动触发每日任务：忽略自动执行开关")
+        }
+        let outcome = IOSBackgroundCredentialStore.outcome()
+        guard let credential = outcome.credential, credential.canRunDailyTasks else {
+            // 有凭据但缺 uid 是最常见的一种：老版本授权的记录里没有这个字段。
+            // 必须把它和「从没授权」分开报，否则用户会反复点授权却不知道为什么没用。
+            let issue: IOSBackgroundCredentialIssue
+            if outcome.credential != nil, outcome.credential?.canRunDailyTasks == false {
+                issue = .partial
+            } else {
+                issue = IOSBackgroundCredentialIssue.from(outcome) ?? .neverGranted
+            }
+            IOSBackgroundLog.write("跳过每日任务：凭据不可用 \(issue.rawValue) \(outcome)")
+            var report = IOSDailyTasksReport()
+            report.result = issue.rawValue
+            report.skipped = ["每日任务"]
+            IOSBackgroundScheduler.record({ value in
+                value.lastRunAt = nowMs()
+                value.lastResult = issue.rawValue
+                value.runCount += 1
+            }, identifier: IOSBackgroundTaskID.dailyTasks)
+            completion(report)
+            return
+        }
+        Task {
+            let report = await IOSDailyTasksClient.shared.run(
+                credential: credential, signInDone: signInDone, budget: budget)
+            IOSBackgroundScheduler.record({ value in
+                value.lastRunAt = nowMs()
+                value.lastResult = report.result
+                value.lastDailyDone = report.doneCount
+                value.lastDailyTotal = report.totalCount
+                value.lastDailySummary = Self.summary(report)
+                value.runCount += 1
+                if report.result == "ok" { value.successCount += 1 }
+            }, identifier: IOSBackgroundTaskID.dailyTasks)
+            IOSBackgroundLog.write("每日任务结束 \(Self.summary(report)) result=\(report.result)")
+            // 完成通知：只在真的做完或用尽预算时发，避免每次都不响。
+            if IOSBackgroundPreferences.taskNotifyEnabled,
+               report.result == "ok" || report.budgetExhausted {
+                IOSBackgroundNotifier.post(id: "daily-tasks",
+                                           title: report.result == "ok" ? "每日任务完成" : "每日任务未全部完成",
+                                           body: Self.summary(report))
+            }
+            completion(report)
+        }
+    }
+
+    /// 「今日 3/4：签到、点赞、分享」这样一句话。失败项只写名字，原因留给回执与日志。
+    static func summary(_ report: IOSDailyTasksReport) -> String {
+        var parts: [String] = ["今日 \(report.doneCount)/\(report.totalCount)"]
+        if report.doneCount > 0 { parts.append("已完成 \(report.completed.count + (report.signInDone ? 1 : 0)) 项") }
+        if !report.failed.isEmpty { parts.append("失败：" + report.failed.map { $0.name }.joined(separator: "、")) }
+        if report.budgetExhausted { parts.append("时间用尽，剩余项下次再跑") }
+        if report.result == "credential_partial" { parts.append("请重新授权以补全账号 id") }
+        return parts.joined(separator: " · ")
+    }
+
     private static func nowMs() -> Int64 { Int64(Date().timeIntervalSince1970 * 1000) }
 }
 

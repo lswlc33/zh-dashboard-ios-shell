@@ -23,7 +23,8 @@ struct BackgroundArgumentError: Error { let code: String; init(_ code: String) {
 @available(iOS 13.0, *)
 final class IOSBackgroundService: NSObject, IOSBridgeService, IOSBridgeCancellableService {
     let methods = ["background.status", "background.credential", "background.credential.clear",
-                   "background.samples.take", "background.schedule", "background.notify"]
+                   "background.samples.take", "background.schedule", "background.notify",
+                   "background.tasks.run", "background.tasks.status"]
 
     // 不能用 `private typealias`：handle(method:args:reply:) 是协议要求的 internal
     // 方法，签名里出现 private 类型会被拒（CI 实测 "method must be declared private
@@ -77,6 +78,11 @@ final class IOSBackgroundService: NSObject, IOSBridgeService, IOSBridgeCancellab
                 try schedule(args, reply: reply)
             case "background.notify":
                 try notify(args, reply: reply)
+            case "background.tasks.status":
+                try requireEmpty(args)
+                reply(tasksStatusPayload(), nil)
+            case "background.tasks.run":
+                try tasksRun(args, reply: reply)
             default:
                 reply(nil, "unsupported_method")
             }
@@ -112,6 +118,9 @@ final class IOSBackgroundService: NSObject, IOSBridgeService, IOSBridgeCancellab
             "autoSignInEnabled": IOSBackgroundPreferences.autoSignInEnabled,
             "chargeNotifyEnabled": IOSBackgroundPreferences.chargeNotifyEnabled,
             "taskNotifyEnabled": IOSBackgroundPreferences.taskNotifyEnabled,
+            // 每日任务：写操作，默认关；用户显式打开才让系统定时跑。
+            "autoDailyTasksEnabled": IOSBackgroundPreferences.autoDailyTasksEnabled,
+            "dailyTasksScheduled": IOSBackgroundScheduler.shared.isScheduled(IOSBackgroundTaskID.dailyTasks),
             "credentialPresent": credential != nil,
             // 凭据异常时给出可据以行动的原因码（null 表示没问题）。
             // 只报 credentialPresent=false 会让用户分不清是没授权还是读不到。
@@ -122,6 +131,8 @@ final class IOSBackgroundService: NSObject, IOSBridgeService, IOSBridgeCancellab
             "credentialScopes": credential?.grantedScopes ?? [],
             "credentialCanSignIn": credential?.canSignIn ?? false,
             "credentialCanSample": credential?.canSampleVehicle ?? false,
+            // 每日任务可跑的前提是 app 域 + 内部 uid，缺一个都会在界面上提示补全授权。
+            "credentialCanRunTasks": credential?.canRunDailyTasks ?? false,
             "credentialVIN": credential?.vin ?? "",
             "credentialAccount": credential?.accountID ?? "",
             "credentialUpdatedAt": credential?.updatedAt ?? 0,
@@ -129,8 +140,66 @@ final class IOSBackgroundService: NSObject, IOSBridgeService, IOSBridgeCancellab
             "refreshScheduled": IOSBackgroundScheduler.shared.isScheduled(IOSBackgroundTaskID.refresh),
             "pendingSamples": IOSBackgroundSampleQueue.count(),
             "signIn": reportJSON(signIn),
-            "refresh": reportJSON(refresh)
+            "refresh": reportJSON(refresh),
+            "dailyTasks": reportJSON(IOSBackgroundScheduler.report(IOSBackgroundTaskID.dailyTasks))
         ]
+    }
+
+    /// 每日任务的状态回执。与 `background.status` 分开，因为网页只想刷进度时
+    /// 不必把凭据域、调度状态一起拉一遍。
+    private func tasksStatusPayload() -> [String: Any] {
+        let outcome = IOSBackgroundCredentialStore.outcome()
+        let credential = outcome.credential
+        let report = IOSBackgroundScheduler.report(IOSBackgroundTaskID.dailyTasks)
+        let signIn = IOSBackgroundScheduler.report(IOSBackgroundTaskID.signIn)
+        // 签到是否算进今天的进度：只有当签到记录就是今天才算，
+        // 否则「昨天签的」会一直给今天凑数。
+        let signInToday = signIn.lastSignInDays != nil && Calendar.current.isDateInToday(
+            Date(timeIntervalSince1970: TimeInterval((signIn.lastRunAt ?? 0) / 1000)))
+        return [
+            "ok": true,
+            "canRun": credential?.canRunDailyTasks ?? false,
+            "credentialIssue": IOSBackgroundCredentialIssue.from(outcome)?.rawValue ?? NSNull(),
+            "enabled": IOSBackgroundPreferences.autoDailyTasksEnabled,
+            "scheduled": IOSBackgroundScheduler.shared.isScheduled(IOSBackgroundTaskID.dailyTasks),
+            "lastRunAt": report.lastRunAt ?? 0,
+            "lastResult": report.lastResult,
+            "done": report.lastDailyDone ?? 0,
+            "total": report.lastDailyTotal ?? 4,
+            "summary": report.lastDailySummary ?? "",
+            "signInToday": signInToday,
+            "runCount": report.runCount,
+            "successCount": report.successCount
+        ]
+    }
+
+    /// 网页主动跑一次每日任务（面板上的「立即执行」按钮）。
+    ///
+    /// 与快捷指令的区别：这里在前台，可以等到真实结果再回执，
+    /// 所以预算给足 25s 并直接返回逐项明细。
+    private func tasksRun(_ args: [Any], reply: @escaping Reply) throws {
+        guard args.count <= 1 else { throw BackgroundArgumentError("invalid_args") }
+        let value = args.first as? [String: Any] ?? [:]
+        let allowed: Set<String> = ["confirm"]
+        guard Set(value.keys).isSubset(of: allowed) else { throw BackgroundArgumentError("invalid_args") }
+        // 会真的往广场发一条动态，必须用户显式确认（网页已经弹过一次，这里是第二道）。
+        guard (value["confirm"] as? Bool) == true else { throw BackgroundArgumentError("confirmation_required") }
+        let signIn = IOSBackgroundScheduler.report(IOSBackgroundTaskID.signIn)
+        let signInToday = signIn.lastSignInDays != nil && Calendar.current.isDateInToday(
+            Date(timeIntervalSince1970: TimeInterval((signIn.lastRunAt ?? 0) / 1000)))
+        IOSBackgroundRunner.runDailyTasks(force: true, signInDone: signInToday, budget: 25) { report in
+            reply([
+                "ok": true,
+                "result": report.result,
+                "done": report.doneCount,
+                "total": report.totalCount,
+                "completed": report.completed,
+                "skipped": report.skipped,
+                "failed": report.failed.map { ["name": $0.name, "reason": $0.reason] },
+                "budgetExhausted": report.budgetExhausted,
+                "summary": IOSBackgroundRunner.summary(report)
+            ], nil)
+        }
     }
 
     private func reportJSON(_ value: IOSBackgroundTaskReport) -> [String: Any] {
@@ -141,6 +210,9 @@ final class IOSBackgroundService: NSObject, IOSBridgeService, IOSBridgeCancellab
         if let soc = value.lastSocPercent { payload["lastSocPercent"] = soc }
         if let charging = value.lastCharging { payload["lastCharging"] = charging }
         if let days = value.lastSignInDays { payload["lastSignInDays"] = days }
+        if let done = value.lastDailyDone { payload["lastDailyDone"] = done }
+        if let total = value.lastDailyTotal { payload["lastDailyTotal"] = total }
+        if let summary = value.lastDailySummary { payload["lastDailySummary"] = summary }
         return payload
     }
 
@@ -170,7 +242,7 @@ final class IOSBackgroundService: NSObject, IOSBridgeService, IOSBridgeCancellab
     private func grant(_ args: [Any], reply: @escaping Reply) throws {
         guard args.count == 1, let value = args[0] as? [String: Any] else { throw BackgroundArgumentError("invalid_args") }
         let allowed: Set<String> = ["accountId", "vin", "token", "signinToken", "appId", "appSecret",
-                                    "h5AppId", "h5Secret", "autoSignIn"]
+                                    "h5AppId", "h5Secret", "autoSignIn", "uid", "autoDailyTasks"]
         guard Set(value.keys).isSubset(of: allowed) else { throw BackgroundArgumentError("invalid_args") }
         let accountID = try text(value["accountId"], limit: 128)
         let vin = try text(value["vin"], limit: 128)
@@ -184,10 +256,14 @@ final class IOSBackgroundService: NSObject, IOSBridgeService, IOSBridgeCancellab
         let appSecret = try optionalText(value["appSecret"], limit: 512) ?? ""
         let h5AppID = try optionalText(value["h5AppId"], limit: 128) ?? ""
         let h5Secret = try optionalText(value["h5Secret"], limit: 512) ?? ""
+        // 内部 uid：每日任务的两个接口（积分任务列表 / 我的动态）只认它。
+        // 前端在授权时会带上当前账号的 uid；老面板不带就存空串，
+        // canRunDailyTasks 会因此为 false，界面提示补全授权——绝不猜一个 uid。
+        let uid = try optionalText(value["uid"], limit: 64) ?? ""
         var credential = IOSBackgroundCredential(
             accountID: accountID, vin: vin, token: token, signinToken: signinToken,
             appSecret: appSecret, h5Secret: h5Secret, appID: appID, h5AppID: h5AppID,
-            updatedAt: Int64(Date().timeIntervalSince1970 * 1000))
+            uid: uid, updatedAt: Int64(Date().timeIntervalSince1970 * 1000))
         // 至少要有一个域可用才值得存；两个都不行说明调用方传错了。
         guard credential.isValid else { throw BackgroundArgumentError("credential_incomplete") }
         // 只导入一半时明确回给调用方，界面可以立刻提示「签到仍不可用」，
@@ -212,6 +288,11 @@ final class IOSBackgroundService: NSObject, IOSBridgeService, IOSBridgeCancellab
             }
             let auto = (value["autoSignIn"] as? Bool) ?? IOSBackgroundPreferences.autoSignInEnabled
             IOSBackgroundPreferences.autoSignInEnabled = auto
+            // 每日任务是写操作（会真发动态），默认沿用用户已开的状态，绝不因为
+            // 「这次授权带了 uid」就替用户把自动发帖打开。
+            if let tasks = value["autoDailyTasks"] as? Bool {
+                IOSBackgroundPreferences.autoDailyTasksEnabled = tasks
+            }
             IOSBackgroundScheduler.shared.scheduleAll()
             // 顺手把一份**最小投影**放进 App Group，让桌面小组件能自己拉车况
             // （官方 ZHWidgetExtension 的做法：扩展自带网络层，不依赖宿主存活）。
@@ -234,12 +315,17 @@ final class IOSBackgroundService: NSObject, IOSBridgeService, IOSBridgeCancellab
 
     private func schedule(_ args: [Any], reply: @escaping Reply) throws {
         guard args.count == 1, let value = args[0] as? [String: Any] else { throw BackgroundArgumentError("invalid_args") }
-        let allowed: Set<String> = ["autoSignIn", "chargeNotify", "taskNotify", "reschedule"]
+        let allowed: Set<String> = ["autoSignIn", "chargeNotify", "taskNotify", "reschedule", "autoDailyTasks"]
         guard Set(value.keys).isSubset(of: allowed) else { throw BackgroundArgumentError("invalid_args") }
         if let flag = value["autoSignIn"] as? Bool {
             IOSBackgroundPreferences.autoSignInEnabled = flag
             if flag { IOSBackgroundScheduler.shared.reschedule(IOSBackgroundTaskID.signIn) }
             else { IOSBackgroundScheduler.shared.cancel(IOSBackgroundTaskID.signIn) }
+        }
+        if let flag = value["autoDailyTasks"] as? Bool {
+            IOSBackgroundPreferences.autoDailyTasksEnabled = flag
+            if flag { IOSBackgroundScheduler.shared.reschedule(IOSBackgroundTaskID.dailyTasks) }
+            else { IOSBackgroundScheduler.shared.cancel(IOSBackgroundTaskID.dailyTasks) }
         }
         if let flag = value["chargeNotify"] as? Bool { IOSBackgroundPreferences.chargeNotifyEnabled = flag }
         if let flag = value["taskNotify"] as? Bool { IOSBackgroundPreferences.taskNotifyEnabled = flag }
