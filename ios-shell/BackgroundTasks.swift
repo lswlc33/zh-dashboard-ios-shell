@@ -118,9 +118,14 @@ final class IOSBackgroundScheduler {
     private init() {}
 
     /// 在 AppDelegate.didFinishLaunching 调用一次。重复调用安全。
+    ///
+    /// `dailyTasks` 是**可选**的：老调用点（不传这个参数）仍然只注册两个任务，
+    /// 不会因为 Info.plist 里还没加 identifier 就在启动时报错。
+    /// 注意闭包类型不能再写 `@escaping`——可选闭包类型参数本身已是 escaping，
+    /// 再标一次会被 Swift 直接拒（CI 实测 "closure is already escaping in optional type argument"）。
     func register(refresh: @escaping (@escaping (Bool) -> Void) -> Void,
                   signIn: @escaping (@escaping (Bool) -> Void) -> Void,
-                  dailyTasks: (@escaping (@escaping (Bool) -> Void) -> Void)? = nil) {
+                  dailyTasks: (((@escaping (Bool) -> Void) -> Void))? = nil) {
         guard !registered else { return }
         registered = true
         handlers[IOSBackgroundTaskID.refresh] = { task in
@@ -131,8 +136,6 @@ final class IOSBackgroundScheduler {
             guard let task = task as? BGAppRefreshTask else { return }
             Self.run(task: task, name: IOSBackgroundTaskID.signIn, reportKind: .signIn, body: signIn)
         }
-        // dailyTasks 是**可选**的：老调用点（不传这个参数）仍然只注册两个任务，
-        // 不会因为 Info.plist 里还没加 identifier 就在启动时报错。
         if let dailyTasks = dailyTasks {
             handlers[IOSBackgroundTaskID.dailyTasks] = { task in
                 guard let task = task as? BGAppRefreshTask else { return }

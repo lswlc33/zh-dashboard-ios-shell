@@ -48,12 +48,20 @@ enum IOSDailyTaskKind: String, CaseIterable {
     }
 }
 
+/// 一个失败项。**必须是具名结构体而不是元组**：元组（含 label 的元组）不满足
+/// `Equatable`，会让整个 `IOSDailyTasksReport` 的合成实现编译失败
+/// （CI 实测 "stored property type '[(name: String, reason: String)]' does not conform"）。
+struct IOSDailyTaskFailure: Equatable, Sendable {
+    let name: String
+    let reason: String
+}
+
 /// 一次每日任务运行的结果。字段都是「可直接拼进回执」的最终值，界面不做二次推断。
 struct IOSDailyTasksReport: Equatable, Sendable {
     /// 本次实际尝试并成功的项。
     var completed: [String] = []
     /// 本次尝试但失败的项（带原因码）。
-    var failed: [(name: String, reason: String)] = []
+    var failed: [IOSDailyTaskFailure] = []
     /// 本次跳过的项（已完成过 / 缺 uid / 超时预算用尽）。
     var skipped: [String] = []
     /// 服务端**复核**后仍判为已完成的可执行项数（不含签到）。
@@ -174,7 +182,7 @@ final class IOSDailyTasksClient {
                     report.skipped.append(name)
                     report.budgetExhausted = true
                 } else {
-                    report.failed.append((name: name, reason: reason))
+                    report.failed.append(IOSDailyTaskFailure(name: name, reason: reason))
                 }
             }
         }
