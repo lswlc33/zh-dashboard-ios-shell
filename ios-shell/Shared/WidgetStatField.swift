@@ -49,10 +49,20 @@ public enum WidgetStatField: String, CaseIterable, Codable, Sendable {
         }
     }
 
-    /// 4×4 六格默认顺序（与 Android WidgetStats.defaults 逐格一致，老用户升级不变）。
-    public static let defaultLarge: [WidgetStatField] = [.today, .last, .duration, .tireFront, .tireRear, .integral]
-    /// 4×2 两格默认（沿用旧中间列两行）。
-    public static let defaultMedium: [WidgetStatField] = [.today, .tirePair]
+    /// 4×4 六格默认顺序。
+    ///
+    /// **默认槽位只放「一定拿得到」的量**：2026-11-15 真机确认「今日骑行 / 上一次骑行 /
+    /// 骑行时长」在实际数据下常年是「—」（ride_home 要进过骑行页才拉，首页场景拿不到；
+    /// 积分/未读同理依赖「我的」页）。默认项显示一片空白比少一项更糟，
+    /// 所以默认改成总里程 / 胎压 / 电压 / 积分 / 续航 —— 它们都来自 vehicleHomePageV2
+    /// 与 batteryInfo 这两个每次必拉的接口。
+    /// 想看骑行数据的用户在 App 设置里自己选（那些项仍保留在 `selectable` 里）。
+    ///
+    /// 注：这不再与 Android `WidgetStats.defaults` 逐格一致——Android 那边骑行数据来自
+    /// 长连接实时流，本来就拿得到；iOS 的数据通路不同，默认值跟着数据可得性走。
+    public static let defaultLarge: [WidgetStatField] = [.total, .tireFront, .tireRear, .voltage, .integral, .range]
+    /// 4×2 两格默认：总里程 + 胎压（同样避开长期缺测的骑行项）。
+    public static let defaultMedium: [WidgetStatField] = [.total, .tirePair]
 
     public static var selectable: [WidgetStatField] {
         [.today, .last, .duration, .total, .soc, .range, .voltage, .current, .power, .chargeState,

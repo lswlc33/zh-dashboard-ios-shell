@@ -9,11 +9,7 @@ enum WidgetStrings {
     static let title = "几何面板"
     static let vehicle = "车辆"
     static let displayName = "车辆状态"
-    static let description = "显示 App 最近同步的电量与充电状态；系统决定刷新时间。"
-    /// iOS 17+ 可编辑版：图库里要和原版**区分开**，否则用户看到两个同名条目会困惑。
-    static let configurableDisplayName = "车辆状态（可编辑）"
-    /// iOS 17+ 可编辑版的描述：明确提一句支持按实例编辑，用户才知道长按能改。
-    static let configurableDescription = "显示电量与充电状态，长按小组件可编辑外观、车名和统计内容。"
+    static let description = "显示电量、充电状态与车况统计；系统决定刷新时间。在 App 的「系统展示」里可改外观与统计项。"
     static let unavailable = "车况暂无数据"
     static let unavailableShort = "打开 App 主页同步"
     static let unavailableHint = "打开 App 进入主页即可同步当前车辆；系统决定小组件的刷新时间。"

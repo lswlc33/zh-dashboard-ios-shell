@@ -20,17 +20,17 @@ import ZeehoSystemShared
 /// **`vehicle` 是已发布的对外契约，永久不能再改它的配置类型，也不能改这个字符串**：
 /// WidgetKit 按 kind + 配置类型名归档已放置实例，改任一项都会让存量实例永远停在
 /// 占位骨架屏（1.1.19 的真实事故，见 `ZeehoVehicleWidget` 的注释）。
-/// 新增能力（原生编辑）只能开新 kind：`configurable`。
-///
-/// 宿主侧 `IOSSystemSurfacesService.widgetKind` 也靠这些字符串对上，改一处必须改两处。
+/// 宿主侧 `IOSSystemSurfacesService.widgetKind` 也靠这个字符串对上，改一处必须改两处。
 enum ZeehoWidgetKind {
-    /// 原静态小组件（1.1.0 起对外发布，必须保持 StaticConfiguration）。
+    /// 唯一的小组件 kind（1.1.0 起对外发布，必须保持 StaticConfiguration）。
+    ///
+    /// 1.1.21 曾另开 `ZeehoVehicleWidgetConfigurable`（AppIntentConfiguration）承载原生编辑，
+    /// 1.1.23 撤除：真机添加后整个空白，而同一份视图在静态版上正常。
     static let vehicle = "ZeehoVehicleWidget"
-    /// iOS 17+ 可编辑小组件（AppIntentConfiguration）。
-    static let configurable = "ZeehoVehicleWidgetConfigurable"
 
     /// 需要 `WidgetCenter.reloadTimelines` 的全部 kind。
-    static var all: [String] { [vehicle, configurable] }
+    /// 撤掉可编辑版后只剩一个；保留数组形式方便以后再加。
+    static var all: [String] { [vehicle] }
 }
 
 /// 车控动作（与 Android CAR_CMDS 的四个按钮一一对应）。

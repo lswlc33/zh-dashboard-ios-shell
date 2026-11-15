@@ -780,25 +780,11 @@ struct ZeehoVehicleWidget: Widget {
     }
 }
 
-/// iOS 17+ 支持原生编辑的版本（长按 →「编辑小组件」），**使用独立 kind**。
-///
-/// 必须是新 kind，不能复用 `ZeehoVehicleWidget`：理由见上面 `ZeehoVehicleWidget` 的注释
-/// —— 复用会让 1.1.18 及更早的用户实例全部失效。代价是老实例不会自动获得编辑能力，
-/// 需要用户在桌面重新添加这一个小组件（图库里会看到两个条目）。
-@available(iOS 17.0, *)
-struct ZeehoConfigurableVehicleWidget: Widget {
-    let kind = ZeehoWidgetKind.configurable
-
-    var body: some WidgetConfiguration {
-        AppIntentConfiguration(kind: kind, intent: ZeehoVehicleWidgetConfiguration.self,
-                               provider: ZeehoVehicleConfigProvider()) { entry in
-            ZeehoVehicleWidgetView(entry: entry)
-        }
-        .configurationDisplayName(WidgetStrings.configurableDisplayName)
-        .description(WidgetStrings.configurableDescription)
-        .supportedFamilies([.systemSmall, .systemMedium, .systemLarge])
-    }
-}
+// 可编辑版（`ZeehoConfigurableVehicleWidget` / `ZeehoVehicleWidgetConfiguration`）
+// 已在 1.1.23 整体撤除：真机添加后整个是空白，且同一份视图在静态版上完全正常。
+// 编辑能力改由 App 内提供（`widget.set` 支持 showName/showTime/dark/stats）。
+// 相关类型与 provider 从 `Widgets/WidgetConfiguration.swift` 一并删除，
+// 避免以后有人看到「有这个类型」就以为图库里应该有。
 
 // 为什么不用 `if #available` 写在 `WidgetBundle.body` 里：
 // `Widget` 与 `WidgetBundle` 的 body 都**没有** result builder，苹果也没有提供
@@ -819,12 +805,20 @@ struct ZeehoWidgets {
     }
 }
 
-/// iOS 17+：原静态小组件（保证老实例继续工作）+ 新的可编辑小组件 + Live Activity。
+/// iOS 17+：车辆小组件 + Live Activity。
+///
+/// **可编辑版（AppIntentConfiguration）已从 bundle 中撤下（1.1.23）**：
+/// 真机实测它添加后整个是空白，而同一份视图在静态版上完全正常。
+/// 已核实 CI 产物里的 `Metadata.appintents` 完整（配置 intent + 4 个参数 +
+/// 两个枚举的全部取值），二进制里 kind/类型也都在，所以不是索引缺失，
+/// 而是 `AppIntentConfiguration` 在「手写 swiftc + 弱链接 AppIntents」这套
+/// 构建方式下的运行时问题。排查成本高、且每次验证都要烧一个正式版本，
+/// 因此改为：**图库只保留能用的静态版**，编辑能力放到 App 内
+/// （`widget.set` 支持 showName/showTime/dark/stats，见 SystemSurfaces）。
 @available(iOS 17.0, *)
 struct ZeehoModernWidgets: WidgetBundle {
     var body: some Widget {
         ZeehoVehicleWidget()
-        ZeehoConfigurableVehicleWidget()
         if #available(iOS 16.1, *) {
             ZeehoLiveActivityWidget()
         }

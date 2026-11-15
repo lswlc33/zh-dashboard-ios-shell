@@ -197,34 +197,34 @@ def main():
                   '--scan-executable "$broadcast_dir/ZeehoCastBroadcast"',
                   '--scan-folder "$broadcast_dir/Frameworks"', 'Entitlements/Broadcast.entitlements'):
         assert token in build_sh, token
-    # Widget 用两套 kind：原 kind 保持 StaticConfiguration（已发布契约，不能动），
-    # iOS 17+ 另开新 kind 用 AppIntentConfiguration 提供原生编辑。
-    # 交互按钮与编辑面板都需要 AppIntents metadata 索引：缺了它点按钮会静默无效、
-    # 编辑面板会是空的（真机日志 linkd Missing: <bundle>:<Type>），所以构建脚本必须
-    # 导出 const-values、跑 appintentsmetadataprocessor、并在签名之前生成索引。
+    # Widget 只有一个已发布的 kind，且**必须保持 StaticConfiguration**。
+    # 车控/刷新按钮仍走 AppIntent，所以仍需 AppIntents metadata 索引
+    # （缺了它点按钮会静默无效，真机日志 linkd Missing: <bundle>:<Type>）。
     widget_bundle = (root / 'Widgets/ZeehoWidgets.swift').read_text(encoding='utf-8')
-    assert 'ZeehoVehicleWidget()' in widget_bundle, '原静态控件必须仍被注册'
+    assert 'ZeehoVehicleWidget()' in widget_bundle, '静态控件必须仍被注册'
     # **回归防线（1.1.19 事故）**：WidgetKit 按 kind + 配置类型名归档已放置实例，
     # 把已发布的 kind 从 StaticConfiguration 换成 AppIntentConfiguration 会让存量实例
     # 永远停在占位骨架屏（用户实测「只显示骨架屏」）。所以原 kind 必须仍是 StaticConfiguration。
     static_widget = widget_bundle.split('struct ZeehoVehicleWidget: Widget')[1].split('\nstruct ')[0]
     assert 'StaticConfiguration(' in static_widget and 'AppIntentConfiguration(' not in static_widget, \
         '已发布的 ZeehoVehicleWidget 必须保持 StaticConfiguration（换配置类型会让存量实例变骨架屏）'
-    config_widget = widget_bundle.split('struct ZeehoConfigurableVehicleWidget: Widget')[1].split('\nstruct ')[0]
-    assert 'AppIntentConfiguration(' in config_widget, '可编辑控件必须用 AppIntentConfiguration'
-    assert 'ZeehoWidgetKind.configurable' in config_widget, \
-        '可编辑控件必须用独立 kind（复用原 kind 会让老实例失效）'
+    # **1.1.23 起可编辑版（AppIntentConfiguration）整体撤除**：真机添加后整个空白，
+    # 同一份视图在静态版上正常，索引也完整 → 是 AppIntentConfiguration 在
+    # 「手写 swiftc + 弱链接 AppIntents」下的运行时问题。编辑能力改由 App 内 widget.set 提供。
+    # 这里钉死「不要再把 AppIntentConfiguration 加回控件注册」，避免又发一个空白小组件。
+    assert 'AppIntentConfiguration(' not in widget_bundle, \
+        '不要再把 AppIntentConfiguration 控件加回 bundle（真机实测整个空白）'
+    assert not (root / 'Widgets/WidgetConfiguration.swift').exists(), \
+        '可编辑版已撤除，WidgetConfiguration.swift 不应再存在'
     # Widget.body / WidgetBundle.body 都没有 result builder，不能写 if #available；
     # 必须用 static main() 在两条 bundle 之间分派。
-    assert 'static func main()' in widget_bundle, '可编辑/静态两套控件必须用 static main() 分派'
+    assert 'static func main()' in widget_bundle, '两条 bundle 必须用 static main() 分派'
     assert 'ZeehoModernWidgets.main()' in widget_bundle and 'ZeehoLegacyWidgets.main()' in widget_bundle, \
         'static main() 必须按 iOS 17 可用性分派两条 WidgetBundle'
-    widget_config = (root / 'Widgets/WidgetConfiguration.swift').read_text(encoding='utf-8')
-    assert 'WidgetConfigurationIntent' in widget_config, '编辑面板必须声明 WidgetConfigurationIntent'
-    # 两个 kind 的字符串必须与宿主侧 SystemSurfaces 完全一致（各写一份常量）。
+    # kind 字符串必须与宿主侧 SystemSurfaces 完全一致（各写一份常量）。
     surfaces_src = (root / 'SystemSurfaces.swift').read_text(encoding='utf-8')
     widget_commands = (root / 'Widgets/WidgetCommands.swift').read_text(encoding='utf-8')
-    for literal in ('"ZeehoVehicleWidget"', '"ZeehoVehicleWidgetConfigurable"'):
+    for literal in ('"ZeehoVehicleWidget"',):
         assert literal in widget_commands, '扩展侧缺少 kind 常量: ' + literal
         assert literal in surfaces_src, '宿主侧缺少同值 kind 常量: ' + literal
     # 小组件自己拉接口的签名算法必须是 sign.js 的同一套（md5(sha1(query+param+secret))）。
@@ -241,9 +241,15 @@ def main():
     assert 'freshWindow = WidgetFreshness.maxAgeSeconds' in (
         root / 'Widgets/WidgetStyle.swift').read_text(encoding='utf-8'), \
         '桌面小组件必须用 30 分钟窗口（180 秒会让数据一渲染就掉成 --）'
-    # 编辑面板的 protocol 必须进 const-values 清单，否则 metadata 里没有它（面板空白）
-    assert 'WidgetConfigurationIntent' in build_sh, \
-        'const_extract_protocols.json 必须包含 WidgetConfigurationIntent'
+    # 撤销「编辑面板的 protocol 必须进清单」那条：可编辑版已整体撤除（1.1.23），
+    # 现在反而**不该**把它留在清单里（对应控件真机空白）。
+    # 只检查协议数组那一行，避免注释里提到名字就误判。
+    protocol_line = next((ln for ln in build_sh.splitlines() if ln.startswith('["AppIntent"')), '')
+    assert protocol_line, '找不到 const_extract_protocols 的协议数组'
+    assert 'WidgetConfigurationIntent' not in protocol_line, \
+        '可编辑版已撤除，协议清单不应再包含 WidgetConfigurationIntent'
+    assert '"AppIntent"' in protocol_line and '"AppEnum"' in protocol_line, \
+        '车控/刷新按钮仍需要 AppIntent 与 AppEnum'
     assert 'appintentsmetadataprocessor' in build_sh, '交互按钮必须生成 AppIntents metadata，否则点击无效'
     # 判据是「索引目录里有文件」，不再死认 extract.actionsdata：Xcode 版本间改过名，
     # 写死文件名会在明明成功的机器上误报（CI 实测 Xcode 16.4）。

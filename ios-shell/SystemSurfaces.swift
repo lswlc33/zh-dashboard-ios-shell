@@ -303,11 +303,10 @@ final class IOSSystemSurfacesService: NSObject, IOSBridgeService, IOSBridgeCance
     let methods = ["system.surfaces.status", "system.snapshot", "liveActivity.start", "liveActivity.update", "liveActivity.end", "widgets.reload"]
     // 与扩展里的 `ZeehoWidgetKind.vehicle` 必须是同一个字符串（扩展在 Widgets 模块，
     // Host 不链接它，所以只能各写一份常量）。test.py 会断言两边一致。
-    // **这两个字符串是已发布的对外契约，永远不要改**：WidgetKit 按 kind 归档已放置实例，
+    // **这个字符串是已发布的对外契约，永远不要改**：WidgetKit 按 kind 归档已放置实例，
     // 改了会让存量小组件永远停在占位骨架屏（1.1.19 的真实事故）。
+    // 1.1.21 曾加过一个同值拼法的 `widgetKindConfigurable`，1.1.23 随可编辑版一起撤除。
     static let widgetKind = "ZeehoVehicleWidget"
-    /// iOS 17+ 可编辑小组件（AppIntentConfiguration）的独立 kind。
-    static let widgetKindConfigurable = "ZeehoVehicleWidgetConfigurable"
     private let worker = DispatchQueue(label: "io.github.lswlc33.dashboard.system-surfaces", qos: .utility)
     private var scopeProvider: (() -> IOSRideScope?)?
     private var presenterProvider: (() -> UIViewController?)?
@@ -1278,10 +1277,9 @@ final class IOSSystemSurfacesService: NSObject, IOSBridgeService, IOSBridgeCance
         } ?? "cleared"
         let now = ProcessInfo.processInfo.systemUptime
         guard force || edge != lastWidgetEdge || now - lastWidgetReload >= 300 else { return false }
-        // 两个 kind 都要刷：`widgetKind` 是原静态小组件（老实例），
-        // `widgetKindConfigurable` 是 iOS 17+ 可编辑的那个。只刷一个会让另一半用户不更新。
+        // 撤掉可编辑版后只剩一个 kind；仍走 `ZeehoWidgetKind.all` 的等价写法，
+        // 以后再加 kind 时只要改扩展那边的 `all` 即可。
         WidgetCenter.shared.reloadTimelines(ofKind: Self.widgetKind)
-        WidgetCenter.shared.reloadTimelines(ofKind: Self.widgetKindConfigurable)
         lastWidgetEdge = edge; lastWidgetReload = now
         return true
     }
