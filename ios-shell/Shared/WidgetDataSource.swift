@@ -34,11 +34,8 @@ public struct WidgetDataSourceResult: Sendable, Equatable {
 }
 
 public enum WidgetDataSource {
-    /// 自己拉的缓存有效期：与小组件统计窗口同口径（30 分钟）。
+    /// 自己拉的缓存有效期为 30 分钟；合法宿主快照保留最后值，由视图标注过期。
     public static let cacheMaxAgeSeconds = SystemSnapshotFreshness.widgetStatsMaxAgeSeconds
-    /// 快照兜底的有效期：与 `WidgetFreshness.maxAgeSeconds` 同口径（30 分钟）。
-    /// 这里刻意不用 180 秒——那是会话级窗口，用它会让小组件刚加上三分钟就空白。
-    public static let snapshotMaxAgeSeconds = 30 * 60.0
 
     /// 取一次数据。`force` 为 true 时（刷新按钮）跳过缓存直接打接口。
     public static func load(at date: Date = Date(), force: Bool = false) async -> WidgetDataSourceResult {
@@ -59,6 +56,14 @@ public enum WidgetDataSource {
         if let credential = credential {
             if !force, let cached = WidgetFetchCache.read(ownerID: credential.ownerID, at: date,
                                                           maxAgeSeconds: cacheMaxAgeSeconds) {
+                // 车辆切换可能与文件读取并发；命中缓存后也必须复核完整身份，
+                // 与网络返回和 loadLocal 的分支保持同一条 fail-closed 规则。
+                guard let currentOwner = try? SystemSnapshotStore.currentOwner(),
+                      currentOwner == activeOwner,
+                      currentOwner.ownerIdentifierString == credential.ownerID,
+                      WidgetCredentialStore.read(at: date) == credential else {
+                    return currentSnapshot(at: date, reason: "stale_credential")
+                }
                 return WidgetDataSourceResult(snapshot: cached, origin: .cache, reason: "")
             }
             let result = await WidgetVehicleClient.fetch(credential, at: date)
@@ -95,20 +100,32 @@ public enum WidgetDataSource {
         return currentSnapshot(at: date, reason: liveReason)
     }
 
-    private static func currentSnapshot(at date: Date, reason: String) -> WidgetDataSourceResult {
-        // 兜底只读当前 active owner 的宿主快照，绝不再用在途请求捕获的 owner。
-        if let snapshot = try? SystemSnapshotStore.readCurrent(now: date),
-           isUsable(snapshot, at: date) {
-            return WidgetDataSourceResult(snapshot: snapshot, origin: .snapshot, reason: reason)
+    /// 图库预览和时间线超时只读本地；不能再次 await 联网而失去兜底意义。
+    public static func loadLocal(at date: Date = Date()) -> WidgetDataSourceResult {
+        let active = try? SystemSnapshotStore.currentOwner()
+        let credential = WidgetCredentialStore.read(at: date)
+        if let active = active, let credential = credential,
+           credential.ownerID == active.ownerIdentifierString,
+           let cached = WidgetFetchCache.read(ownerID: credential.ownerID, at: date,
+                                               maxAgeSeconds: cacheMaxAgeSeconds),
+           (try? SystemSnapshotStore.currentOwner()) == active,
+           WidgetCredentialStore.read(at: date) == credential {
+            return WidgetDataSourceResult(snapshot: cached, origin: .cache, reason: "")
         }
-        return WidgetDataSourceResult(snapshot: nil, origin: .none, reason: reason)
+        return currentSnapshot(at: date, reason: "local_fallback")
     }
 
-    /// 只做时间与归属检查：快照本身已由 store 校验过结构，这里补一条「多久内的还能展示」。
-    private static func isUsable(_ snapshot: SystemSnapshot, at date: Date) -> Bool {
-        guard let vehicle = snapshot.vehicle else { return false }
-        let age = date.timeIntervalSince1970 - Double(vehicle.updatedAt) / 1000
-        return age >= -SystemSnapshotFreshness.futureToleranceSeconds && age < snapshotMaxAgeSeconds
+    private static func currentSnapshot(at date: Date, reason: String) -> WidgetDataSourceResult {
+        // 保留合法的最后车况，过期由展示层标注；读取不能把真实采样时间改成现在。
+        do {
+            if let snapshot = try SystemSnapshotStore.readCurrent(now: date), snapshot.vehicle != nil {
+                return WidgetDataSourceResult(snapshot: snapshot, origin: .snapshot, reason: reason)
+            }
+        } catch {
+            let code = (error as? SystemSnapshotError)?.code ?? "snapshot_read_failed"
+            return WidgetDataSourceResult(snapshot: nil, origin: .none, reason: code)
+        }
+        return WidgetDataSourceResult(snapshot: nil, origin: .none, reason: reason)
     }
 
     /// 把接口结果拼成共享 schema 的快照。构造不出合规数据就返回 nil（调用方退回缓存/快照）。

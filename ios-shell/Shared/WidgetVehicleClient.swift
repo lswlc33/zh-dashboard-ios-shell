@@ -1,4 +1,5 @@
 import Foundation
+import CoreFoundation
 import CryptoKit
 
 // 小组件自己拉车况的最小客户端（照官方 `ZHEEHTTPSessionManager` + `ZHNetTool` 的做法）。
@@ -211,7 +212,7 @@ public enum WidgetVehicleClient {
         if let tires = tires, let rows = tires["realTimeData"] as? [[String: Any]] {
             for row in rows {
                 // sensorPosition 1=前轮 2=后轮；其它值忽略（不猜）。
-                guard let position = number(row["sensorPosition"]).map({ Int($0) }) else { continue }
+                guard let position = number(row["sensorPosition"]), position == 1 || position == 2 else { continue }
                 let pressure = number(row["tirePressure"]).flatMap { $0 > 0 && $0 <= 20 ? $0 : nil }
                 let temp = number(row["tireTemp"]).flatMap { $0 >= -60 && $0 <= 200 ? $0 : nil }
                 if position == 1 {
@@ -268,7 +269,10 @@ public enum WidgetVehicleClient {
         let integral = value(integralResult).flatMap { $0["data"] as? [String: Any] }
         let messages = value(messageResult).flatMap { $0["data"] as? [String: Any] }
         // 未读取的是**总数** `noRead`，不是列表项里的 `unread`（那个是「1=已读」的反义字段）。
-        let unread = messages.flatMap { number($0["noRead"]) }.map { Int($0) }.flatMap { $0 >= 0 ? $0 : nil }
+        let unread = messages.flatMap { number($0["noRead"]) }.flatMap { value -> Int? in
+            guard value >= 0, value < Double(Int.max), value.rounded(.towardZero) == value else { return nil }
+            return Int(value)
+        }
         let total = integral.flatMap { number($0["integralTotal"]) }
         if total == nil && unread == nil { return nil }
         return (total, unread)
@@ -446,7 +450,7 @@ public enum WidgetVehicleClient {
             return Int(text[swiftRange])
         }
         let hours = group(1) ?? 0
-        guard let mins = group(2) else { return nil }
+        guard let mins = group(2), hours >= 0, hours <= 100_000, mins >= 0, mins <= 100_000 else { return nil }
         return hours * 60 + mins
     }
 

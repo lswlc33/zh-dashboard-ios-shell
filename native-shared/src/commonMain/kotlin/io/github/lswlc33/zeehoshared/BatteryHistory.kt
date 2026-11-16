@@ -34,6 +34,36 @@ internal class BatteryHistory {
             "3d" -> 900_000; "7d" -> 1_800_000; "30d" -> 7_200_000; else -> 300_000
         }
         private fun round2(value: Double): Double = BatteryReading.rounded(value * 100) / 100
+        private const val OCV_MAX_POINTS = 6_000
+
+        /** OCV 用紧凑原始采样，不复用按时间桶降采样的展示报告。 */
+        fun buildOcvReport(all: List<BatteryRecord>, now: Long): JsonObject {
+            require(now >= 0) { "invalid_time" }
+            val retained = all.filter { it.valid(now) && it.t >= now - RETENTION_MS }
+                .sortedBy { it.t }.distinctBy { it.t }
+            // 按完整时间序列均匀取点并保留端点，不能优先静置点而抹掉期间的动态反证。
+            val selected = if (retained.size <= OCV_MAX_POINTS) retained else
+                (0 until OCV_MAX_POINTS).map { index ->
+                    retained[(index.toLong() * retained.lastIndex / (OCV_MAX_POINTS - 1)).toInt()]
+                }
+            val truncated = selected.size < retained.size
+            val from = retained.firstOrNull()?.t ?: 0L
+            val to = retained.lastOrNull()?.t ?: 0L
+            return buildJsonObject {
+                put("ok", true); put("from", from); put("to", to); put("count", retained.size)
+                put("truncated", truncated); put("returnedCount", selected.size)
+                put("metadata", buildJsonObject {
+                    put("from", from); put("to", to); put("count", retained.size); put("returnedCount", selected.size)
+                    put("truncated", truncated); put("samplingStrategy", if (truncated) "uniform" else "raw")
+                    put("staticInferenceAllowed", !truncated)
+                })
+                put("samples", JsonArray(selected.map { record -> JsonArray(listOf(
+                    JsonPrimitive(record.t), JsonPrimitive(record.soc), JsonPrimitive(record.v),
+                    JsonPrimitive(record.a), JsonPrimitive(record.state), JsonPrimitive(record.powered)
+                )) }))
+            }
+        }
+
         fun buildReport(all: List<BatteryRecord>, inputRange: String, now: Long): JsonObject {
             require(now >= 0) { "invalid_time" }
             val range = normalizeRange(inputRange)
@@ -160,6 +190,11 @@ class SharedBattery {
                 reportKey = key; reportAt = now; reportRevision = history.revision
                 cachedReport
             }
+        }
+    }
+    fun ocvReportJSON(now: Long): String = safeJson {
+        lock.withLock {
+            BatteryHistory.buildOcvReport(history.all(), now).toString()
         }
     }
     fun snapshotJSON(): String = lock.withLock {

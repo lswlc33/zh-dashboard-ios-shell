@@ -176,16 +176,22 @@ public enum SystemSnapshotStore {
 
     private static func settings(at root: URL, active: SystemSnapshotOwner) throws -> SystemWidgetSettings {
         let account = active.accountHash ?? active.accountVINHash
-        guard let data = try boundedRead(root.appendingPathComponent(settingsName), limit: 2048) else {
+        do {
+            guard let data = try boundedRead(root.appendingPathComponent(settingsName), limit: 2048) else {
+                return SystemWidgetSettings(accountHash: account)
+            }
+            let shape = try object(data)
+            guard Set(shape.keys).isSubset(of: ["accountHash", "vehicleID", "showName", "showTime",
+                                              "darkMode", "stats"]) else {
+                throw SystemSnapshotError("invalid_widget_settings")
+            }
+            let value = try JSONDecoder().decode(SystemWidgetSettings.self, from: data).validated()
+            return value.accountHash == account ? value : SystemWidgetSettings(accountHash: account)
+        } catch {
+            // 偏好只是展示附加项；损坏或旧枚举不该让已验证归属的车况整张空白。
+            // 不改写原文件，不放宽 owner/快照校验，后续保存仍按同一验证入口执行。
             return SystemWidgetSettings(accountHash: account)
         }
-        let shape = try object(data)
-        guard Set(shape.keys).isSubset(of: ["accountHash", "vehicleID", "showName", "showTime",
-                                          "darkMode", "stats"]) else {
-            throw SystemSnapshotError("invalid_widget_settings")
-        }
-        let value = try JSONDecoder().decode(SystemWidgetSettings.self, from: data).validated()
-        return value.accountHash == account ? value : SystemWidgetSettings(accountHash: account)
     }
 
     public static func write(_ value: SystemSnapshot, expectedOwner: SystemSnapshotOwner) throws {
@@ -456,7 +462,9 @@ public enum SystemSnapshotStore {
         // 撤权先进入 action 删除匹配 marker；枚举限额只约束可选清理，不能阻断撤权。
         if !revoking {
             let entries = try manager.contentsOfDirectory(at: root, includingPropertiesForKeys: nil, options: [])
-            guard entries.count <= (create ? 64 : maxVehicles + 3) else { throw SystemSnapshotError("snapshot_storage_limit") }
+            // 读写使用同一目录总量上限；后台回执/原子写残留不能只在读取时挤掉合法车况。
+            // 车辆条目仍在 snapshotOwners/removeOrphans 按 maxVehicles 独立校验。
+            guard entries.count <= 64 else { throw SystemSnapshotError("snapshot_storage_limit") }
         }
         return try action(root)
         #else

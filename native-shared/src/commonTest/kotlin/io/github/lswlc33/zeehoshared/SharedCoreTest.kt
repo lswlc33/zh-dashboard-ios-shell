@@ -47,6 +47,50 @@ class SharedCoreTest {
         assertEquals(0.0, (report["summary"] as JsonObject).number("chargeKwh"))
         assertEquals(0L, (report["summary"] as JsonObject).long("chargeMin"))
     }
+    @Test fun ocvReportRetainsVoltageAndStateInCompactRows() {
+        val samples = (1..4).map { index ->
+            BatteryRecord(index * 300_000L, 79.0 + index, -0.1, -8.0, 20 + index * 10,
+                state = 0, powered = 0)
+        }
+        val report = BatteryHistory.buildOcvReport(samples, 2_000_000L)
+        val rows = report["samples"] as JsonArray
+        assertEquals(4, rows.size)
+        assertEquals(80.0, (rows[0] as JsonArray)[2].toString().toDouble())
+        assertEquals(0, (rows[0] as JsonArray)[4].toString().toInt())
+        assertEquals(0, (rows[0] as JsonArray)[5].toString().toInt())
+        assertEquals(false, report["truncated"].toString().toBoolean())
+        val metadata = report["metadata"] as JsonObject
+        assertFalse(metadata["truncated"].toString().toBoolean())
+        assertTrue(metadata["staticInferenceAllowed"].toString().toBoolean())
+        assertEquals("raw", metadata.text("samplingStrategy"))
+        assertEquals(4, metadata.int("returnedCount"))
+    }
+
+    @Test fun ocvReportCapsUniformSamplingAndRetainsRangeEndpoints() {
+        val samples = (0 until 12_000).map { index ->
+            val static = index % 2 == 0
+            BatteryRecord(index * 60_000L + 1_000L, 70.0, if (static) 0.0 else 4.0,
+                if (static) 0.0 else 300.0, 20 + index % 70, state = if (static) 0 else 1,
+                powered = if (static) 0 else 1)
+        }
+        val report = BatteryHistory.buildOcvReport(samples, 12_100 * 60_000L)
+        val rows = report["samples"] as JsonArray
+        val metadata = report["metadata"] as JsonObject
+        assertEquals(12_000, report.int("count"))
+        assertEquals(6_000, rows.size)
+        assertTrue(report["truncated"].toString().toBoolean())
+        assertTrue(metadata["truncated"].toString().toBoolean())
+        assertFalse(metadata["staticInferenceAllowed"].toString().toBoolean(), "sampling gaps cannot prove static dwell")
+        assertEquals("uniform", metadata.text("samplingStrategy"))
+        assertEquals(6_000, metadata.int("returnedCount"))
+        assertEquals(samples.first().t, (rows.first() as JsonArray)[0].toString().toLong())
+        assertEquals(samples.last().t, (rows.last() as JsonArray)[0].toString().toLong())
+        assertEquals(samples.first().t, metadata.long("from"))
+        assertEquals(samples.last().t, metadata.long("to"))
+        assertTrue(rows.any { (it as JsonArray)[4].toString().toInt() == 0 }, "static samples remain represented")
+        assertTrue(rows.any { (it as JsonArray)[4].toString().toInt() == 1 }, "dynamic endpoint cannot be removed by static priority")
+    }
+
     @Test fun snapshotRestoreKeepsRevisionAndNoDuplicate() {
         fun sample(at: Long): String = buildJsonObject {
             put("vin", "OFFLINE-VIN"); put("batteryAt", at); put("vehicleAt", at); put("lock", 1)

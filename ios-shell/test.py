@@ -76,7 +76,9 @@ def main():
         info = plistlib.load(f)
     assert info['CFBundlePackageType'] == 'APPL'
     assert info['MinimumOSVersion'] == '15.4'
-    assert info.get('NSAppTransportSecurity') == {'NSAllowsArbitraryLoads': True}
+    expected_ats = {'NSAllowsArbitraryLoads': True,
+                    'NSExceptionDomains': {'tapi.zeehoev.com': {}, 'h5.zeehoev.com': {}}}
+    assert info.get('NSAppTransportSecurity') == expected_ats
     assert info['NSAppTransportSecurity']['NSAllowsArbitraryLoads'] is True
     for extension in ('Widgets', 'Broadcast'):
         with (root / extension / 'Info.plist').open('rb') as stream:
@@ -220,7 +222,12 @@ def main():
         '不要再把 AppIntentConfiguration 控件加回 bundle（真机实测整个空白）'
     assert not (root / 'Widgets/WidgetConfiguration.swift').exists(), \
         '可编辑版已撤除，WidgetConfiguration.swift 不应再存在'
-    # Widget.body / WidgetBundle.body 都没有 result builder，不能写 if #available；
+    widget_link_region = build_sh.split('widget_args=', 1)[1].split('broadcast_args=', 1)[0]
+    assert '-Xlinker -e -Xlinker _NSExtensionMain' not in widget_link_region, \
+        'WidgetKit 必须走 Swift @main 的 _main，不能强制普通扩展入口'
+    assert '-Xlinker -e -Xlinker _NSExtensionMain' in build_sh.split('broadcast_args=', 1)[1], \
+        'Broadcast 仍需使用传统 _NSExtensionMain 入口'
+    # Widget body / WidgetBundle.body 都没有 result builder，不能写 if #available；
     # 必须用 static main() 在两条 bundle 之间分派。
     assert 'static func main()' in widget_bundle, '两条 bundle 必须用 static main() 分派'
     assert 'ZeehoModernWidgets.main()' in widget_bundle and 'ZeehoLegacyWidgets.main()' in widget_bundle, \
@@ -706,7 +713,12 @@ def main():
     assert 'truncated = true' not in resource_code, '资源超限不能返回部分文件作为成功结果'
     helper.validate_info(info)
     for ats in (None, {'NSAllowsArbitraryLoads': False}, {'NSAllowsArbitraryLoads': 1},
-                {'NSAllowsArbitraryLoads': True, 'NSAllowsArbitraryLoadsInWebContent': True}):
+                {'NSAllowsArbitraryLoads': True},
+                {'NSAllowsArbitraryLoads': True, 'NSExceptionDomains': {'tapi.zeehoev.com': {}}},
+                {'NSAllowsArbitraryLoads': True, 'NSExceptionDomains': {
+                    'tapi.zeehoev.com': {}, 'h5.zeehoev.com': {}, 'evil.invalid': {}}},
+                {'NSAllowsArbitraryLoads': True, 'NSExceptionDomains': expected_ats['NSExceptionDomains'],
+                 'NSAllowsArbitraryLoadsInWebContent': True}):
         altered = dict(info); altered['NSAppTransportSecurity'] = ats
         try:
             helper.validate_info(altered)

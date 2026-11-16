@@ -333,6 +333,10 @@ final class IOSSystemSurfacesService: NSObject, IOSBridgeService, IOSBridgeCance
     private var lastWidgetReload = -Double.infinity
     private var lastWidgetEdge = ""
     private var lastError: String?
+    private var widgetExecution: [String: Any] = [:]
+    private var widgetConfigurations: [String: Any] = ["queried": false]
+    private var widgetSnapshotReadable = false
+    private var widgetSnapshotReadError: String?
     // 车模素材：artUrl 触发的一次性下载，同一时刻只允许一个（见 refreshWidgetArt）。
     private var artTicket: UInt64 = 0
     private var artURLInFlight: String?
@@ -451,6 +455,8 @@ final class IOSSystemSurfacesService: NSObject, IOSBridgeService, IOSBridgeCance
         }
         revoking = false; latest = nil; persistedSnapshot = nil; nativeWritePending = false
         nativeRide = nil; nativeGauge = nil; lastError = nil
+        widgetExecution = [:]; widgetConfigurations = ["queried": false]
+        widgetSnapshotReadable = false; widgetSnapshotReadError = nil
         // 换车/换账号/撤销：进行中的车模下载立刻作废，迟到的字节不许落到新 owner 的文件里。
         cancelWidgetArt()
         lastNativePublish = -Double.infinity; lastGaugePublish = -Double.infinity
@@ -714,10 +720,46 @@ final class IOSSystemSurfacesService: NSObject, IOSBridgeService, IOSBridgeCance
         let ticket = epoch
         let enabled = approved
         worker.async { [weak self] in
-            let stored = enabled ? try? SystemSnapshotStore.readCurrent() : nil
+            var stored: SystemSnapshot?
+            var readError: String?
+            if enabled {
+                do { stored = try SystemSnapshotStore.readCurrent() }
+                catch { readError = (error as? SystemSnapshotError)?.code ?? "snapshot_read_failed" }
+            }
+            var execution: [String: Any] = [:]
+            let build = Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String ?? "unknown"
+            for phase in WidgetDiagnostics.Phase.allCases {
+                guard let receipt = WidgetDiagnostics.read(phase), receipt.build == build else { continue }
+                execution[phase.rawValue] = ["recordedAt": receipt.recordedAt, "build": receipt.build,
+                    "bundleIdentifier": receipt.bundleIdentifier, "appGroupIdentifier": receipt.appGroupIdentifier,
+                    "ownerID": receipt.ownerID as Any? ?? NSNull(), "capturedAt": receipt.capturedAt as Any? ?? NSNull(),
+                    "origin": receipt.origin, "reason": receipt.reason]
+            }
             DispatchQueue.main.async { [weak self] in
                 guard let self = self, self.epoch == ticket, self.current(job) else { return }
                 if self.persistedSnapshot == nil, let stored = stored { self.persistedSnapshot = stored }
+                self.widgetSnapshotReadable = stored != nil
+                self.widgetSnapshotReadError = readError
+                self.widgetExecution = execution
+                self.queryWidgetConfigurations(job)
+            }
+        }
+    }
+
+    private func queryWidgetConfigurations(_ job: Job) {
+        let ticket = epoch
+        WidgetCenter.shared.getCurrentConfigurations { [weak self] result in
+            DispatchQueue.main.async { [weak self] in
+                guard let self = self, self.epoch == ticket, self.current(job) else { return }
+                switch result {
+                case .success(let configurations):
+                    let count = configurations.filter { $0.kind == Self.widgetKind }.count
+                    self.widgetConfigurations = ["queried": true, "installedCount": count]
+                case .failure:
+                    self.widgetConfigurations = ["queried": false, "reason": "widget_configuration_query_failed"]
+                }
+                let ready = self.widgetExecution[WidgetDiagnostics.Phase.timelineReady.rawValue] != nil
+                IOSDiagnostics.shared.log("widget: hostReadable=\(self.widgetSnapshotReadable) readReason=\(self.widgetSnapshotReadError ?? "none") launched=\(self.widgetExecution[WidgetDiagnostics.Phase.launch.rawValue] != nil) timelineReady=\(ready) configurations=\(self.widgetConfigurations)")
                 self.finishStatus(job)
             }
         }
@@ -757,12 +799,22 @@ final class IOSSystemSurfacesService: NSObject, IOSBridgeService, IOSBridgeCance
             "reason": lastError as Any? ?? NSNull()]
         if let owner = owner { stored["owner"] = ownerJSON(owner) }
         let configurable = availability["perInstanceVehicleSelection"] as? Bool == true
+        let delivered = widgetExecution[WidgetDiagnostics.Phase.timelineReady.rawValue] as? [String: Any]
+        let deliveredOwner = delivered?["ownerID"] as? String
+        let executionState = widgetSnapshotReadError ?? (!approved ? "disabled"
+            : deliveredOwner == owner?.ownerIdentifierString && deliveredOwner != nil ? "timeline_delivered"
+            : widgetExecution[WidgetDiagnostics.Phase.launch.rawValue] != nil ? "awaiting_timeline"
+            : "extension_not_observed")
         return ["ok": true, "supported": supported, "enabled": supported && approved,
             "liveActivities": live, "widgets": ["supported": supported, "enabled": supported && approved && persistedSnapshot != nil,
                 "appGroupAvailable": availability["appGroupAvailable"] ?? false, "embedded": availability["embedded"] ?? false,
                 "appGroup": availability["appGroup"] ?? NSNull(),
                 "widgetExtension": availability["widgetExtension"] ?? NSNull(),
                 "kind": Self.widgetKind, "placement": "os_managed", "reason": availability["reason"] ?? NSNull(),
+                "executionState": executionState, "execution": widgetExecution,
+                "configurations": widgetConfigurations, "snapshotReadable": widgetSnapshotReadable,
+                "snapshotReadReason": widgetSnapshotReadError as Any? ?? NSNull(),
+                "verification": "extension_execution_receipt",
                 "perInstanceVehicleSelection": configurable, "perInstanceMinimumIOS": NSNull(),
                 "supportedFamilies": ["systemSmall", "systemMedium", "systemLarge"], "refreshBudget": "os_managed", "displayed": false],
             "snapshot": stored, "scope": owner.map(ownerJSON) as Any? ?? NSNull(),

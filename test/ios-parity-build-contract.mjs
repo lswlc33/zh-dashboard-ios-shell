@@ -44,6 +44,11 @@ for (const name of ['Broadcast/Info.plist', 'Entitlements/Broadcast.entitlements
 assert.ok(![...records].some(n => n.endsWith('Widgets/WidgetVehicleIntent.swift')), 'AppIntents 意图文件应已移除');
 assert.ok(![...records].some(n => /Inductive(?:Cloud|Session)\.swift$/.test(n)));
 const build = readFileSync(path.join(shell, 'build.sh'), 'utf8');
+const widgetLink = build.slice(build.indexOf('widget_args=')).split('broadcast_args=')[0];
+assert.ok(!widgetLink.includes('-Xlinker -e -Xlinker _NSExtensionMain'),
+  'WidgetKit must use Swift @main rather than the ordinary extension entry');
+assert.ok(build.slice(build.indexOf('broadcast_args=')).includes('-Xlinker -e -Xlinker _NSExtensionMain'),
+  'Broadcast must retain its traditional extension entry');
 for (const token of ['-module-name ZeehoCastBroadcast', '-Xlinker -e -Xlinker _NSExtensionMain',
   '--scan-executable "$broadcast_dir/ZeehoCastBroadcast"', '--scan-folder "$broadcast_dir/Frameworks"',
   'xcrun --sdk iphoneos swiftc']) assert.ok(build.includes(token), token);
@@ -94,6 +99,16 @@ assert not h.PRIVATE_SWIFT_RE.search('enum IOSCastWire { static let frameMax = 2
 assert h.objc_runtime_class('_OBJC_CLASS_$__TtC18ZeehoCastBroadcast13SampleHandler') == 'ZeehoCastBroadcast.SampleHandler'
 assert h.objc_runtime_class('_OBJC_CLASS_$_ExplicitHandler') == 'ExplicitHandler'
 rejects(lambda: h.macho(b'fake executable', 2), 'Truncated Mach-O')
+entry = {'mainSymbols': ['_main'], 'mainEntryAddress': 4096, 'entryAddress': 4096,
+         'extensionEntrypointSymbols': ['_NSExtensionMain'], 'extensionEntryAddress': 8192}
+h.validate_entrypoint(entry, 'host')
+h.validate_entrypoint(entry, 'widgets')
+wrong = dict(entry, entryAddress=8192)
+rejects(lambda: h.validate_entrypoint(wrong, 'widgets'), 'Swift _main')
+h.validate_entrypoint(wrong, 'broadcast')
+rejects(lambda: h.validate_entrypoint(entry, 'broadcast'), '_NSExtensionMain')
+missing = dict(entry, mainEntryAddress=None)
+rejects(lambda: h.validate_entrypoint(missing, 'widgets'), 'Swift _main')
 name = h.APP_PREFIX + c['directory'] + c['product']
 dependency = '@rpath/libswiftCompatibilityExample.dylib'
 bundled = h.APP_PREFIX + 'Frameworks/libswiftCompatibilityExample.dylib'

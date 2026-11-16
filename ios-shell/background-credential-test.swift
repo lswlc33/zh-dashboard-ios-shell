@@ -74,6 +74,13 @@ enum BackgroundCredentialTest {
 
         let dirty = makeCredential(token: "tok\nen")
         check(!dirty.canSampleVehicle, "token 含控制字符时该域不可用")
+        check(!dirty.canSignIn, "h5 token 含控制字符时也不可签到")
+        let longToken = String(repeating: "t", count: 1024)
+        let longCredential = makeCredential(token: longToken)
+        check(longCredential.canSampleVehicle && longCredential.canSignIn,
+              "合法长 token 沿用授权入口 4096 字节上限，不再被 512 字节误拒")
+        check(!makeCredential(token: String(repeating: "t", count: 4097)).isValid,
+              "超过授权入口上限的 token 两个域都拒绝")
 
         // MARK: - 5. 错误码映射：不得把「有数据但坏了」说成「没授权」
 

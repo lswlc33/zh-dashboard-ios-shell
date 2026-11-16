@@ -87,8 +87,11 @@ struct IOSBackgroundCredential: Codable, Equatable, Sendable {
     }
 
     /// 单字段合法性：非空、不超长、无控制字符。
-    private static func ok(_ value: String) -> Bool {
-        !value.isEmpty && value.utf8.count <= 512
+    ///
+    /// token 类字段单独放宽到 4096：官方换发的新 token 明显变长，
+    /// 512 的通用上限会把**有效**凭据判成非法，前端只能报「凭据无效」。
+    private static func ok(_ value: String, limit: Int = 512) -> Bool {
+        !value.isEmpty && value.utf8.count <= limit
             && !value.unicodeScalars.contains { CharacterSet.controlCharacters.contains($0) }
     }
 
@@ -98,12 +101,15 @@ struct IOSBackgroundCredential: Codable, Equatable, Sendable {
     /// 旧实现把 `isValid`（要求 h5 全齐）当成采样前提，于是「只导入了 app 域
     /// 凭据」的账号采样必然失败并报 `no_credential` —— 第二个真实成因。
     var canSampleVehicle: Bool {
-        Self.ok(accountID) && Self.ok(vin) && Self.ok(token) && Self.ok(appSecret) && Self.ok(appID)
+        Self.ok(accountID) && Self.ok(vin) && Self.ok(token, limit: 4096)
+            && Self.ok(appSecret) && Self.ok(appID)
     }
 
     /// h5 域够用才能签到。签到要 h5 的 appId/secret，token 可以用 app 域顶替。
     var canSignIn: Bool {
-        Self.ok(vin) && (!signinToken.isEmpty || !token.isEmpty) && Self.ok(h5Secret) && Self.ok(h5AppID)
+        Self.ok(accountID) && Self.ok(vin)
+            && Self.ok(signinToken.isEmpty ? token : signinToken, limit: 4096)
+            && Self.ok(h5Secret) && Self.ok(h5AppID)
     }
 
     /// 跑每日任务要 app 域凭据 + 内部 uid。

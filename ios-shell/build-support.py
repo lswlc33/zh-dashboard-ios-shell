@@ -419,8 +419,11 @@ def validate_info(info, executable='Dashboard', bundle_id=BUNDLE_ID):
     require(info.get('MinimumOSVersion') == MINIMUM_IOS, 'Deployment must be iOS 15.4')
     # Host 公开资源允许任意 HTTP；只接受这一种精确配置，不给 extension 或 WebView 加专项放行。
     ats = info.get('NSAppTransportSecurity')
-    require(isinstance(ats, dict) and set(ats) == {'NSAllowsArbitraryLoads'}
-            and ats['NSAllowsArbitraryLoads'] is True, 'Host public resource ATS configuration mismatch')
+    require(isinstance(ats, dict)
+            and ats.get('NSAllowsArbitraryLoads') is True
+            and ats.get('NSExceptionDomains') == {'tapi.zeehoev.com': {}, 'h5.zeehoev.com': {}}
+            and set(ats) == {'NSAllowsArbitraryLoads', 'NSExceptionDomains'},
+            'Host public resource ATS configuration mismatch')
     require(isinstance(info.get('NSLocalNetworkUsageDescription'), str)
             and bool(info['NSLocalNetworkUsageDescription'].strip()), 'Local TCP networking requires a user-facing purpose string')
     require('NSBonjourServices' not in info, 'Pure TCP networking must not declare Bonjour discovery')
@@ -668,6 +671,7 @@ def macho(data, expected_type, signed=True, expected_minimum=0x000F0400):
         require(directories, 'Code signature has no CodeDirectory')
     shared_symbols, widget_symbols, main_symbols, objc_classes = [], [], [], []
     extension_entry_address = None
+    main_entry_address = None
     if symtab:
         symbol_offset, count, string_offset, string_size = symtab
         require(count <= 1_000_000 and symbol_offset + count * 16 <= len(data) and string_offset + string_size <= len(data), 'Invalid Mach-O symbols')
@@ -697,6 +701,8 @@ def macho(data, expected_type, signed=True, expected_minimum=0x000F0400):
                     widget_symbols.append(name.decode('utf-8'))
             if symbol_type & 0x0E == 0x0E and name in (b'_main', b'_Dashboard_main'):
                 main_symbols.append(name.decode('utf-8'))
+                if name == b'_main':
+                    main_entry_address = struct.unpack_from('<Q', data, symbol_offset + index * 16 + 8)[0]
         # 扩展的 LC_MAIN 通常落在 lazy 绑定的 `_NSExtensionMain` stub 上（真机产物实测），
         # 那种形态下符号表里只有 undef；这里用 __stubs + 间接符号表把入口解析回符号名。
         if entry_offset is not None and lc_main_address is not None and dysymtab and dysymtab[13]:
@@ -719,8 +725,22 @@ def macho(data, expected_type, signed=True, expected_minimum=0x000F0400):
             'imports': imports, 'rpaths': rpaths, 'codeSignaturePresent': signature is not None,
             'signature': signature_metadata, 'entrypointPresent': entrypoint, 'mainSymbols': main_symbols,
             'extensionEntrypointSymbols': widget_symbols, 'entryAddress': lc_main_address,
-            'extensionEntryAddress': extension_entry_address, 'definedObjCClasses': sorted(objc_classes),
+            'mainEntryAddress': main_entry_address, 'extensionEntryAddress': extension_entry_address,
+            'definedObjCClasses': sorted(objc_classes),
             'sharedClassSymbolCount': len(shared_symbols), 'sharedClassSymbols': shared_symbols[:8]}
+
+
+def validate_entrypoint(report, target):
+    # WidgetKit 与 UIKit Host 都要执行 Swift 生成的 main；Broadcast 才走传统扩展入口。
+    # 只检查符号存在不够：旧包同时含 _main，却把 LC_MAIN 指到了 _NSExtensionMain stub。
+    if target in ('host', 'widgets'):
+        require('_main' in report['mainSymbols'] and report.get('mainEntryAddress') is not None
+                and report['entryAddress'] == report['mainEntryAddress'],
+                'Swift _main must be the real LC_MAIN entrypoint: ' + target)
+    else:
+        require(report['extensionEntrypointSymbols'] and report['extensionEntryAddress'] is not None
+                and report['entryAddress'] == report['extensionEntryAddress'],
+                'Extension _NSExtensionMain must be the real LC_MAIN entrypoint: ' + target)
 
 
 def objc_runtime_class(symbol):
@@ -869,7 +889,7 @@ def validate_ipa(path, expected_info=None):
         binary_name = app_prefix + product
         reports = {binary_name: macho(archive.read(binary_name), 2)}
         main = reports[binary_name]
-        require({'_main'}.intersection(main['mainSymbols']), 'Host executable main/module entrypoint symbol missing')
+        validate_entrypoint(main, 'host')
         signature_id = main['signature'].get('identifier')
         require(signature_id == actual_id, 'CodeDirectory identifier must match actual Info.plist bundle ID')
         extension_prefixes = {key: app_prefix + contract['directory'] for key, contract in EXTENSIONS.items()}
@@ -889,11 +909,9 @@ def validate_ipa(path, expected_info=None):
             resources = prefix + '_CodeSignature/CodeResources'
             require(resources in names and isinstance(plistlib.loads(archive.read(resources)), dict), 'Extension resource signature missing/invalid: ' + key)
             code = reports[binary] = macho(archive.read(binary), 2)
-            # 导入符号本身不够；LC_MAIN 必须落在真正 _NSExtensionMain 定义或 stub 上。
-            require(code['extensionEntrypointSymbols'] and code['extensionEntryAddress'] is not None
-                    and code['entryAddress'] == code['extensionEntryAddress']
-                    and code['signature'].get('identifier') == contract['bundleID'],
-                    'Extension _NSExtensionMain must be the real LC_MAIN entrypoint and match the signature identity: ' + key)
+            validate_entrypoint(code, key)
+            require(code['signature'].get('identifier') == contract['bundleID'],
+                    'Extension signature identity does not match its bundle: ' + key)
             require(code['sharedClassSymbolCount'] == 0 and not any('ZeehoShared.framework' in i['path'] for i in code['imports']),
                     'KMP must not be linked into extensions: ' + key)
             require(code['signature'].get('entitlements') == EXTENSION_ENTITLEMENTS,

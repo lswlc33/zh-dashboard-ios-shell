@@ -25,14 +25,22 @@ public enum ZeehoWidgetCommandMailbox {
         let descriptor = open(path, O_CREAT | O_RDWR | O_NOFOLLOW, S_IRUSR | S_IWUSR)
         guard descriptor >= 0 else { throw CocoaError(.fileReadNoPermission) }
         defer { close(descriptor) }
-        guard flock(descriptor, LOCK_EX) == 0 else { throw CocoaError(.fileLocking) }
+        var locked = false
+        for attempt in 0..<21 {
+            if flock(descriptor, LOCK_EX | LOCK_NB) == 0 { locked = true; break }
+            if attempt < 20 { usleep(5_000) }
+        }
+        guard locked else { throw CocoaError(.fileLocking) }
         defer { _ = flock(descriptor, LOCK_UN) }
         return try body()
     }
 
+    private static let actions: Set<String> = ["unlock", "lock", "horn", "seat"]
+
     @discardableResult
     public static func post(_ action: String, ownerID: String) -> Bool {
-        guard !ownerID.isEmpty, ownerID.utf8.count <= 161,
+        guard actions.contains(action), SystemSnapshotStore.ownerIdentifier(ownerID) != nil,
+              let active = try? SystemSnapshotStore.currentOwner(), active.ownerIdentifierString == ownerID,
               let root = FileManager.default.containerURL(forSecurityApplicationGroupIdentifier: AppGroup.current()) else { return false }
         let directory = root.appendingPathComponent(directoryName, isDirectory: true)
         do {
@@ -49,14 +57,20 @@ public enum ZeehoWidgetCommandMailbox {
 
     /// 旧小组件命令永不重绑定到当前选中的 owner。
     public static func consume(ownerID: String, now: Int64 = Int64(Date().timeIntervalSince1970 * 1000)) -> Command? {
-        guard !ownerID.isEmpty,
+        guard SystemSnapshotStore.ownerIdentifier(ownerID) != nil,
               let root = FileManager.default.containerURL(forSecurityApplicationGroupIdentifier: AppGroup.current()) else { return nil }
         let url = root.appendingPathComponent(directoryName, isDirectory: true).appendingPathComponent(fileName)
-        return (try? withLock(root) {
-            guard let data = try? Data(contentsOf: url), let value = try? JSONDecoder().decode(Command.self, from: data) else {
+        return (try? withLock(root) { () -> Command? in
+            guard let metadata = try? url.resourceValues(forKeys: [.isRegularFileKey, .isSymbolicLinkKey, .fileSizeKey]),
+                  metadata.isRegularFile == true, metadata.isSymbolicLink != true,
+                  let size = metadata.fileSize, size > 0, size <= 1024,
+                  let handle = try? FileHandle(forReadingFrom: url) else { return nil }
+            defer { try? handle.close() }
+            guard let data = try? handle.read(upToCount: 1025), data.count <= 1024,
+                  let value = try? JSONDecoder().decode(Command.self, from: data) else {
                 try? FileManager.default.removeItem(at: url); return nil
             }
-            guard UUID(uuidString: value.id) != nil, !value.action.isEmpty, value.ownerID == ownerID,
+            guard UUID(uuidString: value.id) != nil, actions.contains(value.action), value.ownerID == ownerID,
                   value.createdAt > 0, now >= value.createdAt, now - value.createdAt <= maxAgeMs else {
                 try? FileManager.default.removeItem(at: url)
                 return nil

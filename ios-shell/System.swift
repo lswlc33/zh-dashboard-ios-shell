@@ -42,7 +42,7 @@ final class IOSSystemService: NSObject, IOSBridgeCancellableService, IOSBridgeMe
 
     let methods = [
         "file.share", "file.save", "clipboard.write", "clipboard.read",
-        "app.info", "app.appearance", "app.settings", "app.diag", "notifications.status", "notifications.request",
+        "app.info", "app.amapIdentity", "app.appearance", "app.settings", "app.diag", "notifications.status", "notifications.request",
         "notifications.schedule", "notifications.cancel", "media.permission", "photos.save"
     ]
 
@@ -174,6 +174,10 @@ final class IOSSystemService: NSObject, IOSBridgeCancellableService, IOSBridgeMe
                 case "app.info":
                     guard options.isEmpty else { throw Failure(IOSStrings.invalidArguments) }
                     reply(self.appInfo(), nil)
+                case "app.amapIdentity":
+                    // 仅当前可信文档可读取固定身份，不能带入参或把身份内容写进诊断。
+                    guard args.isEmpty else { throw Failure(IOSStrings.invalidArguments) }
+                    reply(IOSAmapIdentity.read(), nil)
                 case "app.diag":
                     // 网页把自己的错误写进原生日志文件：白屏时用户导出这份文件即可。
                     // 只接受一条短文本，不做任何解析，也没有副作用。

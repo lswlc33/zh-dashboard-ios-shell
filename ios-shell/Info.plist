@@ -11,15 +11,19 @@
     <key>CFBundleDisplayName</key><string>Zeeho Panel</string>
     <key>CFBundleExecutable</key><string>Dashboard</string>
     <key>CFBundlePackageType</key><string>APPL</string>
-    <key>CFBundleShortVersionString</key><string>1.1.25</string>
-    <key>CFBundleVersion</key><string>73</string>
+    <key>CFBundleShortVersionString</key><string>1.1.26</string>
+    <key>CFBundleVersion</key><string>74</string>
     <key>MinimumOSVersion</key><string>15.4</string>
     <key>LSRequiresIPhoneOS</key><true/>
-    <!-- 公开素材可能只有 HTTP，URLSession 需 host 级 ATS 放行；此键也弱化 host ATS，
-         不承诺仅影响原生。WebView 业务导航/桥来源仍由 Swift 限定为 HTTPS 或本地快照，
-         不添加 NSAllowsArbitraryLoadsInWebContent，Widget/Broadcast 也不继承此配置。 -->
+    <!-- 公开资源可能只有 HTTP。此全局 ATS 例外会弱化 iOS 原生请求及 WKWebView 网络子资源；
+         不是 URLSession 专属例外。WebView 主框架仍由 Dashboard 限制为 HTTPS 或本地快照，
+         tapi/h5 显式恢复默认完整 ATS；Widget/Broadcast 不继承本配置。 -->
     <key>NSAppTransportSecurity</key><dict>
         <key>NSAllowsArbitraryLoads</key><true/>
+        <key>NSExceptionDomains</key><dict>
+            <key>tapi.zeehoev.com</key><dict/>
+            <key>h5.zeehoev.com</key><dict/>
+        </dict>
     </dict>
     <key>UIDeviceFamily</key><array><integer>1</integer><integer>2</integer></array>
     <key>UILaunchScreen</key><dict/>

@@ -238,8 +238,9 @@ except Exception as error:
 if not isinstance(data, list) or not data:
     sys.exit("BLOCKED: host const-values 为空，快捷指令看不到后台 intent（检查协议清单）")
 ZEEHO_CHECKHOSTCV
+# WidgetKit 必须从 Swift @main 生成的 _main 启动，才能执行 WidgetBundle.main()。
+# 普通扩展的 _NSExtensionMain 会绕过这段注册逻辑；该入口只留给下方 Broadcast。
 widget_args=(-I "$build_dir" "$build_dir/ZeehoSystemShared.o" "${activity_args[@]}" -framework Foundation \
-    -Xlinker -e -Xlinker _NSExtensionMain \
     -Xlinker -rpath -Xlinker '@executable_path/../../Frameworks' \
     -Xlinker -rpath -Xlinker '@executable_path/Frameworks' -Xlinker -rpath -Xlinker /usr/lib/swift)
 while IFS= read -r module; do

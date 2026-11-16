@@ -62,10 +62,8 @@ struct ZeehoVehicleEntry: TimelineEntry {
 
 /// `getTimeline` 的一次性闸门：网络结果与超时兜底**先到先赢**，`completion` 只调一次。
 ///
-/// 为什么必须有：WidgetKit 的时间预算只有几秒，而一次联网最坏 18 秒。
-/// 直接 `await` 会让系统在预算到点时掐掉扩展，`completion` 永不调用 ——
-/// 表现就是「小组件一直显示旧数据 / 一直占位」，而且系统不会立刻再给机会。
-/// 用闸门保证：预算内一定交出 timeline（哪怕是快照兜底），网络结果只用于填缓存。
+/// 网络可能在扩展完成时间线之前尚未返回；系统也可能提前停止扩展。
+/// 用本地兜底尽早交出 timeline，不能把 3.5 秒当作系统保证的固定执行预算。
 private final class TimelineGate {
     private let lock = NSLock()
     private var completion: ((Timeline<ZeehoVehicleEntry>) -> Void)?
@@ -85,6 +83,9 @@ private final class TimelineGate {
         lock.unlock()
         fallback?.cancel()
         callback?(timeline)
+        if callback != nil, let entry = timeline.entries.first {
+            WidgetDiagnostics.record(.timelineReady, snapshot: entry.snapshot, origin: entry.origin.rawValue)
+        }
     }
 
     /// 超时兜底：到点还没 finish 就先交一份「只读本地」的 timeline。
@@ -98,7 +99,12 @@ private final class TimelineGate {
             self.fallback = nil
             self.lock.unlock()
             guard let callback = callback else { return }
-            callback(build())
+            let timeline = build()
+            callback(timeline)
+            if let entry = timeline.entries.first {
+                WidgetDiagnostics.record(.timelineReady, snapshot: entry.snapshot,
+                                         origin: entry.origin.rawValue, reason: "local_fallback")
+            }
         }
         lock.lock()
         fallback = item
@@ -120,20 +126,21 @@ struct ZeehoVehicleProvider: TimelineProvider {
 
     func getSnapshot(in context: Context, completion: @escaping (ZeehoVehicleEntry) -> Void) {
         // 图库预览不联网：只读已有快照/缓存，避免添加小组件时卡住预览面板。
-        completion(ZeehoWidgetReader.read(at: Date()))
+        let entry = ZeehoWidgetReader.read(at: Date())
+        WidgetDiagnostics.record(.snapshot, snapshot: entry.snapshot, origin: entry.origin.rawValue)
+        completion(entry)
     }
 
     func getTimeline(in context: Context, completion: @escaping (Timeline<ZeehoVehicleEntry>) -> Void) {
-        // WidgetKit 给的时间预算只有几秒级；网络最坏要 18 秒（见 WidgetVehicleClient），
-        // 直接 await 会被系统掐断，表现是「小组件永远停在旧数据 / 占位态」。
-        // 所以这里用一次性闸门：**先到先赢**，超时就交快照兜底的 timeline，
-        // 之后网络回来也只是把结果写进缓存，下次刷新自然用上。
+        // 网络可能串行等待多轮请求；本地兜底先交付，避免时间线完全依赖网络完成。
+        // 这是应用选择的等待上限，系统没有承诺给扩展固定的秒数预算。
+        WidgetDiagnostics.record(.timelineStarted)
         let gate = TimelineGate(completion: completion)
         Task {
             let result = await WidgetDataSource.load(at: Date())
             gate.finish(Self.timeline(entry: ZeehoWidgetReader.entry(result, at: Date()), now: Date()))
         }
-        // 保守取 3.5 秒：与系统对 App Extension 的常见预算留出余量。
+        // 最多等待网络 3.5 秒，再交本地结果；这不是系统保证的执行时长。
         gate.scheduleFallback(seconds: 3.5) {
             let now = Date()
             // 多语句闭包必须显式 return（单表达式闭包才允许省略）。
@@ -168,8 +175,12 @@ enum ZeehoWidgetReader {
     /// 同步读（只用于图库预览）：只走快照/缓存，不联网。
     static func read(at date: Date, vehicleID: String? = nil, showName: Bool? = nil,
                      showTime: Bool? = nil) -> ZeehoVehicleEntry {
-        makeEntry(snapshot: readSnapshot(at: date, vehicleID: vehicleID),
-                  origin: .snapshot, at: date, showName: showName, showTime: showTime)
+        if vehicleID == nil || vehicleID?.isEmpty == true {
+            return entry(WidgetDataSource.loadLocal(at: date), at: date,
+                         showName: showName, showTime: showTime)
+        }
+        return makeEntry(snapshot: readSnapshot(at: date, vehicleID: vehicleID),
+                         origin: .snapshot, at: date, showName: showName, showTime: showTime)
     }
 
     /// 把取数结果组装成 entry（Provider 用）。
@@ -797,6 +808,7 @@ struct ZeehoVehicleWidget: Widget {
 @main
 struct ZeehoWidgets {
     static func main() {
+        WidgetDiagnostics.record(.launch)
         if #available(iOS 17.0, *) {
             ZeehoModernWidgets.main()
         } else {

@@ -7,7 +7,7 @@ import ZeehoShared
 
 // iOS 只做真实前台样本的系统 IO。采样 admission、积分、缺口和充电段全部交给 KMP。
 final class IOSHistoryService: IOSBridgeService {
-    let methods = ["history.record", "history.battery", "history.charge", "history.clear", "history.status"]
+    let methods = ["history.record", "history.battery", "history.ocv", "history.charge", "history.clear", "history.status"]
 
     private typealias Object = [String: Any]
     private typealias Reply = (Any?, String?) -> Void
@@ -221,6 +221,8 @@ final class IOSHistoryService: IOSBridgeService {
                                 throw Failure("history_invalid_range")
                             }
                             self.complete(request, try self.batteryResponse(state, range, request))
+                        case "history.ocv":
+                            self.complete(request, try self.ocvResponse(state, request, dropped: loaded.droppedPoints))
                         case "history.charge":
                             self.complete(request, try self.chargeResponse(state, request, dropped: loaded.droppedPoints))
                         default: throw Failure("history_unsupported_method")
@@ -571,6 +573,25 @@ final class IOSHistoryService: IOSBridgeService {
         // report 字段，否则 IPC 体积凭空翻倍（电池点最多约 1MB）。
         let result: Object = ["report": report, "storageRevision": state.revision]
         return result
+    }
+
+    private func ocvResponse(_ state: StoreState, _ request: Request, dropped: Int) throws -> Object {
+        var report = try sharedObject(state.battery.ocvReportJSON(now: nowMillis()))
+        guard report["samples"] is [Any], var sampling = report["metadata"] as? Object else {
+            throw Failure("history_invalid_shared_report")
+        }
+        // 保留 KMP 的抽样范围/截断标记，再合入当前 scope；不能覆盖成伪连续后台采样。
+        metadata(request).forEach { sampling[$0.key] = $0.value }
+        let write = writeError(request.owner)
+        let degraded = write != nil || dropped > 0
+        sampling["degraded"] = degraded; sampling["droppedPoints"] = dropped
+        if degraded { sampling["staticInferenceAllowed"] = false }
+        report["vin"] = request.scope.vin
+        report["metadata"] = sampling
+        report["sampling"] = "foreground-only"; report["backgroundPolling"] = false
+        report["degraded"] = degraded; report["droppedPoints"] = dropped
+        if let write = write { report["writeError"] = write }
+        return ["report": report, "storageRevision": state.revision]
     }
 
     private func chargeResponse(_ state: StoreState, _ request: Request, dropped: Int = 0) throws -> Object {
