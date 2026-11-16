@@ -366,10 +366,20 @@ if printf '%s\n' "$stdlib_help" | grep -q -- '--filter-for-swift-os'; then
 else
     printf 'note: swift-stdlib-tool 不支持 --filter-for-swift-os，跳过该过滤（deployment target 15.4 自带运行时）\n'
 fi
-stdlib_status=0
-( xcrun --sdk iphoneos swift-stdlib-tool "${stdlib_args[@]}" ) || stdlib_status=$?
-if [[ $stdlib_status -ne 0 ]]; then
-    printf 'warning: swift-stdlib-tool 失败（status=%s，扫描阶段），继续由兼容性 dylib 扫描兜底\n' "$stdlib_status" >&2
+# 默认跳过：Xcode 26 的 swift-stdlib-tool 扫描含弱链接 AppIntents/ActivityKit 的
+# 扩展时会在进程内 trap。实测 SIGABRT 连 `|| status=$?` 都捕获不到、也不打印兜底
+# 警告，整条 build.sh 直接 134 退出（本仓库 CI 连续复现）。deployment target 15.4
+# 高于 Swift ABI 稳定线（iOS 12.2），设备自带运行时，这一步通常不需要拷贝任何库。
+# 真正需要的兼容性 dylib 仍由下面的扫描 + 签名循环兜住；需要时可用
+# ZEEHO_RUN_STDLIB_TOOL=1 显式开启排查。
+if [[ "${ZEEHO_RUN_STDLIB_TOOL:-0}" == "1" ]]; then
+    stdlib_status=0
+    ( xcrun --sdk iphoneos swift-stdlib-tool "${stdlib_args[@]}" ) || stdlib_status=$?
+    if [[ $stdlib_status -ne 0 ]]; then
+        printf 'warning: swift-stdlib-tool 失败（status=%s，扫描阶段），继续由兼容性 dylib 扫描兜底\n' "$stdlib_status" >&2
+    fi
+else
+    printf 'note: 跳过 swift-stdlib-tool 扫描（14/15.4 自带 Swift 运行时；需要时设 ZEEHO_RUN_STDLIB_TOOL=1）\n'
 fi
 while IFS= read -r -d '' dylib; do
     architectures="$(xcrun lipo -archs "$dylib")"
