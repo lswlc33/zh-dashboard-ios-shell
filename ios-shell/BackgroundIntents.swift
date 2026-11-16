@@ -69,75 +69,51 @@ struct ZeehoRunBackgroundTaskIntent: AppIntent {
     init(action: IOSBackgroundIntentAction) { self.action = action }
 
     func perform() async throws -> some IntentResult & ProvidesDialog {
-        var parts: [String] = []
-        // 签到先跑：每日任务的进度里要把签到算成一项（N/M 的 M 含签到），
-        // 而且签到更快，先拿下它，万一步骤超预算也不会连签到都做不完。
-        var signInDone = false
-        if action.wantsSignIn {
-            // 这里**故意不看**设置里的自动签到开关：快捷指令 / 个人自动化是用户主动触发的一次
-            // 执行，不是系统在后台定时自动跑。那个开关的语义只是「允许系统自己定时签到」，
-            // 拿它挡住用户手动触发，就会出现「我明明点了签到，却只回一句自动签到未开启」。
-            // 系统定时路径（BGAppRefreshTask -> IOSBackgroundRunner.runSignIn 默认参数）仍然
-            // 尊重该开关，两条路径的区分写在 runSignIn 的注释里。
-            //
-            // 回执必须在 completion 回调里读：runSignIn 是异步的，请求发出后才会记账，
-            // 在 await 之前读到的还是上一条旧记录。
-            let report = await withCheckedContinuation { continuation in
-                IOSBackgroundRunner.runSignIn(force: true) { _ in
-                    continuation.resume(returning: IOSBackgroundScheduler.report(IOSBackgroundTaskID.signIn))
+        let requested = action
+        let parts: [String]
+        do {
+            parts = try await IOSBackgroundRunner.withRun(source: .shortcut, budget: 25) { context in
+                var parts: [String] = []
+                var signInDone = false
+                if requested.wantsSignIn {
+                    try context.check()
+                    let report = await IOSBackgroundRunner.runSignIn(force: true, context: context)
+                    try context.check()
+                    let daysPart = report.lastSignInDays.map { "（连签 \($0) 天）" } ?? ""
+                    switch report.lastResult {
+                    case "already_signed", "signed":
+                        signInDone = true
+                        parts.append((report.lastResult == "already_signed" ? "今日已签到" : "签到成功") + daysPart)
+                    case _ where ZeehoCredentialIssueText.isCredentialIssue(report.lastResult):
+                        parts.append("签到失败（" + ZeehoCredentialIssueText.text(report.lastResult) + "）")
+                    default: parts.append("签到失败（\(report.lastResult)）")
+                    }
                 }
-            }
-            let daysPart = report.lastSignInDays.map { "（连签 \($0) 天）" } ?? ""
-            switch report.lastResult {
-            case "already_signed", "signed":
-                signInDone = true
-                parts.append((report.lastResult == "already_signed" ? "今日已签到" : "签到成功") + daysPart)
-            case _ where ZeehoCredentialIssueText.isCredentialIssue(report.lastResult):
-                // runSignIn 在缺凭据时回 completion(true)，那是给系统调度评分用的
-                // （缺凭据不是运行失败，不该扣分）；对用户来说这次确实没签上，不能报成功。
-                parts.append("签到失败（" + ZeehoCredentialIssueText.text(report.lastResult) + "）")
-            default:
-                parts.append("签到失败（\(report.lastResult)）")
-            }
-        }
-        if action.wantsDailyTasks {
-            // 预算分配：签到已经吃掉一部分时间，任务这边按剩余量给（最少 8s，最多 25s）。
-            // 两个都跑时压缩到 20s，避免加起来越过 AppIntent 的 30 秒硬上限。
-            let budget: TimeInterval = action.wantsSignIn ? 20 : 25
-            let report = await withCheckedContinuation { continuation in
-                IOSBackgroundRunner.runDailyTasks(force: true, signInDone: signInDone, budget: budget) {
-                    continuation.resume(returning: $0)
+                if requested.wantsDailyTasks {
+                    try context.check()
+                    let report = await IOSBackgroundRunner.runDailyTasks(force: true, signInDone: signInDone, context: context)
+                    try context.check()
+                    parts.append(IOSBackgroundRunner.summary(report))
+                    for item in report.failed { parts.append("\(item.name)失败（\(item.reason)）") }
+                    if report.result == "credential_partial" { parts.append("请在面板里重新授权后台任务以补全账号 id") }
                 }
-            }
-            // 进度文案：这是用户主动触发时唯一能立刻看到结果的地方，必须写全 N/M。
-            parts.append(IOSBackgroundRunner.summary(report))
-            if !report.completed.isEmpty { parts.append("完成 " + report.completed.joined(separator: "、")) }
-            // 失败项带上原因码，用户在快捷指令里就能看出是网络还是凭据问题。
-            for item in report.failed { parts.append("\(item.name)失败（\(item.reason)）") }
-            if report.result == "credential_partial" { parts.append("请在面板里重新授权后台任务以补全账号 id") }
-        }
-        if action.wantsSample {
-            // 与签到同样的道理：runRefresh 的布尔是「运行是否正常走完」，不是「取数是否成功」，
-            // 网络失败与缺凭据都回 true（那是给系统调度评分用的，不是给用户看的结论）。
-            // 所以成败一律按 completion 回调里读到的 lastResult 判定，`ok` 才算真取到；
-            // 从没跑过是 `never`，同样落到失败分支显示真实机器码，不能谎报「车况已更新」。
-            let report = await withCheckedContinuation { continuation in
-                IOSBackgroundRunner.runRefresh { _ in
-                    continuation.resume(returning: IOSBackgroundScheduler.report(IOSBackgroundTaskID.refresh))
+                if requested.wantsSample {
+                    // 共用一开始领取的期限；前面耗尽时间就不会再发起采样请求。
+                    try context.check()
+                    let report = await IOSBackgroundRunner.runRefresh(context: context)
+                    try context.check()
+                    switch report.lastResult {
+                    case "ok": parts.append("车况已更新")
+                    case _ where ZeehoCredentialIssueText.isCredentialIssue(report.lastResult):
+                        parts.append("车况采样失败（" + ZeehoCredentialIssueText.text(report.lastResult) + "）")
+                    default: parts.append("车况采样失败（\(report.lastResult)）")
+                    }
                 }
+                return parts
             }
-            switch report.lastResult {
-            case "ok":
-                parts.append("车况已更新")
-            case _ where ZeehoCredentialIssueText.isCredentialIssue(report.lastResult):
-                // 凭据侧的原因按真实码翻译，并给出**下一步该做什么**：
-                // 「未导入后台凭据」这句话在用户明明授权过时只会让他反复重试。
-                parts.append("车况采样失败（" + ZeehoCredentialIssueText.text(report.lastResult) + "）")
-            default:
-                parts.append("车况采样失败（\(report.lastResult)）")
-            }
-            // 采样失败只记账、不提前 return：签到与任务是独立的另外两件事，
-            // 不能因为取车况失败就把它们也一起放弃。用「；」拼接。
+        } catch {
+            // 不读取旧的持久回执冒充本轮结果；取消/预算耗尽按本轮真实码返回。
+            parts = ["后台任务未完成（\(IOSDailyTasksClient.code(of: error))）"]
         }
         return .result(dialog: IntentDialog(stringLiteral: parts.isEmpty ? "没有要执行的动作" : parts.joined(separator: "；")))
     }

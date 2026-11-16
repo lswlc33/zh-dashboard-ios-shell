@@ -139,9 +139,10 @@ def require(condition, message):
 # 这些是真·文本：Windows（CRLF）与 CI/Mac（LF）对同一 commit 必须给出同一个指纹，
 # 否则「上传快照 == 完整构建输入」这条安全前提在跨平台时永远对不上。
 # 除常见源码扩展名外，还必须覆盖 .entitlements（XML 模板）、.toml（libs.versions）、
-# .xml/.html/.css/.txt —— 仓库里都存在，漏掉就会让同一 commit 有两个指纹。
+# .strings（本地化 plist 文本）与 .xml/.html/.css/.txt —— 仓库里都存在，漏掉会让
+# 同一 commit 在 Windows git archive 与 CI/Mac 间产生不同指纹。
 TEXT_EXTENSIONS = {
-    '.swift', '.py', '.sh', '.js', '.mjs', '.json', '.plist', '.entitlements', '.yml', '.yaml',
+    '.swift', '.py', '.sh', '.js', '.mjs', '.json', '.plist', '.entitlements', '.strings', '.yml', '.yaml',
     '.md', '.kt', '.kts', '.gradle', '.properties', '.toml', '.xml', '.html', '.css', '.txt', '.bat',
 }
 

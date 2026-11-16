@@ -57,6 +57,11 @@ struct IOSBackgroundTaskReport: Codable, Equatable, Sendable {
     var lastCharging: Bool?
     /// 上次签到成功的连签天数。
     var lastSignInDays: Int?
+    /// 明确成功的签到时间；失败时清空，不与上次连签天数混用。
+    var lastSignInAt: Int64?
+    /// 每日任务所属匿名 owner/date，用来防止旧账号或旧日期凑进度。
+    var ownerID: String?
+    var day: String?
     /// 每日任务：今日已完成项数（含签到）。只有 dailyTasks 任务会写。
     var lastDailyDone: Int?
     /// 每日任务：今日可执行项总数（签到 + 发帖/点赞/分享）。
@@ -78,6 +83,9 @@ struct IOSBackgroundTaskReport: Codable, Equatable, Sendable {
         lastSocPercent = try? box.decodeIfPresent(Double.self, forKey: .lastSocPercent)
         lastCharging = try? box.decodeIfPresent(Bool.self, forKey: .lastCharging)
         lastSignInDays = try? box.decodeIfPresent(Int.self, forKey: .lastSignInDays)
+        lastSignInAt = try? box.decodeIfPresent(Int64.self, forKey: .lastSignInAt)
+        ownerID = try? box.decodeIfPresent(String.self, forKey: .ownerID)
+        day = try? box.decodeIfPresent(String.self, forKey: .day)
         lastDailyDone = try? box.decodeIfPresent(Int.self, forKey: .lastDailyDone)
         lastDailyTotal = try? box.decodeIfPresent(Int.self, forKey: .lastDailyTotal)
         lastDailySummary = try? box.decodeIfPresent(String.self, forKey: .lastDailySummary)
@@ -86,12 +94,14 @@ struct IOSBackgroundTaskReport: Codable, Equatable, Sendable {
     }
 
     init(lastRunAt: Int64? = nil, lastResult: String, lastSocPercent: Double? = nil,
-         lastCharging: Bool? = nil, lastSignInDays: Int? = nil, lastDailyDone: Int? = nil,
-         lastDailyTotal: Int? = nil, lastDailySummary: String? = nil,
+         lastCharging: Bool? = nil, lastSignInDays: Int? = nil, lastSignInAt: Int64? = nil,
+         ownerID: String? = nil, day: String? = nil,
+         lastDailyDone: Int? = nil, lastDailyTotal: Int? = nil, lastDailySummary: String? = nil,
          runCount: Int, successCount: Int) {
         self.lastRunAt = lastRunAt; self.lastResult = lastResult
         self.lastSocPercent = lastSocPercent; self.lastCharging = lastCharging
-        self.lastSignInDays = lastSignInDays
+        self.lastSignInDays = lastSignInDays; self.lastSignInAt = lastSignInAt
+        self.ownerID = ownerID; self.day = day
         self.lastDailyDone = lastDailyDone; self.lastDailyTotal = lastDailyTotal
         self.lastDailySummary = lastDailySummary
         self.runCount = runCount; self.successCount = successCount
@@ -102,6 +112,41 @@ struct IOSBackgroundTaskReport: Codable, Equatable, Sendable {
 ///
 /// 只管三件事：注册 handler、提交请求、维护「上次跑了什么」。
 /// 不做任何网络或签名——那些在 IOSBackgroundSignIn。
+/// expiration 可先于 Task 安装；把「已结束」和 handle 一起保护，晚安装的 Task 也立即取消。
+@available(iOS 13.0, *)
+private final class IOSBackgroundScheduledRun {
+    private let lock = NSLock()
+    private var finished = false
+    private var operation: Task<Void, Never>?
+    private let task: BGAppRefreshTask
+    private let name: String
+
+    init(task: BGAppRefreshTask, name: String) { self.task = task; self.name = name }
+
+    func install(_ value: Task<Void, Never>) {
+        lock.lock()
+        let ended = finished
+        if !ended { operation = value }
+        lock.unlock()
+        if ended { value.cancel() }
+    }
+
+    func complete(_ success: Bool, cancel: Bool = false) {
+        lock.lock()
+        guard !finished else { lock.unlock(); return }
+        finished = true
+        let current = operation
+        operation = nil
+        lock.unlock()
+        if cancel {
+            IOSBackgroundRunCoordinator.shared.cancelSystem(name)
+            current?.cancel()
+        }
+        task.setTaskCompleted(success: success)
+        IOSBackgroundLog.write("结束 \(name) success=\(success)")
+    }
+}
+
 @available(iOS 13.0, *)
 final class IOSBackgroundScheduler {
     static let shared = IOSBackgroundScheduler()
@@ -123,23 +168,23 @@ final class IOSBackgroundScheduler {
     /// 不会因为 Info.plist 里还没加 identifier 就在启动时报错。
     /// 注意闭包类型不能再写 `@escaping`——可选闭包类型参数本身已是 escaping，
     /// 再标一次会被 Swift 直接拒（CI 实测 "closure is already escaping in optional type argument"）。
-    func register(refresh: @escaping (@escaping (Bool) -> Void) -> Void,
-                  signIn: @escaping (@escaping (Bool) -> Void) -> Void,
-                  dailyTasks: (((@escaping (Bool) -> Void) -> Void))? = nil) {
+    func register(refresh: @escaping (@escaping (Bool) -> Void) -> Task<Void, Never>,
+                  signIn: @escaping (@escaping (Bool) -> Void) -> Task<Void, Never>,
+                  dailyTasks: (() async -> Bool)? = nil) {
         guard !registered else { return }
         registered = true
         handlers[IOSBackgroundTaskID.refresh] = { task in
             guard let task = task as? BGAppRefreshTask else { return }
-            Self.run(task: task, name: IOSBackgroundTaskID.refresh, reportKind: .refresh, body: refresh)
+            Self.run(task: task, name: IOSBackgroundTaskID.refresh, body: refresh)
         }
         handlers[IOSBackgroundTaskID.signIn] = { task in
             guard let task = task as? BGAppRefreshTask else { return }
-            Self.run(task: task, name: IOSBackgroundTaskID.signIn, reportKind: .signIn, body: signIn)
+            Self.run(task: task, name: IOSBackgroundTaskID.signIn, body: signIn)
         }
         if let dailyTasks = dailyTasks {
             handlers[IOSBackgroundTaskID.dailyTasks] = { task in
                 guard let task = task as? BGAppRefreshTask else { return }
-                Self.run(task: task, name: IOSBackgroundTaskID.dailyTasks, reportKind: .dailyTasks, body: dailyTasks)
+                Self.run(task: task, name: IOSBackgroundTaskID.dailyTasks, asyncBody: dailyTasks)
             }
         }
         for (identifier, handler) in handlers {
@@ -156,25 +201,27 @@ final class IOSBackgroundScheduler {
         }
     }
 
-    private enum ReportKind { case refresh, signIn, dailyTasks }
+    private static func run(task: BGAppRefreshTask, name: String,
+                            asyncBody: @escaping () async -> Bool) {
+        run(task: task, name: name) { completion in
+            Task {
+                guard !Task.isCancelled else { completion(false); return }
+                let success = await asyncBody()
+                completion(success && !Task.isCancelled)
+            }
+        }
+    }
 
-    private static func run(task: BGAppRefreshTask, name: String, reportKind: ReportKind,
-                            body: @escaping (@escaping (Bool) -> Void) -> Void) {
+    private static func run(task: BGAppRefreshTask, name: String,
+                            body: @escaping (@escaping (Bool) -> Void) -> Task<Void, Never>) {
         IOSBackgroundLog.write("开始 \(name)")
-        var finished = false
-        let complete: (Bool) -> Void = { success in
-            // 系统可能先触发 expirationHandler 再让我们回来；重复 setTaskCompleted 会崩。
-            guard !finished else { return }
-            finished = true
-            task.setTaskCompleted(success: success)
-            IOSBackgroundLog.write("结束 \(name) success=\(success)")
-        }
+        let state = IOSBackgroundScheduledRun(task: task, name: name)
         task.expirationHandler = {
-            // 到点没做完必须立刻收尾，否则系统会认为任务失控并减少后续调度。
             IOSBackgroundLog.write("超时 \(name)")
-            complete(false)
+            state.complete(false, cancel: true)
         }
-        body(complete)
+        let operation = body { state.complete($0) }
+        state.install(operation)
     }
 
     /// 重排下一次。系统会自己决定什么时候真的跑，这里只是「再排一次」。
@@ -203,6 +250,7 @@ final class IOSBackgroundScheduler {
 
     /// 取消某个任务的排队。用户关掉自动签到时要调用，否则后台还会继续跑。
     func cancel(_ identifier: String) {
+        IOSBackgroundRunCoordinator.shared.cancelSystem(identifier)
         BGTaskScheduler.shared.cancel(taskRequestWithIdentifier: identifier)
         Self.defaults.set(false, forKey: Self.scheduledPrefix + identifier)
     }

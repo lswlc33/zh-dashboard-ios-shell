@@ -77,13 +77,15 @@ struct ZeehoWidgetCommandIntent: AppIntent {
         self.ownerID = ownerID
     }
 
-    func perform() async throws -> some IntentResult {
-        guard let command = ZeehoWidgetCommand(rawValue: action) else {
-            return .result()
+    func perform() async throws -> some IntentResult & ProvidesDialog {
+        guard let command = ZeehoWidgetCommand(rawValue: action),
+              let owner = try? SystemSnapshotStore.currentOwner(),
+              ownerID == owner.accountVINHash + "." + owner.scopeID else {
+            return .result(dialog: IntentDialog("车辆状态已变化，请刷新小组件后重试。"))
         }
-        // 只接受当前 active owner，防止旧小组件向另一辆车投递命令。
-        let owner = try? SystemSnapshotStore.currentOwner()
-        _ = ZeehoWidgetCommandMailbox.post(command.rawValue, owner: owner)
+        guard ZeehoWidgetCommandMailbox.post(command.rawValue, ownerID: ownerID) else {
+            return .result(dialog: IntentDialog("命令未能安全排队，请返回面板后重试。"))
+        }
         // 立刻请求刷新，让界面尽快反映「已受理」（不代表车已执行）。
         // 两个 kind 都要刷：用户可能装的是静态那个，也可能是可编辑那个。
         for kind in ZeehoWidgetKind.all {

@@ -274,7 +274,7 @@ def main():
         '刷新必须绑定到 ZeehoWidgetRefreshIntent（不能是画出来的死控件）'
     assert 'WidgetDataSource.load' in widget_commands, '刷新必须真的重新取数，而不是只重读旧快照'
     host_bridge = (root / 'Bridge.swift').read_text(encoding='utf-8')
-    assert 'ZeehoWidgetCommandMailbox.consume()' in host_bridge, '主 App 必须消费小组件命令'
+    assert 'ZeehoWidgetCommandMailbox.consume(ownerID:' in host_bridge, '主 App 必须按当前匿名 owner 消费小组件命令'
     assert '__zeehoWidgetCommand' in (root / 'bridge-bootstrap.js').read_text(encoding='utf-8'), \
         '网页必须有接收小组件命令的入口'
     assert build_sh.index('--entitlements "$script_dir/Entitlements/Broadcast.entitlements"') < \
@@ -782,6 +782,10 @@ def main():
     assert 'private let store = IOSStore.shared' in (root / 'Bridge.swift').read_text(encoding='utf-8'), \
         'Bridge 必须改用共享存档实例'
     assert 'private let store = IOSStore.shared' in backup_panel
+    active_rows = backup_panel.split('private func rows(for section:', 1)[1].split('case .accounts:', 1)[0]
+    assert 'hasAccount && !summary.activeToken.isEmpty' not in active_rows, \
+        '残留 token 镜像不能因没有 activeID 而隐藏恢复出口'
+    assert 'if !summary.activeToken.isEmpty {' in active_rows
 
     # 全部 Swift 源文件都要进构建清单，新增文件漏了会静默不编译。
     # build.sh 从 build-support.py 的 inventory 读文件表，所以检查 inventory 而不是 shell 脚本。

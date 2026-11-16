@@ -308,25 +308,27 @@ enum IOSUpdater {
     static func panelBuild(from bytes: Data) throws -> String {
         guard bytes.count <= maximumMetadataSize,
               let object = try JSONSerialization.jsonObject(with: bytes) as? [String: Any],
-              let text = object["build"] as? String, text.utf8.count == 19 else { throw UpdateError.invalidRelease }
+              let text = object["build"] as? String, validPanelBuild(text) else { throw UpdateError.invalidRelease }
+        return text
+    }
+
+    // 正在运行的网页也可能是开发占位符；无有效 build 时不能按字典序判成「已是最新」。
+    static func validPanelBuild(_ text: String) -> Bool {
+        guard text.utf8.count == 19 else { return false }
         let digits = Array(text.utf8)
         for index in digits.indices {
             let separator: UInt8? = [4: 45, 7: 45, 10: 32, 13: 58, 16: 58][index]
-            guard separator.map({ digits[index] == $0 }) ?? (48...57).contains(digits[index]) else {
-                throw UpdateError.invalidRelease
-            }
+            guard separator.map({ digits[index] == $0 }) ?? (48...57).contains(digits[index]) else { return false }
         }
-        guard Int(text.prefix(4)).map({ $0 > 0 }) == true else { throw UpdateError.invalidRelease }
+        guard Int(text.prefix(4)).map({ $0 > 0 }) == true else { return false }
         let formatter = DateFormatter()
         formatter.locale = Locale(identifier: "en_US_POSIX")
         formatter.calendar = Calendar(identifier: .gregorian)
         formatter.timeZone = TimeZone(secondsFromGMT: 0)
         formatter.dateFormat = "yyyy-MM-dd HH:mm:ss"
         formatter.isLenient = false
-        guard let date = formatter.date(from: text), formatter.string(from: date) == text else {
-            throw UpdateError.invalidRelease
-        }
-        return text
+        guard let date = formatter.date(from: text) else { return false }
+        return formatter.string(from: date) == text
     }
 
     // 仅供旧版清单迁移；最新检查不调用 API，也不采用资产里的任意下载 URL。

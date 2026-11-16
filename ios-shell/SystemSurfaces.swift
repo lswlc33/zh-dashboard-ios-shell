@@ -1452,6 +1452,10 @@ final class IOSSystemSurfacesService: NSObject, IOSBridgeService, IOSBridgeCance
         return SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
     }
 
+    static func widgetOwnerID(accountID: String, vin: String) -> String? {
+        widgetOwner(accountID: accountID, vin: vin)?.ownerIdentifierString
+    }
+
     /// 按 accountID + VIN 推导与快照完全一致的匿名 owner（供小组件凭据使用）。
     ///
     /// 小组件要自己拉接口，就必须知道「这份凭据属于哪个 owner」：否则换账号后

@@ -75,6 +75,12 @@ public struct WidgetFetchedVehicle: Equatable, Sendable {
     /// 统计类字段的响应到达时刻（毫秒）；一个统计字段都没拿到时为 nil。
     public var statsUpdatedAt: Int64?
 
+    /// 核心车况没有任何数值时，车名/状态位/账号统计不足以替换已有完整快照。
+    public var hasCoreMeasurements: Bool {
+        socPercent != nil || voltage != nil || current != nil || power != nil
+            || totalMileKm != nil || rangeKm != nil
+    }
+
     public var hasStatistics: Bool {
         statsUpdatedAt != nil && (voltage != nil || current != nil || power != nil
             || lockState != nil || seatState != nil || online != nil
@@ -356,9 +362,17 @@ public enum WidgetVehicleClient {
 
     /// 数值：排除 JSON 的 true/false（NSNumber 会把它们当 1/0）。
     private static func number(_ value: Any?) -> Double? {
-        guard let number = value as? NSNumber, CFGetTypeID(number) != CFBooleanGetTypeID() else { return nil }
-        let result = number.doubleValue
-        return result.isFinite ? result : nil
+        let parsed: Double
+        if let number = value as? NSNumber, CFGetTypeID(number) != CFBooleanGetTypeID() {
+            parsed = number.doubleValue
+        } else if let text = value as? String,
+                  !text.isEmpty, text == text.trimmingCharacters(in: .whitespacesAndNewlines),
+                  let number = Double(text) {
+            parsed = number
+        } else {
+            return nil
+        }
+        return parsed.isFinite ? parsed : nil
     }
 
     private static func text(_ value: Any?) -> String? {

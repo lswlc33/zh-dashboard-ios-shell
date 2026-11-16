@@ -112,7 +112,8 @@ final class IOSCastService: IOSBridgeCancellableService {
             let call: MutableCall?
             if mutating {
                 options = try object(args)
-                call = try captureMutation(options, requiresAttempt: method == "cast.start" || method == "cast.requestProjection")
+                call = try captureMutation(options, requiresAttempt: method == "cast.start" || method == "cast.requestProjection",
+                                           revokingSession: method == "cast.stop" || method == "cast.forgetProfile")
             } else { options = [:]; call = nil }
             switch method {
             case "cast.version": reply(1, nil)
@@ -174,7 +175,7 @@ final class IOSCastService: IOSBridgeCancellableService {
             reply(["ok": false, "error": code, "reason": code, "phase": "failed"], nil)
         }
     }
-    private func captureMutation(_ options: [String: Any], requiresAttempt: Bool) throws -> MutableCall {
+    private func captureMutation(_ options: [String: Any], requiresAttempt: Bool, revokingSession: Bool = false) throws -> MutableCall {
         guard UIApplication.shared.applicationState == .active,
               let scope = scopeProvider?(), scope.valid, let metadata = metadataProvider?(),
               let navigation = metadata["navId"] as? String ?? metadata["navigationId"] as? String,
@@ -190,16 +191,30 @@ final class IOSCastService: IOSBridgeCancellableService {
         }
         let call = MutableCall(scope: scope, navigationID: navigation, frame: frame, epoch: epoch,
                                documentGeneration: generation, attemptID: attempt)
+        if revokingSession, let held = activeCall {
+            // 系统广播独立于网页 generation。只允许同 owner/epoch、原文档与原 frame
+            // 撤销精确票据；不能借前后台恢复把 A 的 stop 重绑到 B。
+            try requireSession(options)
+            guard held.scope == scope, held.epoch == epoch,
+                  held.navigationID == navigation, held.frame == frame,
+                  matches(options, held, ignoringDocumentGeneration: true),
+                  let supplied = options["scope"] as? [String: Any],
+                  let suppliedGeneration = IOSBridgePolicy.integer(supplied["generation"]),
+                  suppliedGeneration >= held.documentGeneration, suppliedGeneration <= generation else {
+                throw IOSCastError.reason("stale_context")
+            }
+            return held
+        }
         guard matches(options, call) else { throw IOSCastError.reason("stale_context") }
         return call
     }
-    private func matches(_ options: [String: Any], _ call: MutableCall) -> Bool {
+    private func matches(_ options: [String: Any], _ call: MutableCall, ignoringDocumentGeneration: Bool = false) -> Bool {
         guard let scope = options["scope"] as? [String: Any] else { return false }
         return options["navigationId"] as? String == call.navigationID
             && options["frame"] as? String == call.frame && IOSBridgePolicy.integer(options["epoch"]) == call.epoch
             && scope["navId"] as? String == call.navigationID && scope["frame"] as? String == call.frame
             && IOSBridgePolicy.integer(scope["epoch"]) == call.epoch
-            && IOSBridgePolicy.integer(scope["generation"]) == call.documentGeneration
+            && (ignoringDocumentGeneration || IOSBridgePolicy.integer(scope["generation"]) == call.documentGeneration)
             && scope["accountId"] as? String == call.scope.accountID && scope["vin"] as? String == call.scope.vin
     }
     private func requireSession(_ options: [String: Any]) throws {
@@ -221,20 +236,27 @@ final class IOSCastService: IOSBridgeCancellableService {
         }
         throw IOSCastError.reason("bridge_bad_json")
     }
+    private func broadcastExtensionID() -> String? {
+        guard let plugins = Bundle.main.builtInPlugInsURL,
+              let urls = try? FileManager.default.contentsOfDirectory(at: plugins, includingPropertiesForKeys: nil) else { return nil }
+        // 重签工具可能分别改 host/appex ID，不能拿固定 ID 或 host+suffix 猜。
+        // 只认本包内真实 Broadcast target；歧义时不替用户选择另一份扩展。
+        let identifiers = urls.compactMap { url -> String? in
+            guard url.pathExtension == "appex", let bundle = Bundle(url: url),
+                  let id = bundle.bundleIdentifier, IOSCastMailbox.validExtensionID(id),
+                  let ext = bundle.object(forInfoDictionaryKey: "NSExtension") as? [String: Any],
+                  ext["NSExtensionPointIdentifier"] as? String == "com.apple.broadcast-services-upload",
+                  ext["NSExtensionPrincipalClass"] as? String == "ZeehoCastBroadcast.SampleHandler",
+                  let executable = bundle.executableURL, FileManager.default.fileExists(atPath: executable.path) else { return nil }
+            return id
+        }
+        return identifiers.count == 1 ? identifiers[0] : nil
+    }
     private func integrationReason() -> String? {
         guard mailbox != nil else { return "cast_app_group_unavailable" }
         guard let text = Bundle.main.object(forInfoDictionaryKey: "NSLocalNetworkUsageDescription") as? String,
               !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return "local_network_usage_description_missing" }
-        guard let plugins = Bundle.main.builtInPlugInsURL,
-              let urls = try? FileManager.default.contentsOfDirectory(at: plugins, includingPropertiesForKeys: nil),
-              urls.contains(where: { url in
-                  guard url.pathExtension == "appex", let bundle = Bundle(url: url),
-                        bundle.bundleIdentifier == IOSCastMailbox.extensionID,
-                        let ext = bundle.object(forInfoDictionaryKey: "NSExtension") as? [String: Any],
-                        ext["NSExtensionPointIdentifier"] as? String == "com.apple.broadcast-services-upload",
-                        let principal = ext["NSExtensionPrincipalClass"] as? String, principal.hasSuffix(".SampleHandler") else { return false }
-                  return FileManager.default.fileExists(atPath: bundle.executableURL?.path ?? "")
-              }) else { return "broadcast_extension_missing" }
+        guard broadcastExtensionID() != nil else { return "broadcast_extension_missing" }
         guard RPScreenRecorder.shared().isAvailable else { return "projection_unavailable" }
         return nil
     }
@@ -275,14 +297,15 @@ final class IOSCastService: IOSBridgeCancellableService {
         guard recipe.tiers.contains(where: { $0.id == settings.tier }) else { throw IOSCastError.reason("cast_tier_invalid") }
         selectedRecipe = recipe
         guard let mailbox = mailbox else { throw IOSCastError.reason("cast_app_group_unavailable") }
+        guard let extensionID = broadcastExtensionID() else { throw IOSCastError.reason("broadcast_extension_missing") }
         let now = Date().timeIntervalSince1970
         let id = UUID().uuidString
-        let grant = IOSCastGrant(version: 1, id: id, targetIP: target, issuedAt: now, selectBefore: now + 120,
+        let grant = IOSCastGrant(version: 1, id: id, extensionID: extensionID, targetIP: target, issuedAt: now, selectBefore: now + 120,
                                  endBefore: now + 7200, revoked: false, reason: "", settings: settings, recipe: recipe)
         try mailbox.setGrant(grant)
         sessionID = id; activeCall = call; activeScope = scope; selectionDeadline = grant.selectBefore; selectionIsPending = true
         localPhase = "provisioning"; localReason = "waiting_user_broadcast_confirmation"
-        let controller = IOSCastPickerController(extensionID: IOSCastMailbox.extensionID)
+        let controller = IOSCastPickerController(extensionID: extensionID)
         controller.onCancelled = { [weak self] in
             guard let self = self, self.sessionID == id, self.activeCall == call else { return }
             self.revoke(reason: "projection_cancelled")

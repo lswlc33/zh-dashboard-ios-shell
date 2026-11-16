@@ -58,7 +58,9 @@ final class IOSWidgetCompatibilityService: IOSBridgeService, IOSBridgeCancellabl
                     // systemService=unavailable（系统没有对应通道可映射，不能谎称有）。
                     value["allowed"] = live["authorizationEnabled"] as? Bool == true
                     value["groups"] = ["service", "message", "task", "charge_start", "charge_progress", "charge_full", "charge_stop"].map {
-                        ["id": $0, "on": $0 == "charge_progress" && live["running"] as? Bool == true && live["kind"] as? String == "charging",
+                        ["id": $0,
+                         "on": $0 == "task" ? IOSBackgroundPreferences.taskNotifyEnabled
+                            : $0 == "charge_progress" && live["running"] as? Bool == true && live["kind"] as? String == "charging",
                          "supported": $0 == "charge_progress" || $0 == "task",
                          "systemService": $0 == "charge_progress" ? "ActivityKit" : "unavailable"] as [String: Any]
                     }
@@ -66,8 +68,13 @@ final class IOSWidgetCompatibilityService: IOSBridgeService, IOSBridgeCancellabl
                 }
             case "setNotifyGroup":
                 try count(args, 2)
-                guard try text(args[0]) == "charge_progress" else { throw SystemSnapshotError("notification_channel_not_mapped") }
-                let on = try boolean(args[1])
+                let group = try text(args[0]), on = try boolean(args[1])
+                if group == "task" {
+                    IOSBackgroundPreferences.taskNotifyEnabled = on
+                    reply(["ok": true, "id": group, "on": on], nil)
+                    return
+                }
+                guard group == "charge_progress" else { throw SystemSnapshotError("notification_channel_not_mapped") }
                 var options = try surfaces.compatibilityScopeOptions()
                 options["kind"] = "charging"
                 forward(method, args: args, target: on ? "liveActivity.start" : "liveActivity.end", options: options, reply: reply)

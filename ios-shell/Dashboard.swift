@@ -30,8 +30,9 @@ final class AppDelegate: UIResponder, UIApplicationDelegate {
                 signIn: { completion in IOSBackgroundRunner.runSignIn(completion: completion) },
                 // 每日任务（发帖/点赞/分享）：只在用户开了「自动执行」或快捷指令主动触发时才跑，
                 // isEnabled 会挡住未开启的情况，不会偷偷往广场发动态。
-                dailyTasks: { completion in
-                    IOSBackgroundRunner.runDailyTasks { _ in completion(true) }
+                dailyTasks: {
+                    let report = await IOSBackgroundRunner.runDailyTasks(force: false)
+                    return report.result == "ok"
                 })
             // 这里只重排一次，让「上次卸载/关机导致队列清空」的情况能自己恢复。
             // 用户关掉自动签到时 signIn 会被 isEnabled 挡掉，不会偷偷跑。
@@ -448,11 +449,22 @@ final class PanelController: UIViewController, WKNavigationDelegate, WKUIDelegat
     }
 
     private func checkPanelAutomatically() {
-        let line = IOSPanelLine.current, current = IOSPanelCache.shared.snapshotBuild()
+        guard let core = bridge, let navigation = core.currentNavigationID() else { return }
+        let line = IOSPanelLine.current
         panelCheckTask?.cancel()
-        panelCheckTask = Task { @MainActor [weak self] in
-            _ = try? await IOSUpdateCenter.shared.checkPanel(current: current, line: line, force: false)
-            self?.panelCheckTask = nil
+        web.evaluateJavaScript("document.querySelector('meta[name=build]')?.content || ''") { [weak self, weak core] value, _ in
+            guard let self = self, let core = core, self.bridge === core,
+                  core.currentNavigationID() == navigation, IOSPanelLine.current == line,
+                  !self.returningToWelcome, UIApplication.shared.applicationState == .active else { return }
+            let current = (value as? String ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+            guard current.utf8.count <= 32 else { return }
+            self.panelCheckTask = Task { @MainActor [weak self, weak core] in
+                guard !Task.isCancelled, let self = self, let core = core,
+                      core.currentNavigationID() == navigation, IOSPanelLine.current == line else { return }
+                _ = try? await IOSUpdateCenter.shared.checkPanel(current: current, line: line, force: false)
+                guard !Task.isCancelled, core.currentNavigationID() == navigation else { return }
+                self.panelCheckTask = nil
+            }
         }
     }
 
@@ -506,6 +518,7 @@ final class PanelController: UIViewController, WKNavigationDelegate, WKUIDelegat
         localFallbackUsed = false
         documentFinished = false
         BootHealth.failed(reason: "unfinished")
+        IOSPanelLine.applyPersisted()
         preparePanel(PanelNavigation.home)
     }
 

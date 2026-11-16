@@ -1,44 +1,70 @@
 import Foundation
+import Darwin
 
-/// 主 App ↔ 扩展的命令邮箱：扩展只写文件，主 App 在前台/后台被唤起时消费。
-/// 与 Android 的 ActionActivity + PendingIntent 语义等价：不伪造「已执行」，
-/// 只投递一条待处理命令。
+/// Main App <-> widget command mailbox.
+///
+/// The mailbox is a one-shot, owner-bound handoff. A command without its original
+/// owner scope or a fresh timestamp must never be rebound to the currently selected
+/// vehicle by the host app.
 public enum ZeehoWidgetCommandMailbox {
     public static let directoryName = "WidgetCommands"
     public static let fileName = "pending-command.json"
+    public static let maxAgeMs: Int64 = 60_000
 
     public struct Command: Codable, Sendable {
+        public let id: String
         public let action: String
-        public let ownerScopeID: String
+        public let ownerID: String
         public let createdAt: Int64
     }
 
-    /// 扩展侧投递：只写一条，覆盖上一条未消费的命令（用户连点以最后一次为准）。
+    private static func lockURL(_ root: URL) -> URL { root.appendingPathComponent(".command.lock") }
+
+    private static func withLock<T>(_ root: URL, _ body: () throws -> T) throws -> T {
+        let path = lockURL(root).path
+        let descriptor = open(path, O_CREAT | O_RDWR | O_NOFOLLOW, S_IRUSR | S_IWUSR)
+        guard descriptor >= 0 else { throw CocoaError(.fileReadNoPermission) }
+        defer { close(descriptor) }
+        guard flock(descriptor, LOCK_EX) == 0 else { throw CocoaError(.fileLocking) }
+        defer { _ = flock(descriptor, LOCK_UN) }
+        return try body()
+    }
+
     @discardableResult
-    public static func post(_ action: String, owner: SystemSnapshotOwner?) -> Bool {
-        guard let owner = owner,
-              let root = FileManager.default.containerURL(
-                forSecurityApplicationGroupIdentifier: AppGroup.current()) else { return false }
+    public static func post(_ action: String, ownerID: String) -> Bool {
+        guard !ownerID.isEmpty, ownerID.utf8.count <= 161,
+              let root = FileManager.default.containerURL(forSecurityApplicationGroupIdentifier: AppGroup.current()) else { return false }
         let directory = root.appendingPathComponent(directoryName, isDirectory: true)
         do {
             try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
-            let payload = Command(action: action, ownerScopeID: owner.scopeID,
-                                  createdAt: Int64(Date().timeIntervalSince1970 * 1000))
-            let data = try JSONEncoder().encode(payload)
-            try data.write(to: directory.appendingPathComponent(fileName), options: [.atomic])
+            try withLock(root) {
+                let payload = Command(id: UUID().uuidString, action: action, ownerID: ownerID,
+                                      createdAt: Int64(Date().timeIntervalSince1970 * 1000))
+                let data = try JSONEncoder().encode(payload)
+                try data.write(to: directory.appendingPathComponent(fileName), options: [.atomic])
+            }
             return true
         } catch { return false }
     }
 
-    /// 主 App 侧消费：读一条并原子删除，返回动作名。
-    public static func consume() -> String? {
-        guard let root = FileManager.default.containerURL(
-                forSecurityApplicationGroupIdentifier: AppGroup.current()) else { return nil }
-        let url = root.appendingPathComponent(directoryName, isDirectory: true)
-            .appendingPathComponent(fileName)
-        defer { try? FileManager.default.removeItem(at: url) }
-        guard let data = try? Data(contentsOf: url),
-              let value = try? JSONDecoder().decode(Command.self, from: data) else { return nil }
-        return value.action
+    /// 旧小组件命令永不重绑定到当前选中的 owner。
+    public static func consume(ownerID: String, now: Int64 = Int64(Date().timeIntervalSince1970 * 1000)) -> Command? {
+        guard !ownerID.isEmpty,
+              let root = FileManager.default.containerURL(forSecurityApplicationGroupIdentifier: AppGroup.current()) else { return nil }
+        let url = root.appendingPathComponent(directoryName, isDirectory: true).appendingPathComponent(fileName)
+        return (try? withLock(root) {
+            guard let data = try? Data(contentsOf: url), let value = try? JSONDecoder().decode(Command.self, from: data) else {
+                try? FileManager.default.removeItem(at: url); return nil
+            }
+            guard UUID(uuidString: value.id) != nil, !value.action.isEmpty, value.ownerID == ownerID,
+                  value.createdAt > 0, now >= value.createdAt, now - value.createdAt <= maxAgeMs else {
+                try? FileManager.default.removeItem(at: url)
+                return nil
+            }
+            // If the one-shot file cannot be removed, do not return an executable action.
+            // Replaying a lock/seat command is worse than dropping this click.
+            guard (try? FileManager.default.removeItem(at: url)) != nil else { return nil }
+            return value
+        }) ?? nil
     }
 }

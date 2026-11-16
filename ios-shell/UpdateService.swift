@@ -16,6 +16,8 @@ final class IOSUpdateCenter {
     private var releases: [IOSPanelLine: IOSRelease] = [:]
     private var appStates: [IOSPanelLine: [String: Any]] = [:]
     private var panelStates: [IOSPanelLine: [String: Any]] = [:]
+    private var panelReadyBuilds: [IOSPanelLine: String] = [:]
+    private(set) var currentPanelBuild = ""
     private var appRequests: [IOSPanelLine: AppRequest] = [:]
     private var panelRequests: [IOSPanelLine: PanelRequest] = [:]
     private var appCheckedAt: [IOSPanelLine: TimeInterval] = [:]
@@ -32,33 +34,26 @@ final class IOSUpdateCenter {
 
     /// `currentBuild` 是网页自报的「我现在跑的这份构建」（`<meta name=build>`，可能没有）。
     func status(currentBuild: String = "") -> [String: Any] {
+        currentPanelBuild = currentBuild
         let line = IOSPanelLine.current
         return ["ok": true, "line": line.rawValue,
                 "app": appStates[line] ?? ["state": "idle"],
                 "panel": settledPanelState(line, currentBuild: currentBuild)]
     }
 
-    /// 读 panel 状态时顺手对一次账：**网页自报正在跑的构建就是之前记的「待重启/有更新」目标
-    /// ⇒ 那份更新确实生效了**，直接把状态落成 latest。
-    ///
-    /// 为什么必须在读取时判（2026-11-15 用户报障）：iOS 有两条更新入口——网页的 `panel.update`
-    /// （会走 panelReady）和设置页的「面板更新 / 重新初始化」（直接 IOSPanelCache.initialize，
-    /// 完全绕过 UpdateService）。后者成功后没人清 ready，而页面重载后 checkedOnLaunch 已为 true、
-    /// 不会再自动检查 → 网页每 3 秒拿到的都是「待重启」，提示永远不消失。
-    ///
-    /// 判据只认网页自报的 build，不认磁盘快照的：快照在 initialize 提交那一刻就已经是新版，
-    /// 而重启失败时页面还是旧的 —— 前者会误报「已生效」，后者才是要保留「待重启」的情况。
+    func panelNavigationChanged() { currentPanelBuild = "" }
+
+    // ready 只说明资源已下载；latest 也可能来自上一份文档。每次读状态都按本页 build 重算，
+    // 不能拿磁盘快照或之前页面的比较结果证明当前页面已更新。只读结算不刷新联网检查时间。
     private func settledPanelState(_ line: IOSPanelLine, currentBuild: String) -> [String: Any] {
         guard let state = panelStates[line] else { return ["state": "idle"] }
         let phase = state["state"] as? String
-        let target = phase == "ready" ? state["pending"] as? String
-            : phase == "update" ? state["remote"] as? String : nil
-        guard let target = target, !target.isEmpty, target == currentBuild else { return state }
-        // 只落状态、不写 panelCheckedAt：这一轮没有联网，「刚查过」的时间戳必须继续反映
-        // 真实检查时刻，否则自动检查的 30 分钟节流会被这次结算白送一个窗口。
-        let settled: [String: Any] = ["state": "latest", "current": target, "remote": target, "line": line.rawValue]
-        panelStates[line] = settled
-        return settled
+        guard phase == "ready" || phase == "update" || phase == "latest" else { return state }
+        let remote = phase == "ready" ? state["pending"] as? String : state["remote"] as? String
+        guard let remote = remote, IOSUpdater.validPanelBuild(remote) else { return state }
+        let result = panelResult(current: currentBuild, remote: remote, line: line)
+        panelStates[line] = result
+        return result
     }
 
     func checkApp(line: IOSPanelLine, force: Bool = true) async throws -> IOSRelease {
@@ -106,9 +101,14 @@ final class IOSUpdateCenter {
     }
 
     func checkPanel(current: String, line: IOSPanelLine, force: Bool = true) async throws -> [String: Any] {
+        currentPanelBuild = current
         if !force, let at = panelCheckedAt[line], ProcessInfo.processInfo.systemUptime - at < Self.automaticInterval,
            let previous = panelStates[line] {
-            if let remote = previous["remote"] as? String { return panelResult(current: current, remote: remote, line: line) }
+            if let remote = previous["remote"] as? String {
+                let result = panelResult(current: current, remote: remote, line: line)
+                panelStates[line] = result
+                return result
+            }
             if previous["state"] as? String == "error" { throw UpdateError.http }
         }
         let request: PanelRequest
@@ -124,7 +124,7 @@ final class IOSUpdateCenter {
             let remote = try await request.task.value
             let result = panelResult(current: current, remote: remote, line: line)
             if panelRequests[line]?.id == request.id, request.revision == (panelRevisions[line] ?? 0) {
-                panelStates[line] = panelResult(current: IOSPanelCache.shared.snapshotBuild(), remote: remote, line: line)
+                panelStates[line] = panelResult(current: currentPanelBuild, remote: remote, line: line)
                 panelCheckedAt[line] = ProcessInfo.processInfo.systemUptime
                 panelRequests.removeValue(forKey: line)
             }
@@ -139,9 +139,15 @@ final class IOSUpdateCenter {
     }
 
     private func panelResult(current: String, remote: String, line: IOSPanelLine) -> [String: Any] {
-        let hasUpdate = current.isEmpty || remote > current
-        return ["ok": true, "state": hasUpdate ? "update" : "latest", "current": current,
-                "remote": remote, "hasUpdate": hasUpdate, "line": line.rawValue]
+        let hasUpdate = !IOSUpdater.validPanelBuild(current) || remote > current
+        var result: [String: Any] = ["ok": true, "state": hasUpdate ? "update" : "latest", "current": current,
+                                     "remote": remote, "hasUpdate": hasUpdate, "line": line.rawValue]
+        // 已提交资源不代表本页已重载；重复检查仍保留待重启。只有页面报告相同或更新的有效 build
+        // 才显示 latest；下载目标仍保留，切回旧页时可再次正确提示待重启。
+        if let pending = panelReadyBuilds[line], pending == remote, hasUpdate {
+            result["state"] = "ready"; result["pending"] = pending
+        }
+        return result
     }
 
     func panelReady(build: String, line: IOSPanelLine) {
@@ -150,6 +156,7 @@ final class IOSUpdateCenter {
         panelCheckedAt.removeValue(forKey: line)
         // 这里只记「已下好待重启」：重启还没发生，页面此刻跑的还是旧构建。
         // 什么时候算生效由 status(currentBuild:) 按网页自报的构建判定。
+        panelReadyBuilds[line] = build
         panelStates[line] = ["state": "ready", "pending": build, "line": line.rawValue]
     }
 }
@@ -199,7 +206,8 @@ enum IOSUpdatePresentation {
     static func checkPanel(from owner: UIViewController, onUpdate: @escaping () -> Void,
                            completion: @escaping () -> Void = {}) -> Task<Void, Never> {
         let line = IOSPanelLine.current, revision = IOSPanelLine.revision
-        let current = IOSPanelCache.shared.snapshotBuild()
+        // 原生设置页也只比较已观察到的运行页面；已下好的磁盘快照不能冒充当前文档。
+        let current = IOSUpdateCenter.shared.currentPanelBuild
         return Task { @MainActor [weak owner] in
             defer { completion() }
             do {
@@ -262,6 +270,11 @@ final class IOSUpdateService: IOSBridgeCancellableService {
         precondition(Thread.isMainThread)
         generation &+= 1
         for job in Array(jobs.values) { finish(job, failure: "stale_navigation") }
+        let navigation = generation
+        Task { @MainActor [weak self] in
+            guard self?.generation == navigation else { return }
+            IOSUpdateCenter.shared.panelNavigationChanged()
+        }
     }
     func applicationBackgrounded() {
         precondition(Thread.isMainThread)

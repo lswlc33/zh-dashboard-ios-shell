@@ -128,6 +128,18 @@ struct IOSBackgroundCredential: Codable, Equatable, Sendable {
         return scopes
     }
 
+    /// 后台回执与发帖账本统一按稳定账号 + VIN 归属，不随 token 轮换变化。
+    var ownerHash: String {
+        var data = Data()
+        for value in [accountID, vin] {
+            let part = Data(value.utf8)
+            var length = UInt32(part.count).bigEndian
+            withUnsafeBytes(of: &length) { data.append(contentsOf: $0) }
+            data.append(part)
+        }
+        return SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
+    }
+
     /// 擦除敏感字段后再丢弃，避免 JSON 副本在内存里留一层。
     mutating func clear() {
         token = ""; signinToken = ""; appSecret = ""; h5Secret = ""
@@ -180,6 +192,7 @@ enum IOSBackgroundCredentialStore {
         }
     }
 
+    @discardableResult
     static func save(_ value: IOSBackgroundCredential) -> Bool {
         guard value.isValid else { return false }
         guard let data = try? JSONEncoder().encode(value) else { return false }
@@ -188,20 +201,27 @@ enum IOSBackgroundCredentialStore {
             kSecAttrService as String: service,
             kSecAttrAccount as String: account
         ]
-        SecItemDelete(query as CFDictionary)
+        var update: [String: Any] = [
+            kSecValueData as String: data,
+            kSecAttrAccessible as String: kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly
+        ]
+        let status = SecItemUpdate(query as CFDictionary, update as CFDictionary)
+        if status == errSecSuccess { return true }
+        guard status == errSecItemNotFound else { return false }
         var insert = query
-        insert[kSecValueData as String] = data
-        insert[kSecAttrAccessible as String] = kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly
+        update.forEach { insert[$0.key] = $0.value }
         return SecItemAdd(insert as CFDictionary, nil) == errSecSuccess
     }
 
-    static func remove() {
+    @discardableResult
+    static func remove() -> Bool {
         let query: [String: Any] = [
             kSecClass as String: kSecClassGenericPassword,
             kSecAttrService as String: service,
             kSecAttrAccount as String: account
         ]
-        SecItemDelete(query as CFDictionary)
+        let status = SecItemDelete(query as CFDictionary)
+        return status == errSecSuccess || status == errSecItemNotFound
     }
 
     private enum ReadResult {
@@ -277,6 +297,10 @@ enum IOSBackgroundError: Error, Equatable {
     case server(Int)           // 其它 4xx/5xx
     case network(String)       // 传输层失败（DNS/超时/断网）
     case decode                // 响应不是预期结构
+    case noData                // 业务失败、空数据或电量不可用
+    case cancelled
+    case budgetExhausted
+    case alreadyRunning
 
     var code: String {
         switch self {
@@ -286,10 +310,180 @@ enum IOSBackgroundError: Error, Equatable {
         case let .server(status): return "http_\(status)"
         case .network: return "network"
         case .decode: return "decode"
+        case .noData: return "no_data"
+        case .cancelled: return "cancelled"
+        case .budgetExhausted: return "budget_exhausted"
+        case .alreadyRunning: return "task_already_running"
         }
     }
 }
 
+// 每次运行拿一份不可变上下文。deadline 用单调时钟，不能放在可重入 actor 的共享属性里。
+// 同一进程所有入口共用一个槽位；取消后的旧 Task 退出前也不让下一轮挤进来。
+enum IOSBackgroundCalendar {
+    static func beijingDay(_ date: Date) -> String {
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.timeZone = TimeZone(secondsFromGMT: 8 * 3600)
+        formatter.dateFormat = "yyyy-MM-dd"
+        return formatter.string(from: date)
+    }
+}
+
+enum IOSBackgroundRunSource: Equatable, Sendable {
+    case web(UUID)
+    case system(String)
+    case shortcut
+}
+
+fileprivate final class IOSBackgroundRunValidity: @unchecked Sendable {
+    private let lock = NSLock()
+    private var cancelled = false
+    var isValid: Bool { lock.lock(); defer { lock.unlock() }; return !cancelled }
+    func revoke() { lock.lock(); cancelled = true; lock.unlock() }
+}
+
+struct IOSBackgroundRunContext: Sendable {
+    let id: UUID
+    let epoch: UInt64
+    let deadline: TimeInterval
+    let source: IOSBackgroundRunSource
+    let day: String
+    fileprivate let validity = IOSBackgroundRunValidity()
+
+    var remaining: TimeInterval { deadline - ProcessInfo.processInfo.systemUptime }
+
+    var canDeliver: Bool { IOSBackgroundRunCoordinator.shared.isAuthorized(self) }
+
+    func check() throws {
+        try Task.checkCancellation()
+        guard IOSBackgroundRunCoordinator.shared.isCurrent(self) else { throw IOSBackgroundError.cancelled }
+        guard remaining > 0 else { throw IOSBackgroundError.budgetExhausted }
+    }
+}
+
+final class IOSBackgroundRunCoordinator: @unchecked Sendable {
+    static let shared = IOSBackgroundRunCoordinator()
+    private struct Active {
+        let context: IOSBackgroundRunContext
+        var cancelled = false
+        var cancel: (() -> Void)?
+    }
+    private let lock = NSLock()
+    private var epoch: UInt64 = 0
+    private var active: Active?
+
+    private init() {}
+
+    func begin(source: IOSBackgroundRunSource, budget: TimeInterval) throws -> IOSBackgroundRunContext {
+        try Task.checkCancellation()
+        guard budget.isFinite, budget > 0 else { throw IOSBackgroundError.budgetExhausted }
+        lock.lock()
+        defer { lock.unlock() }
+        guard active == nil else { throw IOSBackgroundError.alreadyRunning }
+        let context = IOSBackgroundRunContext(id: UUID(), epoch: epoch,
+            deadline: ProcessInfo.processInfo.systemUptime + min(25, budget), source: source,
+            day: IOSBackgroundCalendar.beijingDay(Date()))
+        active = Active(context: context)
+        return context
+    }
+
+    func installCancellation(_ context: IOSBackgroundRunContext, cancel: @escaping () -> Void) {
+        lock.lock()
+        let current = active?.context.id == context.id && active?.cancelled == false && epoch == context.epoch
+        if current { active?.cancel = cancel }
+        lock.unlock()
+        if !current { cancel() }
+    }
+
+    func isCurrent(_ context: IOSBackgroundRunContext) -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return active?.context.id == context.id && active?.cancelled == false && epoch == context.epoch
+    }
+
+    func isAuthorized(_ context: IOSBackgroundRunContext) -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return epoch == context.epoch && context.validity.isValid
+    }
+
+    func finish(_ context: IOSBackgroundRunContext) {
+        lock.lock()
+        defer { lock.unlock() }
+        if active?.context.id == context.id { active = nil }
+    }
+
+    func cancel(_ context: IOSBackgroundRunContext) { cancel(where: { $0.id == context.id }) }
+    func cancelWeb(_ owner: UUID) { cancel(where: { $0.source == .web(owner) }) }
+    func cancelSystem(_ identifier: String) { cancel(where: { $0.source == .system(identifier) }) }
+
+    private func cancel(where matches: (IOSBackgroundRunContext) -> Bool) {
+        lock.lock()
+        let action: (() -> Void)?
+        if let value = active, matches(value.context) {
+            active?.cancelled = true
+            value.context.validity.revoke()
+            action = value.cancel
+        } else { action = nil }
+        lock.unlock()
+        action?()
+    }
+
+    /// Keychain 写成功才切 epoch；失败保留旧凭据与正在运行的任务。
+    /// 同步锁只包住短暂的 Keychain 操作，绝不跨 await。
+    func replaceCredential(_ value: IOSBackgroundCredential) -> Bool {
+        changeCredential { IOSBackgroundCredentialStore.save(value) }
+    }
+
+    func clearCredential() -> Bool {
+        changeCredential { IOSBackgroundCredentialStore.remove() }
+    }
+
+    private func changeCredential(_ change: () -> Bool) -> Bool {
+        lock.lock()
+        guard change() else { lock.unlock(); return false }
+        epoch &+= 1
+        active?.cancelled = true
+        active?.context.validity.revoke()
+        let action = active?.cancel
+        lock.unlock()
+        action?()
+        return true
+    }
+
+    /// 记账/排通知与凭据切换使用同一把同步锁，旧账号不能在 clear 之后落新结果。
+    @discardableResult
+    func commit(_ context: IOSBackgroundRunContext, _ body: () -> Void) -> Bool {
+        guard !Task.isCancelled else { return false }
+        lock.lock()
+        defer { lock.unlock() }
+        guard active?.context.id == context.id, active?.cancelled == false,
+              epoch == context.epoch, context.remaining > 0 else { return false }
+        body()
+        return true
+    }
+}
+
+/// 结构化子 Task 计时：到绝对期限立即取消 data(for:)；父 Task 取消也沿任务组传播。
+/// URLRequest.timeoutInterval 只是空闲超时，不能拿它约束持续收到字节的响应。
+func iosBackgroundWithinDeadline<T: Sendable>(
+    _ context: IOSBackgroundRunContext, operation: @escaping @Sendable () async throws -> T
+) async throws -> T {
+    try context.check()
+    return try await withThrowingTaskGroup(of: T.self) { group in
+        group.addTask { try context.check(); return try await operation() }
+        group.addTask {
+            let seconds = max(0, context.remaining)
+            try await Task.sleep(nanoseconds: UInt64(seconds * 1_000_000_000))
+            throw IOSBackgroundError.budgetExhausted
+        }
+        defer { group.cancelAll() }
+        guard let value = try await group.next() else { throw IOSBackgroundError.cancelled }
+        try context.check()
+        return value
+    }
+}
 
 /// 签名算法的纯函数部分。不持有任何密钥，便于单测与复用。
 enum IOSBackgroundSigning {
@@ -383,7 +577,7 @@ final class IOSBackgroundClient {
     ///
     /// **绝不能改成调原生 PsModel 式端点**（Android 侧教训：那会让全局 401 映射把
     /// 登录态清掉并弹「登录已过期」）。h5 通道的 401 只影响本次结果。
-    func signIn(credential: IOSBackgroundCredential) async -> Result<SignInResult, IOSBackgroundError> {
+    func signIn(credential: IOSBackgroundCredential, context: IOSBackgroundRunContext) async -> Result<SignInResult, IOSBackgroundError> {
         // 越界防御：Runner 已按 canSignIn 拦过一次，这里是第二道。
         // 走到这里说明凭据**缺 h5 域**（不是完全没授权），所以报 partial 而不是 neverGranted。
         guard credential.canSignIn else { return .failure(.noCredential(.partial)) }
@@ -413,11 +607,11 @@ final class IOSBackgroundClient {
         let data: Data
         let http: HTTPURLResponse
         do {
-            let (payload, response) = try await session.data(for: request)
+            let (payload, response) = try await fetch(request, context: context)
             guard let value = response as? HTTPURLResponse else { return .failure(.decode) }
             data = payload; http = value
         } catch {
-            return .failure(.network((error as NSError).domain))
+            return .failure(Self.failure(error))
         }
         switch http.statusCode {
         case 200...299: break
@@ -456,7 +650,7 @@ final class IOSBackgroundClient {
     /// **只有字符串 "1" 是充电中**——与网页 model.js 同口径；其它值（"0"/"2"/"3"/"-1"）
     /// 一律按未充电，缺失才是未知。Android 的通知 getter 还兼容 "true"，那是历史偏差，
     /// 不要照抄过来。
-    func vehicleSample(credential: IOSBackgroundCredential) async -> Result<VehicleSample, IOSBackgroundError> {
+    func vehicleSample(credential: IOSBackgroundCredential, context: IOSBackgroundRunContext) async -> Result<VehicleSample, IOSBackgroundError> {
         // 同上：缺 app 域时是部分授权，不是完全没授权。
         guard credential.canSampleVehicle else { return .failure(.noCredential(.partial)) }
         let path = "/v1.0/app/cfmotoserverapp/vehicleHomePageV2/\(credential.vin)"
@@ -476,7 +670,7 @@ final class IOSBackgroundClient {
         request.setValue("0", forHTTPHeaderField: "cfmoto-x-sign-type")
 
         do {
-            let (data, response) = try await session.data(for: request)
+            let (data, response) = try await fetch(request, context: context)
             guard let http = response as? HTTPURLResponse else { return .failure(.decode) }
             switch http.statusCode {
             case 200...299: break
@@ -487,9 +681,12 @@ final class IOSBackgroundClient {
             guard let object = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] else {
                 return .failure(.decode)
             }
-            // 车况字段的真实位置随接口版本变过：先找 data，再退到根对象。
-            let body = (object["data"] as? [String: Any]) ?? object
-            let soc = number(body["socPercent"]) ?? number(body["soc"]) ?? number(body["batterySoc"])
+            // HTTP 200 也会带业务错误或空 data；缺电量不能算成功，更不能排队或发充电提醒。
+            guard Self.text(object["code"]) == "10000",
+                  let body = object["data"] as? [String: Any],
+                  let soc = number(body["socPercent"]) ?? number(body["soc"])
+                    ?? number(body["batterySoc"]) ?? number(body["bmssoc"]),
+                  (0...100).contains(soc) else { return .failure(.noData) }
             let raw = body["chargeState"]
             let charging: Bool?
             if let text = raw as? String {
@@ -502,8 +699,30 @@ final class IOSBackgroundClient {
             }
             return .success(VehicleSample(socPercent: soc, charging: charging, capturedAt: timestamp))
         } catch {
-            return .failure(.network((error as NSError).domain))
+            return .failure(Self.failure(error))
         }
+    }
+
+    private func fetch(_ original: URLRequest, context: IOSBackgroundRunContext) async throws -> (Data, URLResponse) {
+        try context.check()
+        var request = original
+        request.timeoutInterval = min(12, context.remaining)
+        let prepared = request
+        let session = self.session
+        let result = try await iosBackgroundWithinDeadline(context) {
+            try context.check()
+            let value = try await session.data(for: prepared)
+            try context.check()
+            return value
+        }
+        try context.check()
+        return result
+    }
+
+    private static func failure(_ error: Error) -> IOSBackgroundError {
+        if let value = error as? IOSBackgroundError { return value }
+        if error is CancellationError || (error as? URLError)?.code == .cancelled { return .cancelled }
+        return .network("transport")
     }
 
     /// code 可能是字符串也可能是数字，统一成字符串比较。
@@ -517,8 +736,16 @@ final class IOSBackgroundClient {
 
     /// NSNumber 的布尔值必须排除：JSON 的 true 也是 NSNumber，会被误读成 1。
     private func number(_ value: Any?) -> Double? {
-        guard let number = value as? NSNumber, CFGetTypeID(number) != CFBooleanGetTypeID() else { return nil }
-        let result = number.doubleValue
+        let result: Double
+        if let number = value as? NSNumber, CFGetTypeID(number) != CFBooleanGetTypeID() {
+            result = number.doubleValue
+        } else if let text = value as? String,
+                  !text.isEmpty, text == text.trimmingCharacters(in: .whitespacesAndNewlines),
+                  let parsed = Double(text) {
+            result = parsed
+        } else {
+            return nil
+        }
         return result.isFinite ? result : nil
     }
 }

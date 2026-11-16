@@ -281,7 +281,9 @@
       if (!event || event.navId !== config.navId) return;
       if (w.dispatchEvent && typeof w.CustomEvent === 'function') {
         w.dispatchEvent(new w.CustomEvent('zeehoios:widget-command', { detail: Object.freeze({
-          action: String(event.action || ''), navId: config.navId, generation: event.generation
+          id: String(event.id || ''), action: String(event.action || ''), ownerID: String(event.ownerID || ''),
+          createdAt: Number(event.createdAt), navId: config.navId, generation: event.generation,
+          epoch: event.epoch, frame: String(event.frame || '')
         }) }));
       }
     } });

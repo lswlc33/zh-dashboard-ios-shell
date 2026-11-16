@@ -431,6 +431,7 @@ enum AccountBackup {
 
     static func incremented(_ value: Any?) -> Int {
         let number = (value as? NSNumber)?.intValue ?? 0
+        guard number >= 0, number < Int.max else { return 1 }
         return max(1, number + 1)
     }
 

@@ -196,6 +196,7 @@ final class IOSNativeAssetService: IOSBridgeCancellableService {
     private let worker = DispatchQueue(label: "io.github.lswlc33.dashboard.ios.asset", qos: .userInitiated)
     private var job: Job?
     private var watch: DispatchWorkItem?
+    private var suspended = false
     private final class Job {
         let ticket = UUID().uuidString
         let lease: IOSVehicleContext.Lease
@@ -214,14 +215,28 @@ final class IOSNativeAssetService: IOSBridgeCancellableService {
     func setNavigationProvider(_ provider: @escaping () -> String?) { context.navigationProvider = provider }
     func setFrameProvider(_ provider: @escaping () -> String?) { context.frameProvider = provider }
     func navigationChanged() { precondition(Thread.isMainThread); context.invalidate(); cancelJob() }
-    func applicationBackgrounded() { navigationChanged() }
-    func cancel(method: String, args: [Any]) { cancelJob() }
+    func applicationBackgrounded() {
+        precondition(Thread.isMainThread)
+        // 去设置连接车机热点是正常步骤：只保留已校验且没有 IO 的素材，绝不后台续传。
+        guard let j = job, ownerCurrent(j), prepared(j) else { navigationChanged(); return }
+        suspended = true; watch?.cancel(); watch = nil
+    }
+    func cancel(method: String, args: [Any]) {
+        precondition(Thread.isMainThread)
+        guard let j = job, let object = args.first as? [String: Any],
+              object["ticket"] as? String == j.ticket || (j.busy && (method == "asset.download.begin" || method == "asset.zip.build.begin")),
+              object["navigationId"] as? String == j.lease.navigation,
+              object["frame"] as? String == j.lease.frame,
+              IOSBridgePolicy.integer(object["epoch"]).map({ String($0) }) == j.lease.scope.generation else { return }
+        cancelJob()
+    }
 
     func handle(method: String, args: [Any], reply: @escaping (Any?, String?) -> Void) {
         precondition(Thread.isMainThread)
         do {
             guard let object = args.first as? [String: Any] else { throw IOSWallpaperError("invalid_args") }
             let lease = try context.capture(object)
+            if let j = job, !ownerCurrent(j) { cancelJob() }
             if method == "asset.download.begin" || method == "asset.zip.build.begin" {
                 let local = method == "asset.zip.build.begin"
                 guard args.count == (local ? 3 : 1), job == nil else { throw IOSWallpaperError("asset_busy_or_invalid_args") }
@@ -301,6 +316,7 @@ final class IOSNativeAssetService: IOSBridgeCancellableService {
             }
             guard args.count == 1, let ticket = object["ticket"] as? String, let j = job,
                   j.ticket == ticket, context.same(lease, j.lease), current(j) else { throw IOSWallpaperError("invalid_asset_ticket") }
+            if suspended { suspended = false; armWatch(j) }
             switch method {
             case "asset.poll": reply(info(j), nil)
             case "asset.cancel": cancelJob(); reply(["ok": true, "ticket": ticket, "cancelled": true], nil)
@@ -337,6 +353,14 @@ final class IOSNativeAssetService: IOSBridgeCancellableService {
             }
         } catch { reply(nil, code(error)) }
     }
+    private func ownerCurrent(_ j: Job) -> Bool {
+        job === j && context.revision == j.lease.revision && context.scopeProvider?() == j.lease.scope
+            && context.navigationProvider?() == j.lease.navigation
+            && (context.frameProvider == nil || context.frameProvider?() == j.lease.frame)
+    }
+    private func prepared(_ j: Job) -> Bool {
+        !j.busy && !j.reading && j.error.isEmpty && j.download == nil && j.package != nil && j.handle != nil
+    }
     private func current(_ j: Job) -> Bool { job === j && context.current(j.lease) }
     private func info(_ j: Job) -> [String: Any] {
         ["ok": j.error.isEmpty, "ticket": j.ticket, "ready": j.package != nil && j.error.isEmpty,
@@ -356,14 +380,19 @@ final class IOSNativeAssetService: IOSBridgeCancellableService {
     private func armWatch(_ j: Job) {
         let item = DispatchWorkItem { [weak self, weak j] in
             guard let self = self, let j = j, self.job === j else { return }
-            guard self.current(j) else { self.cancelJob(); return }
+            guard self.ownerCurrent(j) else { self.cancelJob(); return }
+            if UIApplication.shared.applicationState != .active {
+                if self.prepared(j) { self.suspended = true; self.watch = nil }
+                else { self.cancelJob() }
+                return
+            }
             if j.busy && !j.token.valid { self.fail(j, IOSWallpaperError("asset_timeout")) }
             self.armWatch(j)
         }
         watch = item; DispatchQueue.main.asyncAfter(deadline: .now() + 1, execute: item)
     }
     private func cancelJob() {
-        watch?.cancel(); watch = nil
+        watch?.cancel(); watch = nil; suspended = false
         guard let j = job else { return }; job = nil; j.token.cancel()
         let directory = j.directory, handle = j.handle; j.directory = nil; j.handle = nil; j.package = nil
         let cleanup = { [self] in worker.async { try? handle?.close(); if let directory = directory { try? FileManager.default.removeItem(at: directory) } } }

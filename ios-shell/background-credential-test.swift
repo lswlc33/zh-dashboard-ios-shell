@@ -20,7 +20,7 @@ import Foundation
 
 @main
 enum BackgroundCredentialTest {
-    static func main() {
+    static func main() async {
         var failures = 0
         func check(_ ok: Bool, _ name: String) {
             if ok { print("  ok   \(name)") }
@@ -104,6 +104,47 @@ enum BackgroundCredentialTest {
         ]
         check(codes.count == 6, "六类凭据问题各有独立错误码（不压成一句「未授权」）")
         check(!codes.contains("ok") && codes.allSatisfy { !$0.isEmpty }, "错误码都非空")
+
+        // MARK: - 7. 全来源单飞、web 生命周期隔离与绝对期限（真实 Swift 行为）
+
+        let coordinator = IOSBackgroundRunCoordinator.shared
+        do {
+            let web = try coordinator.begin(source: .web(UUID()), budget: 1)
+            do {
+                _ = try coordinator.begin(source: .shortcut, budget: 1)
+                check(false, "web 正在运行时快捷指令必须拒绝并发")
+            } catch {
+                check((error as? IOSBackgroundError) == .alreadyRunning, "所有入口共享单飞槽位")
+            }
+            coordinator.cancel(web)
+            check(!coordinator.isCurrent(web) && !web.canDeliver, "取消撤销网络与迟到通知/样本资格")
+            check(!coordinator.commit(web, {}), "取消后不能记账")
+            do {
+                _ = try coordinator.begin(source: .shortcut, budget: 1)
+                check(false, "取消后旧 Task 未退出前不能开新一轮")
+            } catch { check((error as? IOSBackgroundError) == .alreadyRunning, "取消后等旧 Task 收尾再释放槽位") }
+            coordinator.finish(web)
+
+            let shortcut = try coordinator.begin(source: .shortcut, budget: 1)
+            coordinator.cancelWeb(UUID())
+            check(coordinator.isCurrent(shortcut), "网页后台化不会取消真正的 Shortcut")
+            coordinator.finish(shortcut)
+
+            let system = try coordinator.begin(source: .system("sample-test"), budget: 1)
+            coordinator.cancelWeb(UUID())
+            check(coordinator.isCurrent(system), "网页导航不会取消真正的 BGTask")
+            coordinator.finish(system)
+
+            let deadline = try coordinator.begin(source: .shortcut, budget: 0.02)
+            do {
+                let _: Bool = try await iosBackgroundWithinDeadline(deadline) {
+                    try await Task.sleep(nanoseconds: 2_000_000_000)
+                    return true
+                }
+                check(false, "绝对期限必须中断悬挂请求")
+            } catch { check((error as? IOSBackgroundError) == .budgetExhausted, "绝对期限实际取消结构化子任务") }
+            coordinator.finish(deadline)
+        } catch { check(false, "运行协调器行为测试异常") }
 
         // MARK: - 结果
 

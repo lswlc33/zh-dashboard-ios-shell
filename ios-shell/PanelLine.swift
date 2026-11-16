@@ -36,16 +36,11 @@ enum IOSPanelLine: String {
         }
         set {
             guard newValue != current else { return }
-            lock.lock()
-            UserDefaults.standard.set(newValue.rawValue, forKey: defaultsKey)
-            changeRevision &+= 1
-            lock.unlock()
-            PanelNavigation.base = baseURL(for: newValue)
-            NotificationCenter.default.post(name: didChangeNotification, object: nil)
+            markChosen(newValue)
         }
     }
 
-    /// 启动时把持久化的线路应用到导航基址。
+    /// 启动或显式重新加载前才提交导航基址；保存线路偏好不能撤销当前 HTTPS 文档的信任。
     static func applyPersisted() {
         PanelNavigation.base = baseURL(for: current)
     }
@@ -60,15 +55,14 @@ enum IOSPanelLine: String {
     /// 只调用 `current` 的 setter 不够：它与当前值相同时直接 return，偏好键永远不会写，
     /// 网页就会一直认为「还没选过」，每次检查都再弹一次选择页。
     static func markChosen(_ line: IOSPanelLine) {
-        if current == line && chosen { return }
-        UserDefaults.standard.set(line.rawValue, forKey: defaultsKey)
-        if PanelNavigation.base != baseURL(for: line) {
-            PanelNavigation.base = baseURL(for: line)
-            NotificationCenter.default.post(name: didChangeNotification, object: nil)
-        }
         lock.lock()
+        guard current != line || !chosen else { lock.unlock(); return }
+        UserDefaults.standard.set(line.rawValue, forKey: defaultsKey)
         changeRevision &+= 1
         lock.unlock()
+        // 偏好立即生效于检查/下载，但旧文档的回执与后续恢复仍按本轮导航基址校验。
+        // 下一次 loadPanel 显式 applyPersisted 后才换信任范围，不能在这里改 base。
+        NotificationCenter.default.post(name: didChangeNotification, object: nil)
     }
 
     /// 面板主文档所在基址（以 `/` 结尾）。iOS 只从这两个 HTTPS 源加载。

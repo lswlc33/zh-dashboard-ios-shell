@@ -24,7 +24,7 @@ struct BackgroundArgumentError: Error { let code: String; init(_ code: String) {
 final class IOSBackgroundService: NSObject, IOSBridgeService, IOSBridgeCancellableService {
     let methods = ["background.status", "background.credential", "background.credential.clear",
                    "background.samples.take", "background.schedule", "background.notify",
-                   "background.tasks.run", "background.tasks.status"]
+                   "background.tasks.run", "background.tasks.status", "background.credential.v2"]
 
     // 不能用 `private typealias`：handle(method:args:reply:) 是协议要求的 internal
     // 方法，签名里出现 private 类型会被拒（CI 实测 "method must be declared private
@@ -33,6 +33,10 @@ final class IOSBackgroundService: NSObject, IOSBridgeService, IOSBridgeCancellab
     private let presenterProvider: () -> UIViewController?
     private var pendingConfirmation: (() -> Void)?
     private var jobID = UUID()
+    private let webOwner = UUID()
+    private var dailyTaskID: UUID?
+    private var activeDailyTask: Task<Void, Never>?
+    private let dailyTaskLock = NSLock()
 
     init(presenter: @escaping () -> UIViewController?) {
         presenterProvider = presenter
@@ -40,16 +44,43 @@ final class IOSBackgroundService: NSObject, IOSBridgeService, IOSBridgeCancellab
     }
 
     func navigationChanged() {
-        // 换页面时撤销未完成的确认，避免用户在新页面里点确认却把旧页面的凭据写进去。
         pendingConfirmation = nil
+        cancelDailyTask()
     }
 
     func applicationBackgrounded() {
         pendingConfirmation = nil
+        cancelDailyTask()
     }
 
     func cancel(method: String, args: [Any]) {
         pendingConfirmation = nil
+        if method == "background.tasks.run" { cancelDailyTask() }
+    }
+
+    private func cancelDailyTask() {
+        dailyTaskLock.lock()
+        let task = activeDailyTask
+        activeDailyTask = nil; dailyTaskID = nil
+        dailyTaskLock.unlock()
+        IOSBackgroundRunCoordinator.shared.cancelWeb(webOwner)
+        task?.cancel()
+    }
+
+    private func installDailyTask(_ task: Task<Void, Never>, id: UUID) {
+        dailyTaskLock.lock()
+        let current = dailyTaskID == id
+        if current { activeDailyTask = task }
+        dailyTaskLock.unlock()
+        if !current { task.cancel() }
+    }
+
+    private func finishDailyTask(_ id: UUID) -> Bool {
+        dailyTaskLock.lock()
+        defer { dailyTaskLock.unlock() }
+        guard dailyTaskID == id else { return false }
+        activeDailyTask = nil; dailyTaskID = nil
+        return true
     }
 
     func handle(method: String, args: [Any], reply: @escaping Reply) {
@@ -62,13 +93,18 @@ final class IOSBackgroundService: NSObject, IOSBridgeService, IOSBridgeCancellab
                 try grant(args, reply: reply)
             case "background.credential.clear":
                 try requireEmpty(args)
-                IOSBackgroundCredentialStore.remove()
+                guard IOSBackgroundRunCoordinator.shared.clearCredential() else {
+                    throw BackgroundArgumentError("keychain_unavailable")
+                }
+                cancelDailyTask()
                 // 小组件那份投影必须一起清：只清 Keychain 会让扩展继续用旧 token 打接口，
                 // 用户点了「清除凭据」却发现小组件还在联网，属于权限与预期双重不符。
                 WidgetCredentialStore.clear()
                 WidgetFetchCache.clear()
+                IOSBackgroundScheduler.shared.cancel(IOSBackgroundTaskID.refresh)
                 IOSBackgroundScheduler.shared.cancel(IOSBackgroundTaskID.signIn)
-                IOSBackgroundLog.write("凭据已清除，签到任务取消排队")
+                IOSBackgroundScheduler.shared.cancel(IOSBackgroundTaskID.dailyTasks)
+                IOSBackgroundLog.write("后台凭据已清除")
                 reply(statusPayload(), nil)
             case "background.samples.take":
                 try requireEmpty(args)
@@ -111,6 +147,8 @@ final class IOSBackgroundService: NSObject, IOSBridgeService, IOSBridgeCancellab
         return [
             "ok": true,
             "supported": true,
+            // 网页只在此 schema version 明确匹配时附带 uid/autoDailyTasks；旧壳不会误拒额外字段。
+            "credentialSchemaVersion": 2,
             // 调度能力：BGTaskScheduler 存在不代表系统会跑，这里如实分开两个字段。
             "schedulerAvailable": true,
             "deliveryGuaranteed": false,
@@ -141,7 +179,9 @@ final class IOSBackgroundService: NSObject, IOSBridgeService, IOSBridgeCancellab
             "pendingSamples": IOSBackgroundSampleQueue.count(),
             "signIn": reportJSON(signIn),
             "refresh": reportJSON(refresh),
-            "dailyTasks": reportJSON(IOSBackgroundScheduler.report(IOSBackgroundTaskID.dailyTasks))
+            "dailyTasks": reportJSON(IOSBackgroundScheduler.report(IOSBackgroundTaskID.dailyTasks),
+                                      currentOwnerID: credential?.ownerHash,
+                                      currentDay: IOSBackgroundRunner.beijingDay(Date()))
         ]
     }
 
@@ -151,11 +191,9 @@ final class IOSBackgroundService: NSObject, IOSBridgeService, IOSBridgeCancellab
         let outcome = IOSBackgroundCredentialStore.outcome()
         let credential = outcome.credential
         let report = IOSBackgroundScheduler.report(IOSBackgroundTaskID.dailyTasks)
-        let signIn = IOSBackgroundScheduler.report(IOSBackgroundTaskID.signIn)
-        // 签到是否算进今天的进度：只有当签到记录就是今天才算，
-        // 否则「昨天签的」会一直给今天凑数。
-        let signInToday = signIn.lastSignInDays != nil && Calendar.current.isDateInToday(
-            Date(timeIntervalSince1970: TimeInterval((signIn.lastRunAt ?? 0) / 1000)))
+        let today = IOSBackgroundRunner.beijingDay(Date())
+        let signInToday = IOSBackgroundRunner.signInIsCurrent(ownerID: credential?.ownerHash, day: today)
+        let dailyIsCurrent = report.day == today && report.ownerID == credential?.ownerHash
         return [
             "ok": true,
             "canRun": credential?.canRunDailyTasks ?? false,
@@ -164,9 +202,9 @@ final class IOSBackgroundService: NSObject, IOSBridgeService, IOSBridgeCancellab
             "scheduled": IOSBackgroundScheduler.shared.isScheduled(IOSBackgroundTaskID.dailyTasks),
             "lastRunAt": report.lastRunAt ?? 0,
             "lastResult": report.lastResult,
-            "done": report.lastDailyDone ?? 0,
-            "total": report.lastDailyTotal ?? 4,
-            "summary": report.lastDailySummary ?? "",
+            "done": dailyIsCurrent ? (report.lastDailyDone ?? 0) : 0,
+            "total": dailyIsCurrent ? (report.lastDailyTotal ?? 4) : 4,
+            "summary": dailyIsCurrent ? (report.lastDailySummary ?? "") : "",
             "signInToday": signInToday,
             "runCount": report.runCount,
             "successCount": report.successCount
@@ -184,10 +222,20 @@ final class IOSBackgroundService: NSObject, IOSBridgeService, IOSBridgeCancellab
         guard Set(value.keys).isSubset(of: allowed) else { throw BackgroundArgumentError("invalid_args") }
         // 会真的往广场发一条动态，必须用户显式确认（网页已经弹过一次，这里是第二道）。
         guard (value["confirm"] as? Bool) == true else { throw BackgroundArgumentError("confirmation_required") }
-        let signIn = IOSBackgroundScheduler.report(IOSBackgroundTaskID.signIn)
-        let signInToday = signIn.lastSignInDays != nil && Calendar.current.isDateInToday(
-            Date(timeIntervalSince1970: TimeInterval((signIn.lastRunAt ?? 0) / 1000)))
-        IOSBackgroundRunner.runDailyTasks(force: true, signInDone: signInToday, budget: 25) { report in
+        let ownerID = IOSBackgroundCredentialStore.load()?.ownerHash
+        let signInToday = IOSBackgroundRunner.signInIsCurrent(ownerID: ownerID, day: IOSBackgroundRunner.beijingDay(Date()))
+        let id = UUID()
+        dailyTaskLock.lock()
+        guard dailyTaskID == nil else { dailyTaskLock.unlock(); throw BackgroundArgumentError("task_already_running") }
+        dailyTaskID = id
+        dailyTaskLock.unlock()
+        let task = Task { [weak self] in
+            guard let self else { reply(nil, "service_closed"); return }
+            let report = await IOSBackgroundRunner.runDailyTasks(force: true, signInDone: signInToday,
+                budget: 25, ownerID: ownerID, source: .web(self.webOwner))
+            let current = self.finishDailyTask(id)
+            guard current, !Task.isCancelled, report.result != "cancelled" else { reply(nil, "cancelled"); return }
+            if report.result == "task_already_running" { reply(nil, report.result); return }
             reply([
                 "ok": true,
                 "result": report.result,
@@ -200,9 +248,12 @@ final class IOSBackgroundService: NSObject, IOSBridgeService, IOSBridgeCancellab
                 "summary": IOSBackgroundRunner.summary(report)
             ], nil)
         }
+        installDailyTask(task, id: id)
     }
 
-    private func reportJSON(_ value: IOSBackgroundTaskReport) -> [String: Any] {
+    private func reportJSON(_ value: IOSBackgroundTaskReport, currentOwnerID: String? = nil,
+                            currentDay: String? = nil) -> [String: Any] {
+        let dailyCurrent = currentOwnerID != nil && value.ownerID == currentOwnerID && value.day == currentDay
         var payload: [String: Any] = ["lastRunAt": value.lastRunAt ?? 0,
                                       "lastResult": value.lastResult,
                                       "runCount": value.runCount,
@@ -210,9 +261,9 @@ final class IOSBackgroundService: NSObject, IOSBridgeService, IOSBridgeCancellab
         if let soc = value.lastSocPercent { payload["lastSocPercent"] = soc }
         if let charging = value.lastCharging { payload["lastCharging"] = charging }
         if let days = value.lastSignInDays { payload["lastSignInDays"] = days }
-        if let done = value.lastDailyDone { payload["lastDailyDone"] = done }
-        if let total = value.lastDailyTotal { payload["lastDailyTotal"] = total }
-        if let summary = value.lastDailySummary { payload["lastDailySummary"] = summary }
+        if let done = value.lastDailyDone, dailyCurrent { payload["lastDailyDone"] = done }
+        if let total = value.lastDailyTotal, dailyCurrent { payload["lastDailyTotal"] = total }
+        if let summary = value.lastDailySummary, dailyCurrent { payload["lastDailySummary"] = summary }
         return payload
     }
 
@@ -281,11 +332,12 @@ final class IOSBackgroundService: NSObject, IOSBridgeService, IOSBridgeCancellab
                 reply(["ok": true, "granted": false, "reason": "user_cancelled"], nil)
                 return
             }
-            guard IOSBackgroundCredentialStore.save(credential) else {
+            guard IOSBackgroundRunCoordinator.shared.replaceCredential(credential) else {
                 credential.clear()
                 reply(nil, "keychain_unavailable")
                 return
             }
+            self.cancelDailyTask()
             let auto = (value["autoSignIn"] as? Bool) ?? IOSBackgroundPreferences.autoSignInEnabled
             IOSBackgroundPreferences.autoSignInEnabled = auto
             // 每日任务是写操作（会真发动态），默认沿用用户已开的状态，绝不因为
@@ -301,7 +353,7 @@ final class IOSBackgroundService: NSObject, IOSBridgeService, IOSBridgeCancellab
             // 必须在 credential.clear() 之前调用。
             Self.mirrorWidgetCredential(accountID: accountID, vin: vin, token: token,
                                         appID: appID, appSecret: appSecret)
-            IOSBackgroundLog.write("后台凭据已保存 vin=\(vin) autoSignIn=\(auto) scopes=\(scopes.joined(separator: "+"))")
+            IOSBackgroundLog.write("后台凭据已保存 autoSignIn=\(auto) scopes=\(scopes.joined(separator: "+"))")
             credential.clear()
             var payload = self.statusPayload()
             // partial=true 时界面应立刻提示补全；两个域都齐才是完整授权。

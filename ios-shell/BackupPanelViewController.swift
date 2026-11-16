@@ -133,13 +133,14 @@ final class BackupPanelViewController: UIViewController, UITableViewDataSource, 
             let uid = hasAccount && !summary.activeUserID.isEmpty ? summary.activeUserID : IOSStrings.backupValueNone
             // 默认只露头尾各几位：整条 token 很长，铺在表格里既看不全也不安全；
             // 要核对或复制时点「显示凭据」进可选中文本页。
-            let masked = hasAccount && !summary.activeToken.isEmpty
+            let masked = !summary.activeToken.isEmpty
                 ? Self.masked(summary.activeToken) : IOSStrings.backupValueNone
             var out: [(String, String)] = [
                 (IOSStrings.backupUserIDLabel, hasAccount ? uid : IOSStrings.backupActiveNone),
                 (IOSStrings.backupTokenLabel, masked)
             ]
-            if hasAccount && !summary.activeToken.isEmpty {
+            // 账号池损坏或没有活动账号时，镜像 token 仍是最后的恢复出口。
+            if !summary.activeToken.isEmpty {
                 out.append((IOSStrings.backupShowToken, ""))
                 out.append((IOSStrings.backupCopyToken, ""))
             }

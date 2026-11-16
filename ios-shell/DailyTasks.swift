@@ -68,7 +68,9 @@ struct IOSDailyTasksReport: Equatable, Sendable {
     /// 服务端**复核**后仍判为已完成的可执行项数（不含签到）。
     var confirmedServer: Int = 0
     /// 可执行项总数（服务端列表里命中 ACTION 表的项，通常 3）。
-    var totalActions: Int = 0
+    var totalActions: Int = IOSDailyTaskKind.allCases.count
+    /// 只有最后一次完整服务端复核确认三项都完成，才允许发完成通知。
+    var serverVerifiedAll: Bool = false
     /// 签到是否完成（由调用方传入，签名里没有签到逻辑）。
     var signInDone: Bool = false
     /// 顶层结论码：ok / partial / budget_exhausted / no_credential / http_401 / ...
@@ -93,17 +95,53 @@ private struct IOSSocialArticle {
     let content: String
 }
 
-final class IOSDailyTasksClient {
+/// 发送前落不可重放动作的账本。文件只存匿名 owner、北京时间日和动作，不含 token/VIN/正文。
+/// 原子写后回读确认；存储缺失/损坏/写失败时禁止发帖，不能假装成功再发送。
+private enum IOSDailyPostAttemptStore {
+    private struct Attempt: Codable, Equatable {
+        let ownerHash: String
+        let day: String
+        let action: String
+    }
+
+    private static func file(ownerHash: String, day: String) throws -> URL {
+        let root = try FileManager.default.url(for: .applicationSupportDirectory,
+            in: .userDomainMask, appropriateFor: nil, create: true)
+            .appendingPathComponent("BackgroundPostAttempts", isDirectory: true)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        return root.appendingPathComponent("\(ownerHash)-\(day)-\(IOSDailyTaskKind.post.rawValue).json")
+    }
+
+    /// false 表示本日已尝试：结果未知也只复核，绝不重发。
+    static func reserve(ownerHash: String, day: String) throws -> Bool {
+        do {
+            let url = try file(ownerHash: ownerHash, day: day)
+            let expected = Attempt(ownerHash: ownerHash, day: day, action: IOSDailyTaskKind.post.rawValue)
+            if FileManager.default.fileExists(atPath: url.path) {
+                let data = try Data(contentsOf: url)
+                guard data.count <= 1024, try JSONDecoder().decode(Attempt.self, from: data) == expected else {
+                    throw IOSDailyTasksError("attempt_persist_failed")
+                }
+                return false
+            }
+            let data = try JSONEncoder().encode(expected)
+            try data.write(to: url, options: [.atomic, .completeFileProtectionUntilFirstUserAuthentication])
+            guard try Data(contentsOf: url) == data else { throw IOSDailyTasksError("attempt_persist_failed") }
+            return true
+        } catch { throw IOSDailyTasksError("attempt_persist_failed") }
+    }
+}
+
+actor IOSDailyTasksClient {
     static let shared = IOSDailyTasksClient()
 
     private let session: URLSession
 
     private init() {
         let config = URLSessionConfiguration.ephemeral
-        // 单个请求 12s、整轮 25s：整轮上限比 AppIntent 的 30s 略小，
-        // 留出收尾（写 App Group 回执、发通知）的时间，否则会被系统直接掐断。
+        // 整轮只有 25 秒：单个请求不能拿固定 12 秒，否则deadline末尾才发起的请求仍会越过总预算。
         config.timeoutIntervalForRequest = 12
-        config.timeoutIntervalForResource = 20
+        config.timeoutIntervalForResource = 12
         config.waitsForConnectivity = false
         config.requestCachePolicy = .reloadIgnoringLocalCacheData
         config.httpShouldSetCookies = false
@@ -111,94 +149,59 @@ final class IOSDailyTasksClient {
         session = URLSession(configuration: config)
     }
 
-    /// 整轮 deadline。外部可以传更短的（例如剩余预算），默认 25s。
-    private var deadline: Date = .distantFuture
-
     // MARK: - 对外入口
 
-    /// 跑一轮完整每日任务。
-    ///
-    /// - Parameters:
-    ///   - credential: 必须 `canRunDailyTasks`（app 域 + uid）。
-    ///   - signInDone: 签到是否已完成——只用于进度统计，本方法不碰签到。
-    ///   - budget: 整轮预算秒数，默认 25。调用方在「签到+任务」连跑时应传剩余时间。
-    func run(credential: IOSBackgroundCredential, signInDone: Bool, budget: TimeInterval = 25) async -> IOSDailyTasksReport {
-        deadline = Date().addingTimeInterval(max(5, min(25, budget)))
-        var report = IOSDailyTasksReport()
-        report.signInDone = signInDone
-        guard credential.canRunDailyTasks else {
-            report.result = "credential_partial"
-            return report
-        }
-        // ① 先读任务列表。列表读不到就没有「哪几项没做」，后面全靠猜——不做。
-        let list: [String: Any]
+    /// 所有入口先在 Runner 领取同一个全局运行槽位；每次 await 前后检查不可变 context。
+    func run(credential: IOSBackgroundCredential, signInDone: Bool,
+             context: IOSBackgroundRunContext) async -> IOSDailyTasksReport {
+        var report = IOSDailyTasksReport(); report.signInDone = signInDone
+        guard credential.canRunDailyTasks else { report.result = "credential_partial"; return report }
+        let initial: [[String: Any]]
         do {
-            list = try await taskList(credential: credential)
-        } catch {
-            report.result = Self.code(of: error)
-            return report
-        }
-        let rows = (list["ps0003_01_002_VOList"] as? [[String: Any]]) ?? []
-        // 服务端任务总数（只数可执行项）。被动项即使未完成也不算进分母，
-        // 否则进度永远到不了 4/4，用户会以为一直失败。
-        let actionable = rows.filter { IOSDailyTaskKind.from(code: Self.text($0["code"]) ?? "") != nil }
-        report.totalActions = actionable.count
-        report.confirmedServer = actionable.filter { Self.isComplete($0) }.count
-        // 分母至少是 3：服务端偶尔只回部分项（例如今天发帖项不出现），
-        // 那时不能让「4/2」这种进度出现在用户面前。
-        report.totalActions = max(report.totalActions, IOSDailyTaskKind.allCases.count)
-
-        let pending = actionable.filter { !Self.isComplete($0) }
-        if pending.isEmpty {
-            report.result = "ok"
-            return report
-        }
-        // ② 逐项执行。顺序与网页一致：发帖 → 点赞 → 分享。
-        // 发帖放最前，因为它最耗时（写完还要回头定位新帖）；万一预算用尽，
-        // 至少点赞与分享这两项快的能做完。
-        for item in pending {
-            let code = Self.text(item["code"]) ?? ""
-            guard let kind = IOSDailyTaskKind.from(code: code) else { continue }
-            let name = Self.text(item["name"]) ?? code
-            if remaining() <= 0 {
-                report.skipped.append(name)
-                report.budgetExhausted = true
-                continue
-            }
+            try context.check()
+            initial = try await taskList(credential: credential, context: context)
+        } catch { report.result = Self.code(of: error); return report }
+        report.confirmedServer = initial.filter { Self.isComplete($0) }.count
+        // 固定顺序：发帖→点赞→分享；列表已校验每个动作恰好一项。
+        for kind in IOSDailyTaskKind.allCases {
+            guard let item = initial.first(where: { Self.text($0["code"]) == kind.rawValue }),
+                  !Self.isComplete(item) else { continue }
+            let name = Self.text(item["name"]) ?? kind.rawValue
             do {
+                try context.check()
                 switch kind {
-                case .post:
-                    try await ensurePost(credential: credential)
-                case .like:
-                    try await ensureLike(credential: credential)
-                case .share:
-                    try await ensureShare(credential: credential)
+                case .post: try await ensurePost(credential: credential, context: context)
+                case .like: try await ensureLike(credential: credential, context: context)
+                case .share: try await ensureShare(credential: credential, context: context)
                 }
+                try context.check()
                 report.completed.append(name)
             } catch {
                 let reason = Self.code(of: error)
-                // 预算用尽不是「这一项失败」，是「没来得及做」，要分开记账，
-                // 否则用户会以为点赞接口坏了。
-                if remaining() <= 0 {
-                    report.skipped.append(name)
-                    report.budgetExhausted = true
-                } else {
-                    report.failed.append(IOSDailyTaskFailure(name: name, reason: reason))
+                if reason == "cancelled" { report.result = reason; return report }
+                if reason == "budget_exhausted" || context.remaining <= 0 {
+                    report.skipped.append(name); report.budgetExhausted = true
+                    report.result = "budget_exhausted"; return report
                 }
+                report.failed.append(IOSDailyTaskFailure(name: name, reason: reason))
             }
         }
-        // ③ 回头复核。**必须重新读一次列表**：接口返回 200 不等于任务完成
-        // （tasks.js:1319 与 AutoTaskRunner 都这么做）。复核失败时保留上一次的读数，
-        // 不把「读不到」当成「没完成」。
-        if let again = try? await taskList(credential: credential),
-           let againRows = (again["ps0003_01_002_VOList"] as? [[String: Any]]) {
-            let againActionable = againRows.filter { IOSDailyTaskKind.from(code: Self.text($0["code"]) ?? "") != nil }
-            report.confirmedServer = againActionable.filter { Self.isComplete($0) }.count
-            report.totalActions = max(againActionable.count, IOSDailyTaskKind.allCases.count)
-        } else {
-            report.confirmedServer = min(report.confirmedServer + report.completed.count, report.totalActions)
+        // 初读已完成也必须再复核，缺键/空列表/重复动作都不能变成 0/4 完成。
+        do {
+            let final = try await taskList(credential: credential, context: context)
+            try context.check()
+            report.confirmedServer = final.filter { Self.isComplete($0) }.count
+            report.serverVerifiedAll = report.confirmedServer == IOSDailyTaskKind.allCases.count
+            if report.serverVerifiedAll {
+                // 丢回包的发帖可被服务端最终状态纠正，不按本地回包猜完成。
+                report.failed = []; report.result = "ok"
+            } else { report.result = "verification_failed" }
+        } catch {
+            let reason = Self.code(of: error)
+            report.result = ["cancelled", "budget_exhausted"].contains(reason) ? reason : "verification_failed"
+            report.budgetExhausted = reason == "budget_exhausted"
+            report.failed.append(IOSDailyTaskFailure(name: "服务端复核", reason: reason))
         }
-        report.result = report.failed.isEmpty ? (report.budgetExhausted ? "budget_exhausted" : "ok") : "partial"
         return report
     }
 
@@ -207,65 +210,70 @@ final class IOSDailyTasksClient {
     /// 每日首次发帖。发布响应**不带文章 id**，只能靠「发帖前 id 基线 + 作者 + 正文 + 时间窗」
     /// 回头定位（tasks.js:851-879 的同一套证据规则）。定位不到就不删——宁可留一条动态，
     /// 也不能凭猜测删别人的帖子。
-    private func ensurePost(credential: IOSBackgroundCredential) async throws {
-        // 发帖前先记一次列表基线；基线不可靠时宁可不发（没有基线就无法安全定位与清理）。
-        let before = try await mineArticles(credential: credential)
+    private func ensurePost(credential: IOSBackgroundCredential, context: IOSBackgroundRunContext) async throws {
+        try context.check()
+        // 账本按开始时的北京时间日固定；跨午夜不把旧任务写成新一天的尝试。
+        guard IOSBackgroundRunner.beijingDay(Date()) == context.day else { throw IOSDailyTasksError("day_changed") }
+        let before = try await mineArticles(credential: credential, context: context)
         guard before.allSatisfy({ !$0.id.isEmpty }) else { throw IOSDailyTasksError("article_id_missing") }
         let baseline = Set(before.map { $0.id })
         let content = Self.defaultPostContent()
         let startedAt = Date().timeIntervalSince1970 * 1000
-        // 载荷形状与 tasks.js:899-902 逐字一致：postSubInfo.topicList 空数组、topicid 空串。
+        try context.check()
+        guard try IOSDailyPostAttemptStore.reserve(ownerHash: credential.ownerHash, day: context.day) else {
+            // 前次可能已被服务端接收，只允许本轮末尾复核任务列表，不能补发或猜删。
+            throw IOSDailyTasksError("post_attempt_unknown")
+        }
+        try context.check()
         let payload: [String: Any] = ["postSubInfo": ["topicList": [Any]()], "topicid": "", "postcontent": content]
-        _ = try await post(credential: credential, path: "/v1.0/social/cfmotoserversocial/commonArticle", body: payload)
+        _ = try await post(credential: credential, path: "/v1.0/social/cfmotoserversocial/commonArticle", body: payload, context: context)
         let endedAt = Date().timeIntervalSince1970 * 1000
-        // 发布成功即返回；接下来的定位只用于「要不要删」，失败不影响本项判定。
-        // 最多 2 轮、每轮隔 0.6s：网页用 5 轮 × 1s，那在后台预算里太贵。
         var created: String?
         for attempt in 0..<2 {
-            if attempt > 0 { try await sleep(0.6) }
-            if remaining() <= 0 { break }
-            guard let rows = try? await mineArticles(credential: credential) else { continue }
+            if attempt > 0 { try await sleep(0.6, context: context) }
+            try context.check()
+            guard let rows = try? await mineArticles(credential: credential, context: context) else { continue }
+            try context.check()
             let matched = rows.filter { row in
                 guard !baseline.contains(row.id), row.userID == credential.uid,
                       row.content == content, row.at.isFinite else { return false }
                 return row.at >= startedAt - 2000 && row.at <= endedAt + 2000
             }
-            // 多于一条说明证据不唯一：不删，也不重试发帖。
             if matched.count == 1 { created = matched[0].id; break }
             if matched.count > 1 { break }
         }
-        // 只有唯一定位到才删。删失败也不影响「发帖」这一项的完成判定。
-        if let id = created, remaining() > 0 {
+        if let id = created {
+            try context.check()
             _ = try? await send(credential: credential, method: "DELETE",
-                                path: "/v1.0/social/cfmotoserversocial/commonArticle/deleteArticle",
-                                query: [("articleId", id), ("postType", "1")], body: nil)
+                path: "/v1.0/social/cfmotoserversocial/commonArticle/deleteArticle",
+                query: [("articleId", id), ("postType", "1")], body: nil, context: context)
         }
     }
 
     /// 点赞：每次重新读广场取最新帖，不缓存、不与分享共用目标（tasks.js:823-837 同款）。
-    private func ensureLike(credential: IOSBackgroundCredential) async throws {
-        let id = try await latestSquarePost(credential: credential)
+    private func ensureLike(credential: IOSBackgroundCredential, context: IOSBackgroundRunContext) async throws {
+        let id = try await latestSquarePost(credential: credential, context: context)
         try await sendJSON(credential: credential, method: "POST",
                            path: "/v1.0/social/cfmotoserversocial/socialCommu/likeFavoriteInfo",
-                           body: ["postId": id, "kindFlag": "0"])
+                           body: ["postId": id, "kindFlag": "0"], context: context)
     }
 
     /// 分享：分享成功后必须再补一次 adjustByShare 领积分，否则任务状态不变。
-    private func ensureShare(credential: IOSBackgroundCredential) async throws {
-        let id = try await latestSquarePost(credential: credential)
+    private func ensureShare(credential: IOSBackgroundCredential, context: IOSBackgroundRunContext) async throws {
+        let id = try await latestSquarePost(credential: credential, context: context)
         try await sendJSON(credential: credential, method: "PUT",
-                           path: "/v1.0/social/cfmotoserversocial/article/share/\(id)", body: nil)
+                           path: "/v1.0/social/cfmotoserversocial/article/share/\(id)", body: nil, context: context)
         try await sendJSON(credential: credential, method: "GET",
-                           path: "/v1.0/mine/cfmotoservermine/integral/adjustByShare", body: nil)
+                           path: "/v1.0/mine/cfmotoservermine/integral/adjustByShare", body: nil, context: context)
     }
 
     /// 广场最新一帖的 id。任何一行缺可靠 id 或发布时间就直接报错——
     /// 猜一个 id 去点赞等于替用户乱操作。
-    private func latestSquarePost(credential: IOSBackgroundCredential) async throws -> String {
+    private func latestSquarePost(credential: IOSBackgroundCredential, context: IOSBackgroundRunContext) async throws -> String {
         let data = try await request(credential: credential, method: "GET",
                                      path: "/v1.0/social/cfmotoserversocial/community/qbTzInfoNewV2",
                                      query: [("postModule", "1"), ("slidingType", "0"), ("page", "1"), ("pageSize", "20")],
-                                     body: nil)
+                                     body: nil, context: context)
         let rows = try Self.rows(from: data, key: nil)
         var latest: IOSSocialArticle?
         for row in rows {
@@ -278,35 +286,46 @@ final class IOSDailyTasksClient {
 
     // MARK: - 读列表
 
-    private func taskList(credential: IOSBackgroundCredential) async throws -> [String: Any] {
+    private func taskList(credential: IOSBackgroundCredential, context: IOSBackgroundRunContext) async throws -> [[String: Any]] {
         let data = try await request(credential: credential, method: "GET",
                                      path: "/v1.0/mine/cfmotoservermine/integral/getByUserId",
-                                     query: [("userId", credential.uid)], body: nil)
-        guard let object = data as? [String: Any] else { throw IOSDailyTasksError("decode") }
-        return object
+                                     query: [("userId", credential.uid)], body: nil, context: context)
+        guard let object = data as? [String: Any],
+              let rows = object["ps0003_01_002_VOList"] as? [[String: Any]], !rows.isEmpty else {
+            throw IOSDailyTasksError("task_list_unusable")
+        }
+        let actionable = rows.filter { IOSDailyTaskKind.from(code: Self.text($0["code"]) ?? "") != nil }
+        let codes = actionable.compactMap { Self.text($0["code"]) }
+        guard actionable.count == IOSDailyTaskKind.allCases.count,
+              Set(codes) == Set(IOSDailyTaskKind.allCases.map { $0.rawValue }),
+              actionable.allSatisfy({ ["0", "1"].contains(Self.text($0["completeFlag"]) ?? "") }) else {
+            throw IOSDailyTasksError("task_list_unusable")
+        }
+        return actionable
     }
 
-    private func mineArticles(credential: IOSBackgroundCredential) async throws -> [IOSSocialArticle] {
+    private func mineArticles(credential: IOSBackgroundCredential, context: IOSBackgroundRunContext) async throws -> [IOSSocialArticle] {
         let data = try await request(credential: credential, method: "GET",
                                      path: "/v1.0/social/cfmotoserversocial/community/mineArticleInfo",
-                                     query: [("userId", credential.uid)], body: nil)
+                                     query: [("userId", credential.uid)], body: nil, context: context)
         return try Self.rows(from: data, key: nil)
     }
 
     // MARK: - HTTP
 
-    private func post(credential: IOSBackgroundCredential, path: String, body: [String: Any]) async throws -> Any? {
-        try await request(credential: credential, method: "POST", path: path, query: [], body: body)
+    private func post(credential: IOSBackgroundCredential, path: String, body: [String: Any],
+                      context: IOSBackgroundRunContext) async throws -> Any? {
+        try await request(credential: credential, method: "POST", path: path, query: [], body: body, context: context)
     }
 
     private func sendJSON(credential: IOSBackgroundCredential, method: String, path: String,
-                          body: [String: Any]?) async throws {
-        _ = try await request(credential: credential, method: method, path: path, query: [], body: body)
+                          body: [String: Any]?, context: IOSBackgroundRunContext) async throws {
+        _ = try await request(credential: credential, method: method, path: path, query: [], body: body, context: context)
     }
 
     private func send(credential: IOSBackgroundCredential, method: String, path: String,
-                      query: [(String, String)], body: [String: Any]?) async throws -> Any? {
-        try await request(credential: credential, method: method, path: path, query: query, body: body)
+                      query: [(String, String)], body: [String: Any]?, context: IOSBackgroundRunContext) async throws -> Any? {
+        try await request(credential: credential, method: method, path: path, query: query, body: body, context: context)
     }
 
     /// 发一个 app 域请求并返回 `data` 字段。
@@ -314,8 +333,9 @@ final class IOSDailyTasksClient {
     /// 签名规则与 sign.js 完全一致：`md5(sha1(query + body + "appId=..&nonce=..&timestamp=.." + SECRET))`。
     /// 注意 body 是**参与签名的原始 JSON 串**，所以必须先序列化再签，不能签完再补字段。
     private func request(credential: IOSBackgroundCredential, method: String, path: String,
-                         query: [(String, String)], body: [String: Any]?) async throws -> Any? {
-        guard remaining() > 0 else { throw IOSDailyTasksError("budget_exhausted") }
+                         query: [(String, String)], body: [String: Any]?, context: IOSBackgroundRunContext) async throws -> Any? {
+        try context.check()
+        guard IOSBackgroundRunner.beijingDay(Date()) == context.day else { throw IOSDailyTasksError("day_changed") }
         let bodyText: String
         if let body = body {
             // 键序不稳定会让同一次请求签不出同一个串，先排序再序列化。
@@ -338,6 +358,8 @@ final class IOSDailyTasksClient {
         guard let target = URL(string: url) else { throw IOSDailyTasksError("bad_request") }
         var request = URLRequest(url: target)
         request.httpMethod = method
+        try context.check()
+        request.timeoutInterval = min(12, context.remaining)
         if body != nil { request.httpBody = Data(bodyText.utf8) }
         request.setValue("application/json;charset=UTF-8", forHTTPHeaderField: "Content-Type")
         request.setValue("zh-CN", forHTTPHeaderField: "Accept-Language")
@@ -350,14 +372,26 @@ final class IOSDailyTasksClient {
         let data: Data
         let http: HTTPURLResponse
         do {
-            let (payload, response) = try await session.data(for: request)
+            let prepared = request
+            let session = self.session
+            let (payload, response) = try await iosBackgroundWithinDeadline(context) {
+                try context.check()
+                let value = try await session.data(for: prepared)
+                try context.check()
+                return value
+            }
+            try context.check()
             guard let value = response as? HTTPURLResponse else { throw IOSDailyTasksError("decode") }
             data = payload; http = value
-        } catch let error as IOSDailyTasksError {
-            throw error
         } catch {
+            // 父取消、credential epoch 与绝对 deadline 不能被压成 network 后继续写。
+            if error is CancellationError || (error as? URLError)?.code == .cancelled {
+                throw IOSBackgroundError.cancelled
+            }
+            if error is IOSBackgroundError || error is IOSDailyTasksError { throw error }
             throw IOSDailyTasksError("network")
         }
+        try context.check()
         switch http.statusCode {
         case 200...299: break
         case 401: throw IOSDailyTasksError("http_401")
@@ -375,9 +409,11 @@ final class IOSDailyTasksClient {
 
     // MARK: - 小工具
 
-    private func remaining() -> TimeInterval { deadline.timeIntervalSinceNow }
-    private func sleep(_ seconds: Double) async throws {
+    private func sleep(_ seconds: Double, context: IOSBackgroundRunContext) async throws {
+        try context.check()
+        guard context.remaining > seconds else { throw IOSBackgroundError.budgetExhausted }
         try await Task.sleep(nanoseconds: UInt64(seconds * 1_000_000_000))
+        try context.check()
     }
 
     /// `completeFlag == 0` 才算已完成（tasks.js:1319 的口径）。
@@ -457,8 +493,10 @@ final class IOSDailyTasksClient {
         return "\(parts.month ?? 1)月\(parts.day ?? 1)号打卡！"
     }
 
-    static func code(of error: Error) -> String {
-        (error as? IOSDailyTasksError)?.code ?? "failed"
+    nonisolated static func code(of error: Error) -> String {
+        if let error = error as? IOSBackgroundError { return error.code }
+        if error is CancellationError || (error as? URLError)?.code == .cancelled { return "cancelled" }
+        return (error as? IOSDailyTasksError)?.code ?? "failed"
     }
 }
 

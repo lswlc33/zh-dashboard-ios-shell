@@ -149,7 +149,14 @@ final class IOSStore {
             let exists = manager.fileExists(atPath: file.path)
             // 未确认无原档时绝不生成新密钥，否则原档会永远无法解密。
             key = try loadKey(archiveExists: exists)
-            guard exists else { return }
+            guard exists else {
+                // 无原档时密钥加载/创建成功已经是完整成功路径；也要清掉此前瞬时
+                // Keychain/目录错误，否则 loaded=true 后 commit 会继续被旧错误冻结。
+                readError = nil
+                values = [:]
+                revision = 0
+                return
+            }
             let fd = file.path.withCString { Darwin.open($0, O_RDONLY | O_NOFOLLOW) }
             guard fd >= 0 else { throw Failure.reason("store_read_failed") }
             defer { Darwin.close(fd) }

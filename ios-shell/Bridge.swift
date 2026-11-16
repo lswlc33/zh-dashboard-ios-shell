@@ -420,7 +420,7 @@ final class IOSBridge {
             replyHandler(IOSBridgePolicy.failure(method: method, code: "unsupported_method", requestID: requestID), nil)
             return
         }
-        guard pending[id] == nil, pending.count < IOSBridgePolicy.maxPending else {
+        guard pending[id] == nil, pending.count < IOSBridgePolicy.maxPending || method == "txn.cancel" else {
             logFailure(method: method, code: "pending_limit", detail: "count=\(pending.count)")
             replyHandler(IOSBridgePolicy.failure(method: method, code: "pending_limit", requestID: requestID), nil)
             return
@@ -665,9 +665,14 @@ final class IOSBridge {
                 }
             }
         }
+        let ownerID = session.flatMap {
+            IOSSystemSurfacesService.widgetOwnerID(accountID: $0.accountID, vin: $0.vin)
+        } ?? ""
         finish(reply, ["ok": true, "frame": session?.frame ?? "", "generation": generation, "epoch": epoch,
-                       "navId": navigationID, "accountId": session?.accountID ?? "", "vin": session?.vin ?? ""])
+                       "navId": navigationID, "accountId": session?.accountID ?? "", "vin": session?.vin ?? "",
+                       "widgetOwnerID": ownerID])
         emitLifecycle("session")
+        DispatchQueue.main.async { [weak self] in self?.drainWidgetCommands() }
     }
 
     private func credential(accountID: String, vin: String, values: [String: String]) -> String? {
@@ -787,7 +792,7 @@ final class IOSBridge {
         }
         services.forEach { $0.applicationBackgrounded() }
         for reply in Array(pending.values) where !reply.backgroundHandoff {
-            if let id = reply.transportID { cancelTransaction(id) }
+            cancelOperation(reply)
             reject(reply, "application_backgrounded")
         }
         finishMedia(.deny)
@@ -809,9 +814,14 @@ final class IOSBridge {
     /// 交给网页的车控逻辑执行（iOS 壳原生没有车控 API，安卓也走网页 car_cmd）。
     /// 只投递一次、失败不重试：车控是显式动作，重复执行比不执行更危险。
     private func drainWidgetCommands() {
-        guard foreground, let command = ZeehoWidgetCommandMailbox.consume() else { return }
-        guard let web = webView, !navigationID.isEmpty else { return }
-        let event: [String: Any] = ["action": command, "navId": navigationID, "generation": generation]
+        guard foreground, nativeSessionScope() != nil, let session = session, !navigationID.isEmpty,
+              let owner = IOSSystemSurfacesService.widgetOwner(accountID: session.accountID, vin: session.vin),
+              let command = ZeehoWidgetCommandMailbox.consume(ownerID: owner.ownerIdentifierString),
+              let web = webView else { return }
+        let event: [String: Any] = ["id": command.id, "action": command.action,
+                                    "ownerID": command.ownerID, "createdAt": command.createdAt,
+                                    "navId": navigationID, "generation": generation,
+                                    "epoch": epoch, "frame": session.frame]
         guard let json = try? IOSBridgePolicy.scriptJSON(event) else { return }
         web.evaluateJavaScript("window.__zeehoWidgetCommand && window.__zeehoWidgetCommand(" + json + ");",
                                completionHandler: nil)

@@ -490,6 +490,7 @@ final class IOSCastIdentity {
 struct IOSCastGrant: Codable {
     let version: Int
     let id: String
+    let extensionID: String? // 旧票据缺此键仍可被 host 撤销；新扩展启动时必须精确匹配。
     let targetIP: String
     let issuedAt: TimeInterval
     let selectBefore: TimeInterval
@@ -499,7 +500,8 @@ struct IOSCastGrant: Codable {
     var settings: IOSCastSettings
     let recipe: IOSCastRecipe
     var valid: Bool {
-        version == 1 && UUID(uuidString: id) != nil && (try? IOSCastTarget.validate(targetIP)) != nil && settings.valid
+        version == 1 && UUID(uuidString: id) != nil && (extensionID.map { IOSCastMailbox.validExtensionID($0) } ?? true)
+            && (try? IOSCastTarget.validate(targetIP)) != nil && settings.valid
             && (try? recipe.validate()) != nil && recipe.tiers.contains(where: { $0.id == settings.tier })
             && issuedAt.isFinite && selectBefore.isFinite && endBefore.isFinite
             && selectBefore >= issuedAt && selectBefore - issuedAt <= 120
@@ -589,7 +591,15 @@ final class IOSCastMailbox {
             }
         }
     }
-    static let extensionID = "io.github.lswlc33.dashboard.ios.broadcast"
+    static func validExtensionID(_ value: String) -> Bool {
+        !value.isEmpty && value.utf8.count <= 256 && value.contains(".")
+            && value.split(separator: ".", omittingEmptySubsequences: false).allSatisfy { part in
+                !part.isEmpty && part.utf8.allSatisfy { byte in
+                    (byte >= 0x41 && byte <= 0x5A) || (byte >= 0x61 && byte <= 0x7A)
+                        || (byte >= 0x30 && byte <= 0x39) || byte == 0x2D
+                }
+            }
+    }
     static let changedNotification = "io.github.lswlc33.dashboard.ios.cast-grant-changed"
     private let directory: URL
     init(groupID: String = IOSCastMailbox.groupID) throws {

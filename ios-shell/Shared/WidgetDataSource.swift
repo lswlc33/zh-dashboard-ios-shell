@@ -45,13 +45,14 @@ public enum WidgetDataSource {
         // **必须核对 active owner**：凭据是「某账号某车」的，而 active-owner.json 才是
         // 「主页当前车辆」。两者不一致（换了账号/换了车、宿主还没重写凭据）时
         // 绝不能用旧凭据继续拉——那正是报告点名的「残留 vehicleID 显示别的车」。
-        let activeOwner = (try? SystemSnapshotStore.currentOwner())?.ownerIdentifierString
+        let activeOwner = try? SystemSnapshotStore.currentOwner()
+        let activeOwnerID = activeOwner?.ownerIdentifierString
         // 不用 `flatMap`：闭包里 `return nil` 与返回 `WidgetCredential` 混在一起时
         // 泛型参数推不出来（CI 实测 "generic parameter 'U' could not be inferred"）。
         let stored = WidgetCredentialStore.read(at: date)
         let credential: WidgetCredential? = {
-            guard let stored = stored, let activeOwner = activeOwner,
-                  stored.ownerID == activeOwner else { return nil }
+            guard let stored = stored, let activeOwnerID = activeOwnerID,
+                  stored.ownerID == activeOwnerID else { return nil }
             return stored
         }()
         var liveReason = "no_credential"
@@ -60,34 +61,47 @@ public enum WidgetDataSource {
                                                           maxAgeSeconds: cacheMaxAgeSeconds) {
                 return WidgetDataSourceResult(snapshot: cached, origin: .cache, reason: "")
             }
-            switch await WidgetVehicleClient.fetch(credential, at: date) {
+            let result = await WidgetVehicleClient.fetch(credential, at: date)
+            let completedAt = Date()
+            // success / failure 都会继续读写数据，必须在分流前复核完整授权。
+            // 只比 owner 会漏掉同车换 token、换密钥和撤权；Equatable 也包含 updatedAt。
+            guard let currentOwner = try? SystemSnapshotStore.currentOwner(),
+                  currentOwner == activeOwner,
+                  currentOwner.ownerIdentifierString == credential.ownerID,
+                  WidgetCredentialStore.read(at: completedAt) == credential else {
+                return currentSnapshot(at: completedAt, reason: "stale_credential")
+            }
+            switch result {
             case .success(let vehicle):
-                // 构造不出来（owner/时间不自洽）就当这次失败：宁可退回缓存/快照，
-                // 也绝不写一份会被 `validated()` 拒绝的坏数据进缓存。
-                if let snapshot = makeSnapshot(vehicle, credential: credential, at: date) {
+                // 车名、充电态或账号统计不等于核心测量成功，空 live 不能盖掉好缓存。
+                if !vehicle.hasCoreMeasurements {
+                    liveReason = "no_data"
+                } else if let snapshot = makeSnapshot(vehicle, credential: credential, at: completedAt) {
                     WidgetFetchCache.write(snapshot)
                     return WidgetDataSourceResult(snapshot: snapshot, origin: .live, reason: "")
-                }
-                liveReason = "snapshot_invalid"
-                if let cached = WidgetFetchCache.read(ownerID: credential.ownerID, at: date,
-                                                      maxAgeSeconds: cacheMaxAgeSeconds) {
-                    return WidgetDataSourceResult(snapshot: cached, origin: .cache, reason: liveReason)
+                } else {
+                    liveReason = "snapshot_invalid"
                 }
             case .failure(let error):
                 liveReason = error.code
-                // 接口挂了但缓存还在：先用缓存，别退回更旧的宿主快照。
-                if let cached = WidgetFetchCache.read(ownerID: credential.ownerID, at: date,
-                                                      maxAgeSeconds: cacheMaxAgeSeconds) {
-                    return WidgetDataSourceResult(snapshot: cached, origin: .cache, reason: error.code)
-                }
             }
+            // 只有 await 后授权仍完整匹配，才允许失败/空结果回退到该凭据的缓存。
+            if let cached = WidgetFetchCache.read(ownerID: credential.ownerID, at: completedAt,
+                                                  maxAgeSeconds: cacheMaxAgeSeconds) {
+                return WidgetDataSourceResult(snapshot: cached, origin: .cache, reason: liveReason)
+            }
+            return currentSnapshot(at: completedAt, reason: liveReason)
         }
-        // 兜底：主 App 前台快照（原有行为，未授权用户/弱网都走这里）。
+        return currentSnapshot(at: date, reason: liveReason)
+    }
+
+    private static func currentSnapshot(at date: Date, reason: String) -> WidgetDataSourceResult {
+        // 兜底只读当前 active owner 的宿主快照，绝不再用在途请求捕获的 owner。
         if let snapshot = try? SystemSnapshotStore.readCurrent(now: date),
            isUsable(snapshot, at: date) {
-            return WidgetDataSourceResult(snapshot: snapshot, origin: .snapshot, reason: liveReason)
+            return WidgetDataSourceResult(snapshot: snapshot, origin: .snapshot, reason: reason)
         }
-        return WidgetDataSourceResult(snapshot: nil, origin: .none, reason: liveReason)
+        return WidgetDataSourceResult(snapshot: nil, origin: .none, reason: reason)
     }
 
     /// 只做时间与归属检查：快照本身已由 store 校验过结构，这里补一条「多久内的还能展示」。
@@ -132,6 +146,6 @@ public enum WidgetDataSource {
         let snapshot = SystemSnapshot(owner: owner, capturedAt: captured,
                                       expiresAt: captured + SystemSnapshot.maxLifetimeMs,
                                       vehicle: value)
-        return (try? snapshot.validated(expectedOwner: owner)) == nil ? nil : snapshot
+        return (try? snapshot.validated(expectedOwner: owner, now: date)) == nil ? nil : snapshot
     }
 }

@@ -113,8 +113,7 @@ struct WidgetVehiclePresentation {
 
     var vehicle: SystemVehicleSnapshot? { snapshot?.vehicle }
     var name: String { vehicle?.name ?? WidgetStrings.vehicle }
-    /// 当前快照的匿名 owner id（accountVINHash.scopeID），车控按钮投递命令时带它核对，
-    /// 避免旧小组件指向另一辆车。空串表示还没拿到快照。
+    /// 当前快照的匿名 owner id（accountVINHash.scopeID），车控邮箱会再核对它。
     var ownerID: String { snapshot?.owner.ownerIdentifierString ?? "" }
     /// 车模：3D 车模与静态立绘都走 App Group 里的共享素材；缺图时不占位（同 Android w_car_box GONE）。
     var hasVehicleArt: Bool { vehicle != nil }

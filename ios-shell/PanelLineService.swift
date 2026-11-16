@@ -6,12 +6,7 @@ final class IOSPanelLineService: IOSBridgeService {
     let methods = ["panelLineVersion", "panelLineInfo", "beginPanelLine",
                    "pollPanelLine", "cancelPanelLine"]
 
-    private let worker = DispatchQueue(label: "io.github.lswlc33.dashboard.ios.panel-line", qos: .utility)
-    private var generation: UInt64 = 0
-
-    func navigationChanged() {
-        worker.async { [weak self] in self?.generation &+= 1 }
-    }
+    func navigationChanged() {}
 
     func applicationBackgrounded() {}
 
@@ -56,17 +51,11 @@ final class IOSPanelLineService: IOSBridgeService {
         // markChosen 而不是直接赋 current：选中默认值（GitHub）时 setter 会直接 return，
         // 偏好键不落盘 → 网页永远认为「还没选过」→ 每次检查都再弹选择页。
         IOSPanelLine.markChosen(target)
-        worker.async { [weak self] in
-            guard let self = self else { return }
-            self.generation &+= 1
-            // 只确认已保存偏好，不启动下载或重载当前文档。
-            DispatchQueue.main.async {
-                reply(["ticket": "", "done": true, "ok": true,
-                       "error": "", "phase": "done",
-                       "line": target.rawValue, "previous": previous.rawValue,
-                       "logicalOrigin": IOSPanelLine.baseURL(for: target).absoluteString,
-                       "reinitialize": false], nil)
-            }
-        }
+        // 只保存偏好，立即确认终态。当前文档仍由旧导航基址授权，重新 load 才提交新线路。
+        reply(["ticket": "", "done": true, "ok": true,
+               "error": "", "phase": "done",
+               "line": target.rawValue, "previous": previous.rawValue,
+               "logicalOrigin": IOSPanelLine.baseURL(for: target).absoluteString,
+               "reinitialize": false], nil)
     }
 }

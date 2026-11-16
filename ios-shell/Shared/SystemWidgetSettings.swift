@@ -21,11 +21,25 @@ public struct SystemWidgetSettings: Codable, Equatable, Sendable {
     /// 统计槽位的指标顺序：4×4 六格、4×2 两格共用一份有序列表，
     /// 展示层按 family 截取（large 取 6、medium 取 2）。
     public var stats: [WidgetStatField]
+
+    private enum CodingKeys: String, CodingKey { case accountHash, vehicleID, showName, showTime, darkMode, stats }
+
     public init(accountHash: String, vehicleID: String? = nil, showName: Bool = true, showTime: Bool = true,
                 darkMode: Int = -1, stats: [WidgetStatField] = []) {
         self.accountHash = accountHash; self.vehicleID = vehicleID
         self.showName = showName; self.showTime = showTime
         self.darkMode = darkMode; self.stats = stats
+    }
+
+    /// 老 Widget 设置没有 darkMode/stats：按系统主题和空统计槽兼容读取，不能整份丢弃。
+    public init(from decoder: Decoder) throws {
+        let box = try decoder.container(keyedBy: CodingKeys.self)
+        accountHash = try box.decode(String.self, forKey: .accountHash)
+        vehicleID = try box.decodeIfPresent(String.self, forKey: .vehicleID)
+        showName = (try? box.decodeIfPresent(Bool.self, forKey: .showName)) ?? true
+        showTime = (try? box.decodeIfPresent(Bool.self, forKey: .showTime)) ?? true
+        darkMode = (try? box.decodeIfPresent(Int.self, forKey: .darkMode)) ?? -1
+        stats = (try? box.decodeIfPresent([WidgetStatField].self, forKey: .stats)) ?? []
     }
     public func validated() throws -> SystemWidgetSettings {
         guard accountHash.count == 64, accountHash.unicodeScalars.allSatisfy({

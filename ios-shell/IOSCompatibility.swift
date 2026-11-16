@@ -50,6 +50,9 @@ final class IOSCompatibilityService: IOSBridgeCancellableService, IOSBridgeBackg
               let parameters = value["args"] as? [Any] else { return }
         if let native = Self.rideMethods[name] { ride.cancel(method: native, args: rideArgs(name, parameters)) }
         if let native = Self.gpsMethods[name] { gps.cancel(method: native, args: gpsArgs(name, parameters)) }
+        if let native = Self.systemMethods[name] {
+            system.cancel(method: native, args: systemArgs(name, parameters))
+        }
         if let target = widget as? IOSBridgeCancellableService, widget.methods.contains(name) {
             target.cancel(method: name, args: parameters)
         }
@@ -105,14 +108,18 @@ final class IOSCompatibilityService: IOSBridgeCancellableService, IOSBridgeBackg
             utility.handle(method: "app.keepScreenOn", args: [["on": on]], reply: reply); return
         }
         if let native = Self.systemMethods[name] {
-            // openSettings 的 JS 侧传的是裸字符串 kind（'notifications'/'battery'/'autostart'/'app'），
-            // 包成 {kind: …} 交给系统服务分流；其余系统方法保持原签名。
-            let values: [Any] = name == "copyText" ? [["text": parameters.first as? String ?? ""]]
-                : name == "openSettings" ? [["kind": parameters.first as? String ?? "app"]] : []
-            system.handle(method: native, args: values, reply: reply); return
+            system.handle(method: native, args: systemArgs(name, parameters), reply: reply); return
         }
         if widget.methods.contains(name) { widget.handle(method: name, args: parameters, reply: reply); return }
         reply(["ok": false, "reason": "unsupported_method"], nil)
+    }
+
+    // System 按翻译后的 method/args 精确取消；调用与撤销必须共用同一转换，
+    // 否则 openSettings 超时后确认框仍能继续打开设置。
+    private func systemArgs(_ name: String, _ args: [Any]) -> [Any] {
+        if name == "copyText" { return [["text": args.first as? String ?? ""]] }
+        if name == "openSettings" { return [["kind": args.first as? String ?? "app"]] }
+        return []
     }
 
     private func validNavigation(_ args: [Any], _ current: [String: Any]) -> Bool {

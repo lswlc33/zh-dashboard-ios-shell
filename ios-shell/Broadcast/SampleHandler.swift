@@ -90,6 +90,10 @@ final class IOSCastBroadcastEngine {
             do {
                 let mailbox = try IOSCastMailbox()
                 let grant = try mailbox.grant()
+                guard let extensionID = Bundle.main.bundleIdentifier,
+                      IOSCastMailbox.validExtensionID(extensionID), grant.extensionID == extensionID else {
+                    throw IOSCastError.reason("cast_extension_mismatch")
+                }
                 let now = Date().timeIntervalSince1970
                 guard !grant.revoked, now >= grant.issuedAt - 2, now <= grant.selectBefore, now < grant.endBefore else {
                     throw IOSCastError.reason("cast_selection_expired")
@@ -126,7 +130,7 @@ final class IOSCastBroadcastEngine {
         lastGrantCheckAt = now
         do {
             let current = try mailbox.grant()
-            guard current.id == old.id, current.targetIP == old.targetIP, !current.revoked,
+            guard current.id == old.id, current.extensionID == old.extensionID, current.targetIP == old.targetIP, !current.revoked,
                   Date().timeIntervalSince1970 < current.endBefore else {
                 fail(current.reason.isEmpty ? "cast_session_revoked" : current.reason); return false
             }
