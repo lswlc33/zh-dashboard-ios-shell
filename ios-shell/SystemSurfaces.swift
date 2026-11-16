@@ -143,6 +143,9 @@ private struct IOSStartedSystemActivity: Sendable {
 private actor IOSLiveActivityManager {
     private var generation: UInt64 = 0
     private var owner: SystemSnapshotOwner?
+    private var lastUpdates: [String: TimeInterval] = [:]
+    private var updating: Set<String> = []
+    private var lastContents: [String: SystemSnapshot] = [:]
 
     func setScope(_ next: SystemSnapshotOwner?, generation ticket: UInt64) async {
         guard ticket >= generation else { return }
@@ -192,13 +195,13 @@ private actor IOSLiveActivityManager {
                lease: IOSSystemSurfaceLease) async throws -> IOSStartedSystemActivity {
         guard lease.valid, ticket == generation, owner == snapshot.owner else { throw SystemSnapshotError("stale_session") }
         guard ActivityAuthorizationInfo().areActivitiesEnabled else { throw SystemSnapshotError("live_activities_disabled") }
-        guard !snapshot.isStale() else { throw SystemSnapshotError("snapshot_stale") }
+        guard kind == .ride || !snapshot.isStale() else { throw SystemSnapshotError("snapshot_stale") }
         switch kind {
         case .charging:
             guard snapshot.vehicle?.visibleCharging() == true else { throw SystemSnapshotError("fresh_charging_data_required") }
         case .ride:
-            guard let ride = snapshot.ride, ride.state != .ended,
-                  SystemSnapshotFreshness.isFresh(ride.updatedAt, maxAgeSeconds: SystemSnapshotFreshness.rideSpeedMaxAgeSeconds) else {
+            // 用户已主动打开记录；waiting/gap 也能先开活动，速度缺席不代表记录结束。
+            guard snapshot.ride.map({ $0.state != .ended }) == true else {
                 throw SystemSnapshotError("native_recording_required")
             }
         case .vehicle:
@@ -209,8 +212,7 @@ private actor IOSLiveActivityManager {
         case .gauge:
             guard snapshot.gauge?.visibleSpeedKph() != nil else { throw SystemSnapshotError("native_gauge_sample_required") }
         }
-        if let existing = running(owner: snapshot.owner).first {
-            guard existing.kind == kind else { throw SystemSnapshotError("another_activity_running") }
+        if let existing = running(owner: snapshot.owner).first(where: { $0.kind == kind }) {
             // 复用已有活动时也要刷新内容：否则用户点「开始活动」拿到的还是上一次
             // 发布的旧电量/旧速度（created:false 曾直接返回 id，不更新任何内容）。
             // 复用也必须成功更新；取消/已结束的竞态不能被 try? 吞掉并骗报 running。
@@ -221,7 +223,8 @@ private actor IOSLiveActivityManager {
             return IOSStartedSystemActivity(id: existing.id, created: false)
         }
         let attributes = ZeehoActivityAttributes(owner: snapshot.owner, kind: kind)
-        let state = ZeehoActivityAttributes.ContentState(snapshot: snapshot)
+        let initial = presentation(snapshot, previous: nil, kind: kind)
+        let state = ZeehoActivityAttributes.ContentState(snapshot: initial)
         let activity: Activity<ZeehoActivityAttributes>
         if #available(iOS 16.2, *) {
             activity = try Activity.request(attributes: attributes,
@@ -235,6 +238,8 @@ private actor IOSLiveActivityManager {
             await finish(activity)
             throw SystemSnapshotError("operation_cancelled")
         }
+        lastContents[activity.id] = initial
+        lastUpdates[activity.id] = ProcessInfo.processInfo.systemUptime
         return IOSStartedSystemActivity(id: activity.id, created: true)
     }
 
@@ -249,10 +254,22 @@ private actor IOSLiveActivityManager {
         guard !targets.isEmpty else { throw SystemSnapshotError("live_activity_not_running") }
         for activity in targets {
             guard lease.valid, ticket == generation, owner == snapshot.owner else { throw SystemSnapshotError("stale_session") }
-            let state = ZeehoActivityAttributes.ContentState(snapshot: snapshot)
+            // 每个 id 独立节流且 await 期间占槽，云端/骑行/gauge 同时到达也不会叠发。
+            let now = ProcessInfo.processInfo.systemUptime
+            guard !updating.contains(activity.id), now - (lastUpdates[activity.id] ?? -.infinity) >= 5 else { continue }
+            updating.insert(activity.id)
+            let previous: SystemSnapshot?
+            if let cached = lastContents[activity.id] { previous = cached }
+            else if #available(iOS 16.2, *) { previous = activity.content.state.snapshot }
+            else { previous = activity.contentState.snapshot }
+            let value = presentation(snapshot, previous: previous, kind: activity.attributes.kind)
+            let state = ZeehoActivityAttributes.ContentState(snapshot: value)
             if #available(iOS 16.2, *) {
-                await activity.update(ActivityContent(state: state, staleDate: staleDate(snapshot, kind: activity.attributes.kind)))
+                await activity.update(ActivityContent(state: state, staleDate: staleDate(value, kind: activity.attributes.kind)))
             } else { await activity.update(using: state) }
+            updating.remove(activity.id)
+            lastUpdates[activity.id] = now
+            lastContents[activity.id] = value
             // actor 在 await 时允许换 scope；不能用已经失效的样本确认成功或留下旧活动。
             guard lease.valid, ticket == generation, owner == snapshot.owner else {
                 if owner != snapshot.owner { await finish(activity) }
@@ -274,6 +291,21 @@ private actor IOSLiveActivityManager {
             await finish(activity); ended += 1
         }
         return ended
+    }
+
+    // 只用于活动展示：缺速保留最后一帧及其原时间；不写回历史、不伪造采样时间。
+    private func presentation(_ value: SystemSnapshot, previous: SystemSnapshot?, kind: ZeehoActivityKind) -> SystemSnapshot {
+        let gauge = value.gauge ?? previous?.gauge
+        var ride = value.ride
+        if kind == .ride, let current = ride, current.state != .ended {
+            if let gauge = value.gauge, gauge.updatedAt >= (current.speedUpdatedAt ?? 0) {
+                ride = SystemRideSnapshot(state: current.state, startedAt: current.startedAt,
+                    updatedAt: max(current.updatedAt, gauge.updatedAt), speedKph: gauge.speedKph,
+                    speedUpdatedAt: gauge.updatedAt, elapsedSeconds: current.elapsedSeconds, gapCount: current.gapCount)
+            } else if current.speedKph == nil, previous?.ride?.speedKph != nil { ride = previous?.ride }
+        }
+        return SystemSnapshot(owner: value.owner, capturedAt: value.capturedAt, expiresAt: value.expiresAt,
+            vehicle: value.vehicle, ride: ride, gauge: gauge)
     }
 
     private func staleDate(_ snapshot: SystemSnapshot, kind: ZeehoActivityKind) -> Date {
@@ -346,6 +378,59 @@ final class IOSSystemSurfacesService: NSObject, IOSBridgeService, IOSBridgeCance
     private var artReady: (owner: String, url: String)?
     /// 失败退避：网页每一帧都会带 artUrl，失败后不记一笔就会变成每帧重试、白烧流量。
     private var artFailed: (url: String, until: TimeInterval)?
+    private var nativeObservers: [NSObjectProtocol] = []
+    private var activityObservers: [String: Task<Void, Never>] = [:]
+    private var chargingPoll: Task<Void, Never>?
+    private var chargingPollLease = IOSSystemSurfaceLease()
+    private var chargingStarting = false
+    private var chargingSampleAt: Int64 = 0
+    private var chargingValue: Bool?
+    private var chargingStartLease = IOSSystemSurfaceLease()
+    private static let sampleAccepted = Notification.Name("dashboard.native.vehicle-sample.accepted")
+    private struct AcceptedSample {
+        let sample: IOSBackgroundClient.VehicleSample
+        let credential: IOSBackgroundCredential
+        let context: IOSBackgroundRunContext
+    }
+
+    override init() {
+        super.init()
+        nativeObservers.append(NotificationCenter.default.addObserver(forName: Self.sampleAccepted,
+            object: nil, queue: .main) { [weak self] notification in
+            guard let event = notification.object as? AcceptedSample else { return }
+            self?.acceptBackgroundSample(event)
+        })
+        nativeObservers.append(NotificationCenter.default.addObserver(forName: UIApplication.didBecomeActiveNotification,
+            object: nil, queue: .main) { [weak self] _ in
+            guard let self = self else { return }
+            self.scopeChanged()
+            self.observeActivities()
+            if let value = self.latest { self.reconcileCharging(value) }
+            self.ensureChargingPoll()
+        })
+    }
+
+    // Runner 仅在已接受且凭据未撤销的样本上调用；冷启动没有 service 也留下待前台标记。
+    static func acceptBackgroundSample(_ sample: IOSBackgroundClient.VehicleSample,
+        credential: IOSBackgroundCredential, context: IOSBackgroundRunContext) {
+        precondition(Thread.isMainThread)
+        guard context.canDeliver, loadApproved(for: credential.ownerHash) else { return }
+        recordCharging(sample.charging, at: sample.capturedAt, hash: credential.ownerHash)
+        NotificationCenter.default.post(name: sampleAccepted,
+            object: AcceptedSample(sample: sample, credential: credential, context: context))
+    }
+
+    private static func chargingKey(_ hash: String, _ field: String) -> String {
+        "io.github.lswlc33.dashboard.ios.charging.\(hash).\(field)"
+    }
+    private static func recordCharging(_ charging: Bool?, at: Int64, hash: String) {
+        guard let charging = charging, at >= Int64(defaults.double(forKey: chargingKey(hash, "at"))) else { return }
+        defaults.set(Double(at), forKey: chargingKey(hash, "at"))
+        defaults.set(charging, forKey: chargingKey(hash, "value"))
+        if !charging { defaults.removeObject(forKey: chargingKey(hash, "suppressed")) }
+        defaults.set(charging && !defaults.bool(forKey: chargingKey(hash, "suppressed")),
+            forKey: chargingKey(hash, "pending"))
+    }
 
     private final class Job {
         let id = UUID()
@@ -365,7 +450,12 @@ final class IOSSystemSurfacesService: NSObject, IOSBridgeService, IOSBridgeCance
         }
     }
 
-    deinit { ownerLease.cancel(); publishWork?.cancel(); artFetch?.cancel() }
+    deinit {
+        ownerLease.cancel(); chargingStartLease.cancel(); chargingPollLease.cancel()
+        chargingPoll?.cancel(); activityObservers.values.forEach { $0.cancel() }
+        nativeObservers.forEach { NotificationCenter.default.removeObserver($0) }
+        publishWork?.cancel(); artFetch?.cancel()
+    }
 
     // MARK: - 持久化（scopeID / approved）
     //
@@ -441,6 +531,12 @@ final class IOSSystemSurfacesService: NSObject, IOSBridgeService, IOSBridgeCance
         let next = scopeProvider?()
         guard force || next != scope else { return }
         let previousOwner = owner
+        stopChargingPoll()
+        chargingStartLease.cancel(); chargingStartLease = IOSSystemSurfaceLease(); chargingStarting = false
+        activityObservers.values.forEach { $0.cancel() }; activityObservers.removeAll()
+        if let previousOwner = previousOwner {
+            IOSContinuedCharging.shared.stop(ownerID: previousOwner.ownerIdentifierString, success: false)
+        }
         ownerLease.cancel(); ownerLease = IOSSystemSurfaceLease()
         cancelJobs("stale_session")
         publishWork?.cancel(); publishWork = nil
@@ -464,6 +560,12 @@ final class IOSSystemSurfacesService: NSObject, IOSBridgeService, IOSBridgeCance
         // approved 也从持久化里取；没拿到 scope 的中间态保留当前内存值，
         // 否则一次导航刷新就把用户的关闭选择抹掉。
         adoptPersistedState(for: owner?.accountVINHash)
+        if let hash = owner?.accountVINHash {
+            chargingSampleAt = Int64(Self.defaults.double(forKey: Self.chargingKey(hash, "at")))
+            chargingValue = Self.defaults.object(forKey: Self.chargingKey(hash, "value")) as? Bool
+        } else { chargingSampleAt = 0; chargingValue = nil }
+        observeActivities()
+        ensureChargingPoll()
         let ticket = epoch
         let selected = owner
         // 同账号选车保留匿名目录；换账号/显式登出清账号摘要，桥关闭的未知状态不作撤销。
@@ -590,8 +692,12 @@ final class IOSSystemSurfacesService: NSObject, IOSBridgeService, IOSBridgeCance
                 let value = try candidate()
                 let kind = try activityKind(options["kind"], snapshot: value)
                 job.activityKind = kind
-                confirm(job, title: IOSStrings.liveActivityStartTitle, message: IOSStrings.liveActivityStartMessage) { [weak self] in
-                    self?.startActivity(value, kind: kind, job: job)
+                if kind == .ride || kind == .gauge || kind == .charging {
+                    startActivity(value, kind: kind, job: job)
+                } else {
+                    confirm(job, title: IOSStrings.liveActivityStartTitle, message: IOSStrings.liveActivityStartMessage) { [weak self] in
+                        self?.startActivity(value, kind: kind, job: job)
+                    }
                 }
             case "liveActivity.update":
                 try validateAction(options)
@@ -793,6 +899,13 @@ final class IOSSystemSurfacesService: NSObject, IOSBridgeService, IOSBridgeCance
         if #available(iOS 16.2, *) { live["staleDateAutomatic"] = liveSupported }
         else { live["staleDateAutomatic"] = false }
         if let first = running.first { live["id"] = first.id; live["kind"] = first.kind.rawValue }
+        live["activities"] = running.map { ["id": $0.id, "kind": $0.kind.rawValue] }
+        live["chargingPendingForeground"] = owner.map {
+            Self.defaults.bool(forKey: Self.chargingKey($0.accountVINHash, "pending"))
+        } ?? false
+        live["chargingSampling"] = chargingPoll != nil
+        live["samplingIntervalSeconds"] = 30
+        live["executionGuarantee"] = "process_executable_only"
         // consentRequired 现在只在「用户显式关闭过系统显示」时为 true。
         // 默认开启后它不再是首次使用门槛：没有 owner（未登录/未握手）属于范围未确认，
         // 不该被网页解读成「要用户点启用」。
@@ -1010,6 +1123,11 @@ final class IOSSystemSurfacesService: NSObject, IOSBridgeService, IOSBridgeCance
         revoking = true; latest = nil; persistedSnapshot = nil; nativeWritePending = false
         nativeRide = nil; nativeGauge = nil
         revokeApproval()
+        stopChargingPoll()
+        chargingStartLease.cancel(); chargingStarting = false
+        activityObservers.values.forEach { $0.cancel() }; activityObservers.removeAll()
+        IOSContinuedCharging.shared.stop(ownerID: selected.ownerIdentifierString, success: false)
+        Self.defaults.removeObject(forKey: Self.chargingKey(selected.accountVINHash, "pending"))
         ownerLease.cancel()
         publishWork?.cancel(); publishWork = nil
         // 撤销授权时也把车模下载停掉：否则迟到的响应会在「已关闭」状态下继续写 App Group。
@@ -1077,26 +1195,26 @@ final class IOSSystemSurfacesService: NSObject, IOSBridgeService, IOSBridgeCance
             })
         } catch { finish(job, failure(Self.code(error))) }
     }
-    private func persist(_ value: SystemSnapshot, job: Job?, didPersist: ((Bool) -> Void)? = nil,
-                         completion: (() -> Void)? = nil) throws {
+    private func persist(_ value: SystemSnapshot, job: Job?, context: IOSBackgroundRunContext? = nil,
+                         didPersist: ((Bool) -> Void)? = nil, completion: (() -> Void)? = nil) throws {
         guard approved, value.owner == owner, pendingWrites < 8 else { throw SystemSnapshotError("snapshot_store_busy") }
         let selectedScope = scope; let ticket = epoch; let lease = ownerLease
         pendingWrites += 1
         worker.async { [weak self] in
             let result: Result<Void, Error>
             do {
-                guard lease.valid, job?.lease.valid != false else { throw SystemSnapshotError("operation_cancelled") }
+                guard lease.valid, job?.lease.valid != false, context?.canDeliver != false else { throw SystemSnapshotError("operation_cancelled") }
                 try SystemSnapshotStore.write(value, expectedOwner: value.owner)
                 result = .success(())
             } catch { result = .failure(error) }
             DispatchQueue.main.async { [weak self] in
                 guard let self = self else { return }
                 self.pendingWrites -= 1
-                guard lease.valid, ticket == self.epoch, self.scopeProvider?() == selectedScope else { return }
+                guard lease.valid, context?.canDeliver != false, ticket == self.epoch,
+                      self.scopeProvider?() == selectedScope else { return }
                 if let job = job, !self.current(job) { return }
                 switch result {
                 case .success:
-                    let previousVehicle = self.persistedSnapshot?.vehicle
                     self.persistedSnapshot = value
                     // 写回调不能让活动车速倒退到排队前；车况沿用本次成功值，原生源使用最新已接受样本。
                     self.latest = (try? self.candidate(vehicle: value.vehicle)) ?? value
@@ -1113,13 +1231,8 @@ final class IOSSystemSurfacesService: NSObject, IOSBridgeService, IOSBridgeCance
                         Self.refreshWidgetCredential(for: credentialOwner, scope: selectedScope)
                     }
                     self.reloadWidgets(force: false, snapshot: value)
-                    // 充电结束就自动收起充电活动：用户此时已经不需要盯着进度条，
-                    // 留着会被系统算到 8 小时上限里，还占着灵动岛位置。
-                    // 只认明确的 true→false；nil（接口没给）一律不动。
-                    if let before = previousVehicle?.charging, before,
-                       let after = value.vehicle?.charging, !after {
-                        self.autoEndChargingActivity(next: value)
-                    }
+                    if job?.activityKind != .charging { self.reconcileCharging(value) }
+                    self.observeActivities()
                     if let completion = completion { completion() }
                     else {
                         self.publishExistingActivity(self.latest ?? value)
@@ -1144,13 +1257,17 @@ final class IOSSystemSurfacesService: NSObject, IOSBridgeService, IOSBridgeCance
         nativeRide = value
         if value.state == .ended {
             for job in Array(jobs.values) where job.method == "liveActivity.update"
-                || (job.method == "liveActivity.start" && job.activityKind == .ride) {
+                || (job.method == "liveActivity.start" && (job.activityKind == .ride || job.activityKind == .gauge)) {
                 finish(job, failure("native_recording_ended"), cancel: true)
             }
             if let owner = owner, #available(iOS 16.1, *) {
-                let manager = liveManager()
-                Task { _ = await manager.end(owner: owner, kind: .ride) }
+                let manager = liveManager(); let ticket = epoch
+                Task {
+                    _ = await manager.end(owner: owner, kind: .ride, generation: ticket)
+                    _ = await manager.end(owner: owner, kind: .gauge, generation: ticket)
+                }
             }
+            nativeGauge = nil
         }
         scheduleNativePersistence(scope: captured, immediate: edge)
     }
@@ -1219,54 +1336,179 @@ final class IOSSystemSurfacesService: NSObject, IOSBridgeService, IOSBridgeCance
 
     func systemGaugeDisconnected(scope captured: IOSRideScope) {
         precondition(Thread.isMainThread)
-        guard captured == scope, captured == scopeProvider?(), let selected = owner else { return }
+        guard captured == scope, captured == scopeProvider?() else { return }
+        // 暂时失去速度只撤销当前输入；manager 保留活动最后一帧及原时间，不结束活动。
         nativeGauge = nil
-        for job in Array(jobs.values) where job.method == "liveActivity.update"
-            || (job.method == "liveActivity.start" && job.activityKind == .gauge) {
-            finish(job, failure("gauge_source_disconnected"), cancel: true)
-        }
-        if #available(iOS 16.1, *) {
-            let manager = liveManager()
-            Task { _ = await manager.end(owner: selected, kind: .gauge) }
-        }
     }
 
     func systemSurfacesDisconnected(scope captured: IOSRideScope) {
         precondition(Thread.isMainThread)
-        guard captured == scope, captured == scopeProvider?(), let owner = owner else { return }
-        for job in Array(jobs.values) where job.method == "liveActivity.update"
-            || (job.method == "liveActivity.start" && job.activityKind == .ride) {
-            finish(job, failure("recording_source_disconnected"), cancel: true)
+        guard captured == scope, captured == scopeProvider?() else { return }
+        // 断连不等于用户停止记录。明确 ended 统一由 publishRide 收尾 ride + gauge。
+    }
+
+    private func acceptBackgroundSample(_ event: AcceptedSample) {
+        precondition(Thread.isMainThread)
+        scopeChanged()
+        guard event.context.canDeliver, approved, !revoking,
+              let captured = scope, captured.ownerHash == event.credential.ownerHash,
+              IOSBackgroundCredentialStore.load() == event.credential else { return }
+        let sample = event.sample
+        guard sample.capturedAt >= (latest?.vehicle?.updatedAt ?? 0) else { return }
+        let vehicle = SystemVehicleSnapshot(name: latest?.vehicle?.name,
+            vinDisplaySuffix: captured.vin.utf8.count > 6 ? String(captured.vin.suffix(4)) : nil,
+            socPercent: sample.socPercent, socUpdatedAt: sample.socPercent == nil ? nil : sample.capturedAt,
+            charging: sample.charging, chargingUpdatedAt: sample.charging == nil ? nil : sample.capturedAt,
+            updatedAt: sample.capturedAt)
+        do {
+            let value = try candidate(vehicle: vehicle)
+            try persist(value, job: nil, context: event.context)
+        } catch { lastError = Self.code(error) }
+    }
+
+    private func reconcileCharging(_ value: SystemSnapshot) {
+        guard approved, !revoking, value.owner == owner, let vehicle = value.vehicle,
+              let charging = vehicle.charging, let at = vehicle.chargingUpdatedAt,
+              at >= chargingSampleAt else { return }
+        chargingSampleAt = at; chargingValue = charging
+        let hash = value.owner.accountVINHash
+        Self.recordCharging(charging, at: at, hash: hash)
+        if let soc = vehicle.socPercent {
+            IOSContinuedCharging.shared.update(ownerID: value.owner.ownerIdentifierString,
+                socPercent: soc, charging: charging)
         }
-        if #available(iOS 16.1, *) {
-            let manager = liveManager()
-            Task { _ = await manager.end(owner: owner, kind: .ride) }
+        if !charging {
+            chargingStartLease.cancel(); chargingStartLease = IOSSystemSurfaceLease(); chargingStarting = false
+            stopChargingPoll()
+            IOSContinuedCharging.shared.stop(ownerID: value.owner.ownerIdentifierString, success: true)
+            endCharging(owner: value.owner)
+            return
+        }
+        observeActivities()
+        guard !Self.defaults.bool(forKey: Self.chargingKey(hash, "suppressed")) else { return }
+        if runningValue().contains(where: { $0.kind == .charging }) {
+            Self.defaults.removeObject(forKey: Self.chargingKey(hash, "pending"))
+            ensureChargingPoll(); return
+        }
+        // 后台只记录 pending，不尝试 Activity.request；回前台仍需真实新鲜充电样本。
+        guard UIApplication.shared.applicationState != .background,
+              vehicle.visibleCharging() == true, !value.isStale(), !chargingStarting,
+              #available(iOS 16.1, *) else { return }
+        chargingStarting = true
+        let manager = liveManager(); let ticket = epoch; let lease = chargingStartLease
+        Task { @MainActor [weak self] in
+            defer { if let self = self, self.epoch == ticket, lease.valid { self.chargingStarting = false } }
+            do {
+                await manager.setScope(value.owner, generation: ticket)
+                guard lease.valid, UIApplication.shared.applicationState != .background else { return }
+                _ = try await manager.start(value, kind: .charging, generation: ticket, lease: lease)
+                guard let self = self, lease.valid, self.epoch == ticket, self.owner == value.owner else { return }
+                Self.defaults.removeObject(forKey: Self.chargingKey(hash, "pending"))
+                self.observeActivities(); self.ensureChargingPoll()
+            } catch { if let self = self, self.epoch == ticket { self.lastError = Self.code(error) } }
         }
     }
 
-    /// 充电视时活动的自动收尾。
-    ///
-    /// 只在「明确充电中 → 明确未充电」时触发。`nil`（接口没给这个字段）不动：
-    /// 缺测不是状态变化，凭它收掉活动会让用户以为充电结束了。
-    private func autoEndChargingActivity(next: SystemSnapshot) {
-        guard let owner = owner, #available(iOS 16.1, *) else { return }
-        guard runningValue().contains(where: { $0.kind == .charging }) else { return }
-        let manager = liveManager()
-        Task {
-            // 只结束 .charging 这一种，不碰用户可能同时开着的 ride/gauge 活动。
-            _ = await manager.end(owner: owner, kind: .charging)
+    private func endCharging(owner selected: SystemSnapshotOwner) {
+        guard #available(iOS 16.1, *) else { return }
+        for activity in Activity<ZeehoActivityAttributes>.activities
+            where activity.attributes.owner == selected && activity.attributes.kind == .charging {
+            activityObservers.removeValue(forKey: activity.id)?.cancel()
         }
-        IOSBackgroundLog.write("充电结束，自动收起充电视时活动")
-        _ = next
+        let manager = liveManager(); let ticket = epoch
+        Task { _ = await manager.end(owner: selected, kind: .charging, generation: ticket) }
+    }
+
+    private func observeActivities() {
+        guard #available(iOS 16.1, *), let selected = owner, approved, !revoking else { return }
+        let ticket = epoch
+        for activity in Activity<ZeehoActivityAttributes>.activities where activity.attributes.owner == selected {
+            // 重启后系统还保留 dismissed 对象时，同样尊重用户对本充电段的选择。
+            if activity.activityState == .dismissed, activity.attributes.kind == .charging,
+               chargingValue == true,
+               Self.defaults.string(forKey: Self.chargingKey(selected.accountVINHash, "dismissedID")) != activity.id {
+                Self.defaults.set(activity.id, forKey: Self.chargingKey(selected.accountVINHash, "dismissedID"))
+                suppressCharging(owner: selected)
+            }
+            guard IOSLiveActivityManager.isLive(activity.activityState), activityObservers[activity.id] == nil else { continue }
+            activityObservers[activity.id] = Task { @MainActor [weak self] in
+                for await state in activity.activityStateUpdates {
+                    guard !Task.isCancelled, let self = self, self.epoch == ticket, self.owner == selected else { return }
+                    if state == .dismissed || state == .ended {
+                        self.activityObservers.removeValue(forKey: activity.id)
+                        if activity.attributes.kind == .charging {
+                            if state == .dismissed {
+                                Self.defaults.set(activity.id, forKey: Self.chargingKey(selected.accountVINHash, "dismissedID"))
+                                self.suppressCharging(owner: selected)
+                            }
+                            self.stopChargingPoll()
+                            IOSContinuedCharging.shared.stop(ownerID: selected.ownerIdentifierString, success: false)
+                        }
+                        // ride/gauge 只清本活动观察者，绝不擅自停止用户记录或真实 GPS。
+                        return
+                    }
+                }
+            }
+        }
+    }
+
+    private func suppressCharging(owner selected: SystemSnapshotOwner) {
+        guard chargingValue == true else { return }
+        Self.defaults.set(true, forKey: Self.chargingKey(selected.accountVINHash, "suppressed"))
+        Self.defaults.removeObject(forKey: Self.chargingKey(selected.accountVINHash, "pending"))
+        chargingStartLease.cancel(); chargingStartLease = IOSSystemSurfaceLease(); chargingStarting = false
+        stopChargingPoll()
+        IOSContinuedCharging.shared.stop(ownerID: selected.ownerIdentifierString, success: false)
+    }
+
+    private func stopChargingPoll() {
+        chargingPollLease.cancel(); chargingPollLease = IOSSystemSurfaceLease()
+        chargingPoll?.cancel(); chargingPoll = nil
+    }
+
+    private func ensureChargingPoll() {
+        guard chargingPoll == nil, approved, !revoking, let selected = owner,
+              let captured = scope, captured == scopeProvider?(),
+              !Self.defaults.bool(forKey: Self.chargingKey(selected.accountVINHash, "suppressed")),
+              runningValue().contains(where: { $0.kind == .charging }) else { return }
+        let ticket = epoch; let lease = chargingPollLease
+        // 普通 Task 只在进程获得执行时间时工作；LA 本身不提供后台执行权，更不启动 GPS。
+        chargingPoll = Task { @MainActor [weak self] in
+            var interval: UInt64 = 30
+            while lease.valid, !Task.isCancelled {
+                do { try await Task.sleep(nanoseconds: interval * 1_000_000_000) } catch { return }
+                guard let self = self, lease.valid, self.epoch == ticket, self.owner == selected,
+                      self.scopeProvider?() == captured, self.approved,
+                      self.runningValue().contains(where: { $0.kind == .charging }) else { return }
+                let report: IOSBackgroundTaskReport
+                do {
+                    report = try await IOSBackgroundRunner.withRun(source: .system("liveActivity.charging")) { context in
+                        guard lease.valid, IOSBackgroundCredentialStore.load()?.ownerHash == captured.ownerHash else {
+                            throw IOSBackgroundError.cancelled
+                        }
+                        return await IOSBackgroundRunner.runRefresh(context: context)
+                    }
+                } catch {
+                    let code = IOSDailyTasksClient.code(of: error)
+                    interval = code == "task_already_running" ? min(120, interval * 2) : 30
+                    continue
+                }
+                guard lease.valid, self.epoch == ticket else { return }
+                interval = report.lastResult == "task_already_running" ? min(120, interval * 2) : 30
+            }
+        }
     }
 
     private func startActivity(_ value: SystemSnapshot, kind: ZeehoActivityKind, job: Job) {
         guard current(job) else { return }
         let availability = runtimeAvailability()
         guard availability["authorizationEnabled"] as? Bool == true else { finish(job, failure("live_activities_disabled")); return }
-        guard !value.isStale() else { finish(job, failure("snapshot_stale")); return }
-        // 用户在确认框点了继续：与 system.snapshot 的启用一样落盘，重启后不必重复确认。
+        guard kind == .ride || !value.isStale() else { finish(job, failure("snapshot_stale")); return }
+        // 按钮本身就是用户动作；自动充电走 reconcileCharging，不开启 continued processing。
         grantApproval()
+        if kind == .charging {
+            chargingStartLease.cancel(); chargingStartLease = IOSSystemSurfaceLease(); chargingStarting = false
+        }
         do {
             try persist(value, job: job) { [weak self] in
                 guard let self = self, self.current(job), #available(iOS 16.1, *) else { return }
@@ -1278,6 +1520,16 @@ final class IOSSystemSurfacesService: NSObject, IOSBridgeService, IOSBridgeCance
                         guard let self = self, self.current(job) else {
                             if started.created { _ = await manager.end(owner: value.owner, id: started.id) }
                             return
+                        }
+                        self.observeActivities(); self.ensureChargingPoll()
+                        if kind == .charging, UIApplication.shared.applicationState != .background,
+                           let soc = value.vehicle?.socPercent {
+                            let selected = value.owner
+                            _ = IOSContinuedCharging.shared.start(ownerID: selected.ownerIdentifierString, socPercent: soc) { [weak self] in
+                                guard let self = self, self.epoch == ticket, self.owner == selected else { return }
+                                self.suppressCharging(owner: selected)
+                                self.endCharging(owner: selected)
+                            }
                         }
                         self.finish(job, ["ok": true, "id": started.id, "kind": kind.rawValue, "running": true])
                     } catch { self?.finish(job, self?.failure(Self.code(error)) ?? ["ok": false]) }
@@ -1308,6 +1560,13 @@ final class IOSSystemSurfacesService: NSObject, IOSBridgeService, IOSBridgeCance
     }
     private func endActivity(id: String?, kind: ZeehoActivityKind? = nil, job: Job) {
         guard let owner = job.owner, current(job), #available(iOS 16.1, *) else { finish(job, failure("live_activity_unavailable")); return }
+        let targets = runningValue().filter { (id == nil || $0.id == id) && (kind == nil || $0.kind == kind) }
+        if targets.contains(where: { $0.kind == .charging }) {
+            suppressCharging(owner: owner)
+            for target in targets where target.kind == .charging {
+                activityObservers.removeValue(forKey: target.id)?.cancel()
+            }
+        }
         let manager = liveManager(); let ticket = epoch
         Task { @MainActor [weak self] in
             guard job.lease.valid else { return }

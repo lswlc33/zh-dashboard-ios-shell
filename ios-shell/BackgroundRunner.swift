@@ -117,22 +117,32 @@ enum IOSBackgroundRunner {
         let value = await IOSBackgroundClient.shared.vehicleSample(credential: credential, context: context)
         do { try context.check() } catch { return stoppedReport(error) }
         var notify: (String, String)?
+        var acceptedSample: IOSBackgroundClient.VehicleSample?
         switch value {
         case let .success(sample):
             report.lastResult = "ok"; report.lastSocPercent = sample.socPercent
-            report.lastCharging = sample.charging; report.successCount += 1
+            // 缺测不能抹掉上一份明确状态，否则 true→nil→false 会漏掉充电结束。
+            if let charging = sample.charging { report.lastCharging = charging }
+            report.successCount += 1
             if let current = sample.charging, let last = previous.lastCharging, current != last,
                previous.ownerID == credential.ownerHash, IOSBackgroundPreferences.chargeNotifyEnabled {
                 notify = (current ? IOSBackgroundStrings.chargeStartTitle : IOSBackgroundStrings.chargeStopTitle,
                           sample.socPercent.map { IOSBackgroundStrings.chargeSoc($0) } ?? IOSBackgroundStrings.chargeSocUnknown)
             }
-            _ = IOSBackgroundRunCoordinator.shared.commit(context) {
+            if IOSBackgroundRunCoordinator.shared.commit(context, {
                 IOSBackgroundHistory.append(sample: sample, credential: credential, context: context)
-            }
+            }) { acceptedSample = sample }
         case let .failure(error): report.lastResult = error.code
         }
         guard persist(report, identifier: IOSBackgroundTaskID.refresh, context: context) else {
             return stoppedReport(IOSBackgroundError.cancelled)
+        }
+        if let sample = acceptedSample {
+            await MainActor.run {
+                // 结果已经记账，仍需检查凭据 epoch；finish 后 canDeliver 仍能识别撤销。
+                guard context.canDeliver, IOSBackgroundCredentialStore.load() == credential else { return }
+                IOSSystemSurfacesService.acceptBackgroundSample(sample, credential: credential, context: context)
+            }
         }
         if let message = notify {
             IOSBackgroundNotifier.post(id: "charge-change", title: message.0, body: message.1, context: context)

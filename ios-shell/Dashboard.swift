@@ -26,16 +26,8 @@ final class AppDelegate: UIResponder, UIApplicationDelegate {
         // 注册本身不发请求、不申请权限：真正的执行等到系统唤醒时才发生。
         if #available(iOS 13.0, *) {
             IOSBackgroundScheduler.shared.register(
-                refresh: { completion in IOSBackgroundRunner.runRefresh(completion: completion) },
-                signIn: { completion in IOSBackgroundRunner.runSignIn(completion: completion) },
-                // 每日任务（发帖/点赞/分享）：只在用户开了「自动执行」或快捷指令主动触发时才跑，
-                // isEnabled 会挡住未开启的情况，不会偷偷往广场发动态。
-                dailyTasks: {
-                    let report = await IOSBackgroundRunner.runDailyTasks(force: false)
-                    return report.result == "ok"
-                })
-            // 这里只重排一次，让「上次卸载/关机导致队列清空」的情况能自己恢复。
-            // 用户关掉自动签到时 signIn 会被 isEnabled 挡掉，不会偷偷跑。
+                refresh: { completion in IOSBackgroundRunner.runRefresh(completion: completion) })
+            // 启动时撤销旧签到/每日任务请求，只申请 refresh 与闲时 processing 单次采样。
             IOSBackgroundScheduler.shared.scheduleAll()
         }
         return true
@@ -336,6 +328,7 @@ final class PanelController: UIViewController, WKNavigationDelegate, WKUIDelegat
                              system, surfaces, line, utility, secrets, renewal, wifi, tcp, assets, blobs, cast, widgets,
                              background, compatibility, updates])
         let scope: () -> IOSRideScope? = { [weak core] in core?.nativeSessionScope() }
+        background.configureScopeProvider(scope)
         let presenter: () -> UIViewController? = { [weak self] in self }
         let metadata: () -> [String: Any]? = { [weak core] in core?.nativeSessionMetadata() }
         let navigation: () -> String? = { [weak core] in core?.currentNavigationID() }

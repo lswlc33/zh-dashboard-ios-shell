@@ -34,12 +34,28 @@ jobs:
       - name: 检出源码
         uses: actions/checkout@v4
 
-      - name: 选择 Xcode
+      - name: 选择 Xcode 26 稳定版（必须含 SDK 26）
         run: |
-          # 打印可用版本，选中最新稳定版；build.sh 需要完整 Xcode 而非仅 CLT。
+          # 只选择已安装、名称为纯数字版本的 26.x，排除 beta/RC；缺失时明确失败。
           ls -d /Applications/Xcode*.app 2>/dev/null || true
-          sudo xcode-select -switch /Applications/Xcode.app
-          xcodebuild -version
+          XCODE_APP=$(python3 -I - <<'PY'
+          import pathlib, re, sys
+          installed = []
+          for path in pathlib.Path('/Applications').glob('Xcode_26*.app'):
+              match = re.fullmatch(r'Xcode_(26(?:\.\d+)*)\.app', path.name)
+              if match and (path / 'Contents/Developer').is_dir():
+                  installed.append((tuple(map(int, match.group(1).split('.'))), str(path)))
+          if not installed:
+              sys.exit('SDK 26 required: no installed stable Xcode 26.x; refusing to fall back to Xcode 16.')
+          print(max(installed)[1])
+          PY
+          )
+          sudo xcode-select -switch "$XCODE_APP/Contents/Developer"
+          XCODE_VERSION=$(xcodebuild -version)
+          printf '%s\n' "$XCODE_VERSION"
+          [[ "$XCODE_VERSION" == Xcode\ 26* ]] || { echo 'SDK 26 required: selected Xcode is not 26.x'; exit 1; }
+          SDK_VERSION=$(xcrun --sdk iphoneos --show-sdk-version)
+          [[ "$SDK_VERSION" == 26 || "$SDK_VERSION" == 26.* ]] || { echo 'SDK 26 required: selected iPhoneOS SDK is not 26.x'; exit 1; }
           xcrun --sdk iphoneos --show-sdk-path
 
       - name: 安装 JDK 21

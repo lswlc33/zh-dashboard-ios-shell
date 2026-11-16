@@ -26,12 +26,19 @@ Swift UIKit + WKWebView 面板壳，默认从 `https://lswlc33.github.io/zeeho-3
 其余基础 RPC 的唯一方法表在 `Bridge.swift` 与各 service 的 `methods`：`hello / store.commit / txn.request / txn.cancel / sync.session`、`gps.* / ride.* / history.*`、传统 `ble.status / scan / stopScan / connect / disconnect / services / read / subscribe / write`、文件 / 剪贴板 / 照片 / 通知 / App 信息、`panelLine*`，以及 `compat.call / compat.<method>`。通用 `ui.confirm / crypto.aes.decrypt / app.keepScreenOn` 只处理已确认会话；方法存在不替代权限、用户确认或最终回执。逐项 API、文件与四层证据见[迁移验收](../docs/iOS原生兼容迁移验收.md)。
 
 - `Shared/` 是主 App 与 Widget extension 共用的 Swift 模块 `ZeehoSystemShared`，不是 KMP `ZeehoShared`。只共享匿名 owner、多车选择、车辆摘要、骑行 / gauge 状态与真实事件时间；token、完整账号 / VIN 和 GPS 坐标不入系统快照。Cast mailbox 与快照隔离，不共享云凭据或 Wi-Fi 密码。
-- `SystemSurfaces.swift` 发布已接受的前台真实云 API 样本；`Ride.swift` 经原生确认的 GPS / BLE 录制与 gauge 事件更新已存在活动，不自动启动活动、不新增后台云轮询器。
+- `SystemSurfaces.swift` 接收已接受的前台真实云 API 样本；新鲜车况明确为充电中时自动尝试启动充电 Live Activity，明确结束时收起。用户 dismiss 后本段充电不再自动重开。充电活动存续且 App 获准运行时，原生按约 30 秒间隔尝试拉取车况更新；这不是系统后台唤醒频率，也不保证挂起或强退后继续采样。
+- 仪表最小化会先请求启动当前 ride / gauge Live Activity，再收起网页仪表；原生确认的 GPS / BLE 录制与 gauge 事件继续更新已有活动，实际显示取决于系统权限、设备与活动状态。
 - `Widgets/` 只有一个传统 `com.apple.widgetkit-extension` appex。普通 Widget 支持 small / medium / large；同一 `WidgetBundle` 内的 `ActivityConfiguration` 提供锁屏 / 横幅、Dynamic Island compact / minimal / expanded 布局，不使用 ExtensionKit 的 `EXAppExtensionAttributes`。
 - 「我的 → iOS 系统展示」使用标准页面卡片，提供启用 / 关闭、活动开始 / 更新 / 结束及小组件刷新。执行检查真实回执、有效车辆范围、extension、App Group 与系统权限；缺能力显示 `unavailable`。公开 entitlement 模板不证明群组权限已获批准，灵动岛展示还取决于设备硬件与系统。
 - 新鲜度口径分两层：**桌面小组件**保留最后已知值，超过 30 分钟只在时间后追加「可能已过期」（对齐 Android `BaseWidget.updated()`）；**Live Activity** 不出现任何过期字样，锁屏 / 灵动岛始终展示最后一次同步到的电量、充电状态、车速与时长，时间新旧由「最后更新 <时间>」那一行体现（用户自行判断）。共享层的 180 秒车辆窗口 / 10 秒速度窗口只用于「实时读数是否可信」的其它判断，不再拿它把 Live Activity 抹成「—」。重新读取或刷新不改样本时间；iOS 16.2+ 使用 `staleDate`，16.1 没有同等系统自动过期保证。Widget 实际刷新受系统预算控制，`reload_requested` 不是已显示新数据。
 
-后台连续电量 / 完整充电采样、每日自动云任务、Android 桌面小组件、VPN 抓取、Android Wi-Fi Direct 建组与 root 增强仍只有 Android 原生实现；iOS 普通 AP 投屏与壁纸传输是另一条已接源码、未验设备的路线。iOS 可保存真实前台历史与已收到的骑行点，缺测留空；不能宣称完整连续轨迹、后台电池健康或用 GPS 推算容量。
+iOS 前台成功确认已保存的账号 / 车辆会话后，通过 `background.credential.sync` 静默同步当前 token 与签名材料到本机 Keychain；`autoMerge` 也会补做同步，网页不再提供后台卡片或授权弹层。相同账号 / 车辆 / 会话去重，账号或 token 已变化时丢弃迟到结果；缺少此方法的旧壳跳过静默同步。同步凭据不会打开自动签到或每日任务开关。
+
+周期补采调度只注册 `BGAppRefreshTask` 和 `BGProcessingTask` 两类单次车况补采，后者要求网络、不要求外接电源；提交只申请执行机会，时间与是否执行由 iOS 决定。旧 `signin` / `tasks` identifier 保留取消迁移队列，签到与每日任务仍可由快捷指令主动执行，不再由 BGTaskScheduler 自动运行。原生补采先入待合并队列，回前台按当前车辆送入既有历史准入通道；缺测留空，不承诺完整连续轨迹、后台电池健康或用 GPS 推算容量。
+
+用户在前台手动启动充电活动时，iOS 26+ 且以 SDK 26 构建的壳额外申请 `BGContinuedProcessingTask`（`continued.*`）；旧系统 no-op，自动检测、恢复与后台补采不申请。系统进度只反映真实 SOC，不按时间伪造前进；停充、满电、用户结束或系统到期时收尾。请求被接受仍不保证持续时长，系统到期与强退也不保证执行回调。
+
+Android 桌面小组件、VPN 抓取、Android Wi-Fi Direct 建组与 root 增强仍只有 Android 原生实现；iOS 普通 AP 投屏与壁纸传输是另一条已接源码、未验设备的路线。
 
 ## iOS 软件更新与面板更新
 

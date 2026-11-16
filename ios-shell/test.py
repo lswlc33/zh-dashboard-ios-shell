@@ -339,22 +339,35 @@ def main():
     assert 'UIBackgroundModes' in info, 'UIBackgroundModes 缺失：后台蓝牙/定位会静默降级'
     background = info.get('UIBackgroundModes') or []
     assert 'bluetooth-central' in background and 'location' in background, 'UIBackgroundModes 缺后台蓝牙/定位'
-    # BGAppRefreshTask 需要 fetch；缺了 submit 会被系统直接拒绝，后台签到/采样永远不跑。
-    assert 'fetch' in background, 'UIBackgroundModes 缺 fetch：BGAppRefreshTask 无法提交'
-    # identifier 必须与 BackgroundTasks.swift 里的常量逐字一致，否则 submit 抛
-    # BGTaskSchedulerErrorCodeUnavailable，日志里只会看到 "No handler registered"。
+    # 采样同时申请 refresh / processing 的执行机会；旧写操作 ID 不再进系统白名单。
+    assert 'fetch' in background and 'processing' in background, \
+        'UIBackgroundModes 缺 fetch/processing：后台补采请求无法提交'
     permitted = info.get('BGTaskSchedulerPermittedIdentifiers') or []
-    assert 'io.github.lswlc33.dashboard.ios.refresh' in permitted, \
-        'BGTaskSchedulerPermittedIdentifiers 缺 refresh（后台采样不会跑）'
-    assert 'io.github.lswlc33.dashboard.ios.signin' in permitted, \
-        'BGTaskSchedulerPermittedIdentifiers 缺 signin（自动签到不会跑）'
+    assert set(permitted) == {'io.github.lswlc33.dashboard.ios.refresh',
+                              'io.github.lswlc33.dashboard.ios.processing',
+                              'io.github.lswlc33.dashboard.ios.continued.*'}, \
+        'BG 白名单只允许两类补采与手动 continued；不允许签到/每日任务自动调度'
     assert 'UILaunchScreen' in info, 'UILaunchScreen 缺失：启动时会出现黑屏/兼容模式'
 
-    # ---- 后台任务（BGAppRefreshTask + 原生签到/采样）----
+    # ---- 后台任务（两类系统调度都只补采车况）----
     background_tasks = strip_comments((root / 'BackgroundTasks.swift').read_text(encoding='utf-8'))
-    # identifier 必须与 Info.plist 逐字一致（上面已断言 plist 侧，这里断言代码侧同值）。
-    assert '"io.github.lswlc33.dashboard.ios.refresh"' in background_tasks, 'refresh identifier 与 plist 不一致'
-    assert '"io.github.lswlc33.dashboard.ios.signin"' in background_tasks, 'signin identifier 与 plist 不一致'
+    for suffix in ('refresh', 'processing', 'signin', 'tasks'):
+        assert '"io.github.lswlc33.dashboard.ios.' + suffix + '"' in background_tasks, \
+            '采样或旧任务取消兼容 identifier 缺失：' + suffix
+    register = background_tasks.split('func register(', 1)[1].split('private static func run(', 1)[0]
+    assert set(re.findall(r'handlers\[IOSBackgroundTaskID\.(\w+)\]\s*=', register)) == {'refresh', 'processing'}, \
+        '系统只注册两类采样 handler，不能恢复自动签到/每日任务'
+    assert 'body: refresh' in register and 'as? BGProcessingTask' in register
+    schedule_all = background_tasks.split('func scheduleAll()', 1)[1].split('private func cancelLegacyRequests()', 1)[0]
+    assert set(re.findall(r'reschedule\(IOSBackgroundTaskID\.(\w+)\)', schedule_all)) == {'refresh', 'processing'}
+    assert 'cancelLegacyRequests()' in schedule_all
+    legacy_cancel = background_tasks.split('private func cancelLegacyRequests()', 1)[1].split('func cancel(', 1)[0]
+    assert 'cancel(IOSBackgroundTaskID.signIn)' in legacy_cancel and 'cancel(IOSBackgroundTaskID.dailyTasks)' in legacy_cancel
+    reschedule = background_tasks.split('func reschedule(', 1)[1].split('func scheduleAll()', 1)[0]
+    assert 'BGAppRefreshTaskRequest(' in reschedule and 'BGProcessingTaskRequest(' in reschedule
+    assert 'requiresNetworkConnectivity = true' in reschedule and 'requiresExternalPower = false' in reschedule
+    assert re.search(r'case IOSBackgroundTaskID\.signIn, IOSBackgroundTaskID\.dailyTasks:\s*cancel\(identifier\)\s*return', reschedule), \
+        '旧写操作 ID 重排入口只能取消，不能再次提交'
     # 注册必须在 didFinishLaunching 附近发生：Apple 要求启动结束前注册完，否则系统唤起时
     # 找不到 handler，日志只会说 "No handler registered"，任务被静默丢弃。
     assert 'IOSBackgroundScheduler.shared.register(' in \
@@ -365,6 +378,17 @@ def main():
     # expirationHandler 必须收尾：到点不 setTaskCompleted 会被系统认为任务失控并降低后续调度。
     assert 'expirationHandler' in background_tasks and 'setTaskCompleted' in background_tasks, \
         '后台任务必须处理超时并回报 setTaskCompleted'
+
+    # 手动充电的 iOS 26 continued 请求另走当次用户动作，不进入周期补采调度器。
+    continued = strip_comments((root / 'ContinuedCharging.swift').read_text(encoding='utf-8'))
+    assert 'ios-shell/ContinuedCharging.swift' in inputs['swiftSources'], 'continued wrapper 必须进自动构建清单'
+    for fragment in ('#if compiler(>=6.2)', '#available(iOS 26.0, *)',
+                     'UIApplication.shared.applicationState == .active', 'BGContinuedProcessingTaskRequest(',
+                     'request.strategy = .fail', 'expirationHandler', 'setTaskCompleted(success:',
+                     'session.ownerID == ownerID', 'session.socPercent * 10'):
+        assert fragment in continued, 'continued 缺少版本/用户操作/收尾或真实 SOC 边界：' + fragment
+    for forbidden in ('URLSession', 'Timer(', 'timeIntervalSinceNow', 'completedUnitCount = 1000'):
+        assert forbidden not in continued, 'continued 不能私自轮询或伪造进度：' + forbidden
 
     # 后台不能跑网页（Apple Frameworks Engineer: "This is by design"；Cordova CB-10657 Won't Fix）。
     # 所以后台逻辑必须是原生 HTTP + 原生签名，绝不能出现 WKWebView / evaluateJavaScript。
@@ -397,8 +421,18 @@ def main():
     # 必须走待合并队列，由前台用 history.record 入账。
     assert 'IOSBackgroundSampleQueue' in runner, '后台采样必须走待合并队列'
     assert 'IOSHistoryService' not in runner, '后台不能直接调 IOSHistoryService（会破坏历史文件格式）'
-    # 充电视时活动要在充电明确结束时自动收尾（只认 true->false，不碰 ride/gauge）。
-    assert 'autoEndChargingActivity' in surfaces_src, '充电结束应自动收起充电视时活动'
+    # 收尾已并入充电状态协调：缺测不结束，明确停充只结束 charging 活动。
+    charging = strip_comments(surfaces_src).split('private func reconcileCharging(', 1)[1].split('private func endCharging(', 1)[0]
+    assert 'let charging = vehicle.charging' in charging, '充电状态缺测不能当停充'
+    assert re.search(r'if !charging\s*\{.*?stopChargingPoll\(\).*?endCharging\(owner: value.owner\).*?return', charging, re.S), \
+        '明确停充必须取消补采并结束充电活动'
+    ending = strip_comments(surfaces_src).split('private func endCharging(', 1)[1].split('private func observeActivities(', 1)[0]
+    assert 'manager.end(owner: selected, kind: .charging' in ending, '自动收尾只能结束 charging'
+    assert 'manager.start(value, kind: .charging' in charging and 'vehicle.visibleCharging() == true' in charging
+    assert 'chargingKey(hash, "suppressed")' in charging, '用户关闭后本充电段不能自动重开'
+    poll = strip_comments(surfaces_src).split('private func ensureChargingPoll()', 1)[1].split('private func startActivity(', 1)[0]
+    assert 'interval: UInt64 = 30' in poll and 'IOSBackgroundRunner.runRefresh(context: context)' in poll
+    assert 'self.scopeProvider?() == captured' in poll and 'lease.valid' in poll, '原生补采必须保持车辆与生命周期边界'
     # 车速活动节流必须 >= 5 秒：iOS 18 起本地 update 被压到 5~15 秒，
     # 2 秒的旧值纯属白耗 CPU 且会被系统合并。
     assert 'gaugeInterval: TimeInterval = 5' in surfaces_src, \

@@ -9,9 +9,10 @@ import ZeehoSystemShared
 // ## 为什么需要这个文件
 //
 // iOS 没有任何「按固定间隔后台跑代码」的通用机制（Apple DTS 在 forums/thread/685525
-// 里对这类需求的统一回答是 "You can't"）。能用的只有 BGAppRefreshTask：系统按用户
-// 使用习惯决定何时跑、每次约 30 秒、并且**不保证**会跑（实测首次可能要等数小时）。
+// 里对这类需求的统一回答是 "You can't"）。采样使用 BGAppRefreshTask，另加
+// BGProcessingTask 在设备空闲时补采一次；两者都由系统决定何时跑，也不保证会跑。
 // 所以这里的定位是「尽力补一次」，所有用户可见的承诺都必须按「可能不跑」写。
+// 签到与每日任务只由快捷指令触发，不再交给 BGTaskScheduler。
 //
 // ## 为什么不能在后台跑网页
 //
@@ -32,14 +33,12 @@ enum IOSBackgroundTaskID {
     /// 拉一次车况并采样电量。identifier 必须与 Info.plist 的
     /// BGTaskSchedulerPermittedIdentifiers 逐字一致，否则 submit 直接抛错。
     static let refresh = "io.github.lswlc33.dashboard.ios.refresh"
-    /// 每日自动签到。
+    /// 旧签到 identifier 只用于迁移时取消排队；保留给快捷指令报告使用。
     static let signIn = "io.github.lswlc33.dashboard.ios.signin"
-    /// 每日任务（发帖/点赞/分享）。与签到分开一个 identifier，因为：
-    /// 两者的用户开关、凭据要求（任务还要内部 uid）、失败后果都不一样；
-    /// 合成一条的话「只签到不跑任务」的用户就没法选了。
+    /// 旧每日任务 identifier 同样不再注册或提交，仍作为任务报告的键。
     static let dailyTasks = "io.github.lswlc33.dashboard.ios.tasks"
-    /// 处理型任务（可跑几分钟，但只在设备空闲时）。留给以后的大批量回填，
-    /// 现在不注册也不提交，避免占掉 10 个 processing 槽位。
+    /// 设备空闲时单次补采，复用 refresh 的执行体与报告，不做常驻采样。
+    static let processing = "io.github.lswlc33.dashboard.ios.processing"
 }
 
 /// 后台任务可用的凭据定义在 BackgroundSigning.swift（那里也管 Keychain 存取）：
@@ -118,10 +117,10 @@ private final class IOSBackgroundScheduledRun {
     private let lock = NSLock()
     private var finished = false
     private var operation: Task<Void, Never>?
-    private let task: BGAppRefreshTask
+    private let task: BGTask
     private let name: String
 
-    init(task: BGAppRefreshTask, name: String) { self.task = task; self.name = name }
+    init(task: BGTask, name: String) { self.task = task; self.name = name }
 
     func install(_ value: Task<Void, Never>) {
         lock.lock()
@@ -163,36 +162,32 @@ final class IOSBackgroundScheduler {
     private init() {}
 
     /// 在 AppDelegate.didFinishLaunching 调用一次。重复调用安全。
-    ///
-    /// `dailyTasks` 是**可选**的：老调用点（不传这个参数）仍然只注册两个任务，
-    /// 不会因为 Info.plist 里还没加 identifier 就在启动时报错。
-    /// 注意闭包类型不能再写 `@escaping`——可选闭包类型参数本身已是 escaping，
-    /// 再标一次会被 Swift 直接拒（CI 实测 "closure is already escaping in optional type argument"）。
+    /// 旧 signIn / dailyTasks 参数保留兼容调用方，但不保存或执行：它们只走快捷指令。
+    /// 可选闭包本身已是 escaping，不能额外标 @escaping。
     func register(refresh: @escaping (@escaping (Bool) -> Void) -> Task<Void, Never>,
-                  signIn: @escaping (@escaping (Bool) -> Void) -> Task<Void, Never>,
-                  dailyTasks: (() async -> Bool)? = nil) {
+                  signIn _: ((@escaping (Bool) -> Void) -> Task<Void, Never>)? = nil,
+                  dailyTasks _: (() async -> Bool)? = nil) {
+        cancelLegacyRequests()
         guard !registered else { return }
         registered = true
         handlers[IOSBackgroundTaskID.refresh] = { task in
-            guard let task = task as? BGAppRefreshTask else { return }
+            guard let task = task as? BGAppRefreshTask else {
+                task.setTaskCompleted(success: false); return
+            }
             Self.run(task: task, name: IOSBackgroundTaskID.refresh, body: refresh)
         }
-        handlers[IOSBackgroundTaskID.signIn] = { task in
-            guard let task = task as? BGAppRefreshTask else { return }
-            Self.run(task: task, name: IOSBackgroundTaskID.signIn, body: signIn)
-        }
-        if let dailyTasks = dailyTasks {
-            handlers[IOSBackgroundTaskID.dailyTasks] = { task in
-                guard let task = task as? BGAppRefreshTask else { return }
-                Self.run(task: task, name: IOSBackgroundTaskID.dailyTasks, asyncBody: dailyTasks)
+        handlers[IOSBackgroundTaskID.processing] = { task in
+            guard let task = task as? BGProcessingTask else {
+                task.setTaskCompleted(success: false); return
             }
+            // processing 只增加一次采样机会，仍沿用 runRefresh 的短预算与可取消 Task。
+            Self.run(task: task, name: IOSBackgroundTaskID.processing, body: refresh)
         }
         for (identifier, handler) in handlers {
-            // register 失败只可能是 Info.plist 缺 identifier 或已被别的 App 注册；
-            // 这两种都不该在启动时崩掉，记录下来即可（能力缺失不等于必须崩溃）。
+            // 注册结果留在日志，方便核对 plist 白名单与重复注册问题。
             let ok = BGTaskScheduler.shared.register(forTaskWithIdentifier: identifier, using: nil) { task in
                 handler(task)
-                // 注册回调每个 identifier 只走一次，进来就重排下一次。
+                // 每次获准执行只补采一次，再申请下一次机会；执行时机仍由系统决定。
                 self.reschedule(identifier)
             }
             if !ok {
@@ -201,18 +196,7 @@ final class IOSBackgroundScheduler {
         }
     }
 
-    private static func run(task: BGAppRefreshTask, name: String,
-                            asyncBody: @escaping () async -> Bool) {
-        run(task: task, name: name) { completion in
-            Task {
-                guard !Task.isCancelled else { completion(false); return }
-                let success = await asyncBody()
-                completion(success && !Task.isCancelled)
-            }
-        }
-    }
-
-    private static func run(task: BGAppRefreshTask, name: String,
+    private static func run(task: BGTask, name: String,
                             body: @escaping (@escaping (Bool) -> Void) -> Task<Void, Never>) {
         IOSBackgroundLog.write("开始 \(name)")
         let state = IOSBackgroundScheduledRun(task: task, name: name)
@@ -226,9 +210,23 @@ final class IOSBackgroundScheduler {
 
     /// 重排下一次。系统会自己决定什么时候真的跑，这里只是「再排一次」。
     func reschedule(_ identifier: String) {
-        guard isEnabled(identifier) else { return }
-        let request = BGAppRefreshTaskRequest(identifier: identifier)
-        // 15 分钟是最短的有意义粒度；再短系统也不会更频繁地答应。
+        let request: BGTaskRequest
+        switch identifier {
+        case IOSBackgroundTaskID.refresh:
+            request = BGAppRefreshTaskRequest(identifier: identifier)
+        case IOSBackgroundTaskID.processing:
+            let processing = BGProcessingTaskRequest(identifier: identifier)
+            processing.requiresNetworkConnectivity = true
+            processing.requiresExternalPower = false
+            request = processing
+        case IOSBackgroundTaskID.signIn, IOSBackgroundTaskID.dailyTasks:
+            // 兼容旧设置入口直接 reschedule：只撤销旧请求，不因开关重排写操作。
+            cancel(identifier)
+            return
+        default:
+            return
+        }
+        // 只设最早时间，不承诺频率；闲时 processing 也只调用一次 runRefresh。
         request.earliestBeginDate = Date(timeIntervalSinceNow: 15 * 60)
         do {
             try BGTaskScheduler.shared.submit(request)
@@ -241,14 +239,19 @@ final class IOSBackgroundScheduler {
         }
     }
 
-    /// 提交全部任务（App 启动完成、以及用户开启相应功能时调用）。
+    /// 启动及设置更新时清掉旧写操作任务，只为两种采样申请执行机会。
     func scheduleAll() {
+        cancelLegacyRequests()
         reschedule(IOSBackgroundTaskID.refresh)
-        reschedule(IOSBackgroundTaskID.signIn)
-        reschedule(IOSBackgroundTaskID.dailyTasks)
+        reschedule(IOSBackgroundTaskID.processing)
     }
 
-    /// 取消某个任务的排队。用户关掉自动签到时要调用，否则后台还会继续跑。
+    private func cancelLegacyRequests() {
+        cancel(IOSBackgroundTaskID.signIn)
+        cancel(IOSBackgroundTaskID.dailyTasks)
+    }
+
+    /// 取消某个任务的排队及已领取的运行上下文，同时清掉本地排队标记。
     func cancel(_ identifier: String) {
         IOSBackgroundRunCoordinator.shared.cancelSystem(identifier)
         BGTaskScheduler.shared.cancel(taskRequestWithIdentifier: identifier)
@@ -275,18 +278,10 @@ final class IOSBackgroundScheduler {
 
     /// 该 identifier 是否已排进队列。只表示「排过」，不代表系统会真的跑。
     func isScheduled(_ identifier: String) -> Bool {
-        Self.defaults.bool(forKey: Self.scheduledPrefix + identifier)
-    }
-
-    private func isEnabled(_ identifier: String) -> Bool {
-        // 签到与每日任务都受各自开关控制；refresh 默认开（只做采样与通知，不改任何云端状态）。
-        if identifier == IOSBackgroundTaskID.signIn {
-            return IOSBackgroundPreferences.autoSignInEnabled
+        guard identifier == IOSBackgroundTaskID.refresh || identifier == IOSBackgroundTaskID.processing else {
+            return false
         }
-        if identifier == IOSBackgroundTaskID.dailyTasks {
-            return IOSBackgroundPreferences.autoDailyTasksEnabled
-        }
-        return true
+        return Self.defaults.bool(forKey: Self.scheduledPrefix + identifier)
     }
 }
 

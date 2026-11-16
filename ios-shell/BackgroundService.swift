@@ -15,16 +15,16 @@ struct BackgroundArgumentError: Error { let code: String; init(_ code: String) {
 //   2) `background.credential` 授权后台凭据（网页把当前账号的 token 与签名密钥交出去）；
 //   3) `background.samples.take` 取走后台补的电量点。
 //
-// 授权必须**用户显式点按钮**才走到这里（网页用 ui.confirm 或自己的开关），
-// 并且落 Keychain 前会再弹一次原生确认——后台凭据是长期有效的，不能由页面脚本
-// 在启动时静默写入。
+// 前台进入已保存的账号/车辆后自动同步后台凭据；保存动作仍校验原生会话与存档，
+// 不会因为授权而执行签到或每日任务。旧手动授权入口保留供旧网页兼容。
 //
 // 标 iOS 13：内部引用的 IOSBackgroundScheduler 是 13.0 起，同一份下限。
 @available(iOS 13.0, *)
 final class IOSBackgroundService: NSObject, IOSBridgeService, IOSBridgeCancellableService {
     let methods = ["background.status", "background.credential", "background.credential.clear",
                    "background.samples.take", "background.schedule", "background.notify",
-                   "background.tasks.run", "background.tasks.status", "background.credential.v2"]
+                   "background.tasks.run", "background.tasks.status", "background.credential.v2",
+                   "background.credential.sync"]
 
     // 不能用 `private typealias`：handle(method:args:reply:) 是协议要求的 internal
     // 方法，签名里出现 private 类型会被拒（CI 实测 "method must be declared private
@@ -33,6 +33,7 @@ final class IOSBackgroundService: NSObject, IOSBridgeService, IOSBridgeCancellab
     private let presenterProvider: () -> UIViewController?
     private var pendingConfirmation: (() -> Void)?
     private var jobID = UUID()
+    private var scopeProvider: (() -> IOSRideScope?)?
     private let webOwner = UUID()
     private var dailyTaskID: UUID?
     private var activeDailyTask: Task<Void, Never>?
@@ -43,17 +44,24 @@ final class IOSBackgroundService: NSObject, IOSBridgeService, IOSBridgeCancellab
         super.init()
     }
 
+    func configureScopeProvider(_ provider: @escaping () -> IOSRideScope?) {
+        scopeProvider = provider
+    }
+
     func navigationChanged() {
+        jobID = UUID()
         pendingConfirmation = nil
         cancelDailyTask()
     }
 
     func applicationBackgrounded() {
+        jobID = UUID()
         pendingConfirmation = nil
         cancelDailyTask()
     }
 
     func cancel(method: String, args: [Any]) {
+        if method == "background.credential.sync" { jobID = UUID() }
         pendingConfirmation = nil
         if method == "background.tasks.run" { cancelDailyTask() }
     }
@@ -91,6 +99,8 @@ final class IOSBackgroundService: NSObject, IOSBridgeService, IOSBridgeCancellab
                 reply(statusPayload(), nil)
             case "background.credential":
                 try grant(args, reply: reply)
+            case "background.credential.sync":
+                try syncCredential(args, reply: reply)
             case "background.credential.clear":
                 try requireEmpty(args)
                 guard IOSBackgroundRunCoordinator.shared.clearCredential() else {
@@ -102,6 +112,7 @@ final class IOSBackgroundService: NSObject, IOSBridgeService, IOSBridgeCancellab
                 WidgetCredentialStore.clear()
                 WidgetFetchCache.clear()
                 IOSBackgroundScheduler.shared.cancel(IOSBackgroundTaskID.refresh)
+                IOSBackgroundScheduler.shared.cancel(IOSBackgroundTaskID.processing)
                 IOSBackgroundScheduler.shared.cancel(IOSBackgroundTaskID.signIn)
                 IOSBackgroundScheduler.shared.cancel(IOSBackgroundTaskID.dailyTasks)
                 IOSBackgroundLog.write("后台凭据已清除")
@@ -288,6 +299,60 @@ final class IOSBackgroundService: NSObject, IOSBridgeService, IOSBridgeCancellab
                                      appID: appID, appSecret: appSecret,
                                      updatedAt: Int64(Date().timeIntervalSince1970 * 1000))
         _ = WidgetCredentialStore.save(value)
+    }
+
+    private func syncCredential(_ args: [Any], reply: @escaping Reply) throws {
+        guard UIApplication.shared.applicationState != .background,
+              args.count == 1, let value = args[0] as? [String: Any],
+              let selected = scopeProvider?(), selected.valid else { throw BackgroundArgumentError("authorized_vehicle_required") }
+        let allowed: Set<String> = ["accountId", "vin", "token", "signinToken", "uid", "appId", "appSecret", "h5AppId", "h5Secret", "scope"]
+        guard Set(value.keys).isSubset(of: allowed),
+              let frame = value["scope"] as? [String: Any],
+              frame["accountId"] as? String == selected.accountID,
+              frame["vin"] as? String == selected.vin,
+              String(IOSBridgePolicy.integer(frame["epoch"]) ?? -1) == selected.generation,
+              value["accountId"] as? String == selected.accountID,
+              value["vin"] as? String == selected.vin else { throw BackgroundArgumentError("stale_session") }
+        let token = try text(value["token"], limit: 4096)
+        let navigation = jobID
+        let signinToken = try optionalText(value["signinToken"], limit: 4096) ?? token
+        guard signinToken == token else { throw BackgroundArgumentError("stale_session") }
+        let credential = IOSBackgroundCredential(accountID: selected.accountID, vin: selected.vin,
+            token: token, signinToken: signinToken,
+            appSecret: try optionalText(value["appSecret"], limit: 512) ?? "",
+            h5Secret: try optionalText(value["h5Secret"], limit: 512) ?? "",
+            appID: try optionalText(value["appId"], limit: 128) ?? "",
+            h5AppID: try optionalText(value["h5AppId"], limit: 128) ?? "",
+            uid: try optionalText(value["uid"], limit: 64) ?? "", updatedAt: Int64(Date().timeIntervalSince1970 * 1000))
+        guard credential.isValid else { throw BackgroundArgumentError("credential_incomplete") }
+        IOSStore.shared.snapshot { [weak self] snapshot in
+            guard let self, self.jobID == navigation, self.scopeProvider?() == selected,
+                  UIApplication.shared.applicationState != .background,
+                  snapshot.readError == nil,
+                  let text = snapshot.values["zeeho.accounts.v1"], let data = text.data(using: .utf8),
+                  let document = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                  let accounts = document["accounts"] as? [[String: Any]],
+                  let account = accounts.first(where: { $0["id"] as? String == selected.accountID }),
+                  account["token"] as? String == token,
+                  ((account["uid"] as? String).map { $0.isEmpty || $0 == credential.uid } ?? true),
+                  (IOSBridgePolicy.integer(account["invalidAt"]) ?? 0) <= 0 else {
+                reply(nil, "stale_session"); return
+            }
+            // 同一份材料不重复切换 epoch：快捷指令可能正执行，前台打开不能无故取消它。
+            let previous = IOSBackgroundCredentialStore.load()
+            let changed = previous?.accountID != credential.accountID || previous?.vin != credential.vin
+                || previous?.token != credential.token || previous?.signinToken != credential.signinToken
+                || previous?.uid != credential.uid || previous?.appID != credential.appID
+                || previous?.appSecret != credential.appSecret || previous?.h5AppID != credential.h5AppID
+                || previous?.h5Secret != credential.h5Secret
+            if changed && !IOSBackgroundRunCoordinator.shared.replaceCredential(credential) {
+                reply(nil, "keychain_unavailable"); return
+            }
+            Self.mirrorWidgetCredential(accountID: credential.accountID, vin: credential.vin,
+                token: credential.token, appID: credential.appID, appSecret: credential.appSecret)
+            IOSBackgroundScheduler.shared.scheduleAll()
+            reply(self.statusPayload(), nil)
+        }
     }
 
     private func grant(_ args: [Any], reply: @escaping Reply) throws {

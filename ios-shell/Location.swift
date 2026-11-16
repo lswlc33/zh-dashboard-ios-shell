@@ -317,14 +317,16 @@ final class IOSLocationService: NSObject, IOSBridgeService, IOSBridgeCancellable
     }
 
     var backgroundAllowed: Bool {
-        recordingOwner != nil && !recordingPaused && backgroundWanted && backgroundModeAvailable
-            && permissionStatus() == .authorizedAlways && locationServicesEnabled
+        // 前台开始的真实骑行定位可凭 WhenInUse + 系统定位指示继续；Always 用于更多后台唤醒机会。
+        let authorization = permissionStatus()
+        return recordingOwner != nil && !recordingPaused && backgroundWanted && backgroundModeAvailable
+            && (authorization == .authorizedAlways || authorization == .authorizedWhenInUse) && locationServicesEnabled
     }
 
     var backgroundReason: String {
         if !backgroundWanted { return "background_recording_disabled" }
         if !backgroundModeAvailable { return "background_mode_missing" }
-        if permissionStatus() != .authorizedAlways { return "always_permission_required" }
+        if permissionStatus() != .authorizedAlways && permissionStatus() != .authorizedWhenInUse { return "always_permission_required" }
         return "background_interrupted"
     }
 
