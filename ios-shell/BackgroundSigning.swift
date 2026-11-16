@@ -201,7 +201,7 @@ enum IOSBackgroundCredentialStore {
             kSecAttrService as String: service,
             kSecAttrAccount as String: account
         ]
-        var update: [String: Any] = [
+        let update: [String: Any] = [
             kSecValueData as String: data,
             kSecAttrAccessible as String: kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly
         ]

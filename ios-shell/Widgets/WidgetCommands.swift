@@ -91,7 +91,9 @@ struct ZeehoWidgetCommandIntent: AppIntent {
         for kind in ZeehoWidgetKind.all {
             WidgetCenter.shared.reloadTimelines(ofKind: kind)
         }
-        return .result()
+        // 返回类型声明了 ProvidesDialog，成功路径也必须带上对话；
+        // 这里只说「已提交」，车控真实结果仍由面板回执决定。
+        return .result(dialog: IntentDialog("车辆控制已提交。"))
     }
 }
 
