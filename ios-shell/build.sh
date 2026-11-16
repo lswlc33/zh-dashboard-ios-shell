@@ -162,6 +162,10 @@ else
     printf '%s\n' 'note: background-credential-test 已跳过（缺 ios-shell/background-credential-test.swift）'
 fi
 
+# 直接编译生产完成闸门与取数策略，验证超时/并发和同车快照择新。
+python3 -I "$script_dir/widget-delivery-test.py" --require-swift
+node "$repo_dir/test/ios-widget-data-source-contract.mjs" --require-swift
+
 gradle_args=(--project-dir "$shared_dir" --no-daemon --console=plain)
 if [[ "$offline" == true ]]; then gradle_args+=(--offline); fi
 # 原样传播 KMP 编译/链接失败；不捕获成成功，也不使用 canImport 假回退。
@@ -238,9 +242,10 @@ except Exception as error:
 if not isinstance(data, list) or not data:
     sys.exit("BLOCKED: host const-values 为空，快捷指令看不到后台 intent（检查协议清单）")
 ZEEHO_CHECKHOSTCV
-# WidgetKit 必须从 Swift @main 生成的 _main 启动，才能执行 WidgetBundle.main()。
-# 普通扩展的 _NSExtensionMain 会绕过这段注册逻辑；该入口只留给下方 Broadcast。
+# Widget 进程先经 Foundation 的扩展入口初始化 XPC；ExtensionFoundation 再通过
+# __swift5_entry 调用 Swift @main。直接把 LC_MAIN 指到 Swift main 会跳过前一层。
 widget_args=(-I "$build_dir" "$build_dir/ZeehoSystemShared.o" "${activity_args[@]}" -framework Foundation \
+    -Xlinker -e -Xlinker _NSExtensionMain \
     -Xlinker -rpath -Xlinker '@executable_path/../../Frameworks' \
     -Xlinker -rpath -Xlinker '@executable_path/Frameworks' -Xlinker -rpath -Xlinker /usr/lib/swift)
 while IFS= read -r module; do

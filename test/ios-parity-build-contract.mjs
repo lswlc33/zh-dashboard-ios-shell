@@ -45,8 +45,8 @@ assert.ok(![...records].some(n => n.endsWith('Widgets/WidgetVehicleIntent.swift'
 assert.ok(![...records].some(n => /Inductive(?:Cloud|Session)\.swift$/.test(n)));
 const build = readFileSync(path.join(shell, 'build.sh'), 'utf8');
 const widgetLink = build.slice(build.indexOf('widget_args=')).split('broadcast_args=')[0];
-assert.ok(!widgetLink.includes('-Xlinker -e -Xlinker _NSExtensionMain'),
-  'WidgetKit must use Swift @main rather than the ordinary extension entry');
+assert.ok(widgetLink.includes('-Xlinker -e -Xlinker _NSExtensionMain'),
+  'WidgetKit must initialize the system extension before invoking Swift @main through __swift5_entry');
 assert.ok(build.slice(build.indexOf('broadcast_args=')).includes('-Xlinker -e -Xlinker _NSExtensionMain'),
   'Broadcast must retain its traditional extension entry');
 for (const token of ['-module-name ZeehoCastBroadcast', '-Xlinker -e -Xlinker _NSExtensionMain',
@@ -100,15 +100,24 @@ assert h.objc_runtime_class('_OBJC_CLASS_$__TtC18ZeehoCastBroadcast13SampleHandl
 assert h.objc_runtime_class('_OBJC_CLASS_$_ExplicitHandler') == 'ExplicitHandler'
 rejects(lambda: h.macho(b'fake executable', 2), 'Truncated Mach-O')
 entry = {'mainSymbols': ['_main'], 'mainEntryAddress': 4096, 'entryAddress': 4096,
-         'extensionEntrypointSymbols': ['_NSExtensionMain'], 'extensionEntryAddress': 8192}
+         'extensionEntrypointSymbols': ['_NSExtensionMain'], 'extensionEntryAddress': 8192,
+         'swiftEntryAddress': 4096, 'swiftEntryFlags': 1}
 h.validate_entrypoint(entry, 'host')
-h.validate_entrypoint(entry, 'widgets')
-wrong = dict(entry, entryAddress=8192)
-rejects(lambda: h.validate_entrypoint(wrong, 'widgets'), 'Swift _main')
-h.validate_entrypoint(wrong, 'broadcast')
+rejects(lambda: h.validate_entrypoint(entry, 'widgets'), '_NSExtensionMain')
+extension = dict(entry, entryAddress=8192)
+h.validate_entrypoint(extension, 'widgets')
+h.validate_entrypoint(extension, 'broadcast')
+rejects(lambda: h.validate_entrypoint(extension, 'host'), 'Swift _main')
 rejects(lambda: h.validate_entrypoint(entry, 'broadcast'), '_NSExtensionMain')
-missing = dict(entry, mainEntryAddress=None)
-rejects(lambda: h.validate_entrypoint(missing, 'widgets'), 'Swift _main')
+for patch in ({'mainEntryAddress': None}, {'mainSymbols': []}, {'swiftEntryAddress': None},
+              {'swiftEntryAddress': 4100}):
+    rejects(lambda: h.validate_entrypoint(dict(extension, **patch), 'widgets'), '__swift5_entry relative pointer')
+for flags in (None, 0, 2):
+    rejects(lambda: h.validate_entrypoint(dict(extension, swiftEntryFlags=flags), 'widgets'), '__swift5_entry flags')
+h.validate_entrypoint(dict(extension, swiftEntryFlags=3), 'widgets')
+# Host/Broadcast 不依赖 Widget 专属 Swift 入口记录。
+h.validate_entrypoint(dict(entry, swiftEntryAddress=None, swiftEntryFlags=None), 'host')
+h.validate_entrypoint(dict(extension, swiftEntryAddress=None, swiftEntryFlags=None), 'broadcast')
 name = h.APP_PREFIX + c['directory'] + c['product']
 dependency = '@rpath/libswiftCompatibilityExample.dylib'
 bundled = h.APP_PREFIX + 'Frameworks/libswiftCompatibilityExample.dylib'

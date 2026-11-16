@@ -208,12 +208,10 @@ def main():
     # （缺了它点按钮会静默无效，真机日志 linkd Missing: <bundle>:<Type>）。
     widget_bundle = (root / 'Widgets/ZeehoWidgets.swift').read_text(encoding='utf-8')
     assert 'ZeehoVehicleWidget()' in widget_bundle, '静态控件必须仍被注册'
-    # **回归防线（1.1.19 事故）**：WidgetKit 按 kind + 配置类型名归档已放置实例，
-    # 把已发布的 kind 从 StaticConfiguration 换成 AppIntentConfiguration 会让存量实例
-    # 永远停在占位骨架屏（用户实测「只显示骨架屏」）。所以原 kind 必须仍是 StaticConfiguration。
+    # 保留已发布 kind 的配置兼容；配置变更本身不能证明桌面永久失效。
     static_widget = widget_bundle.split('struct ZeehoVehicleWidget: Widget')[1].split('\nstruct ')[0]
     assert 'StaticConfiguration(' in static_widget and 'AppIntentConfiguration(' not in static_widget, \
-        '已发布的 ZeehoVehicleWidget 必须保持 StaticConfiguration（换配置类型会让存量实例变骨架屏）'
+        '已发布的 ZeehoVehicleWidget 必须保持 StaticConfiguration 的配置兼容'
     # **1.1.23 起可编辑版（AppIntentConfiguration）整体撤除**：真机添加后整个空白，
     # 同一份视图在静态版上正常，索引也完整 → 是 AppIntentConfiguration 在
     # 「手写 swiftc + 弱链接 AppIntents」下的运行时问题。编辑能力改由 App 内 widget.set 提供。
@@ -223,15 +221,13 @@ def main():
     assert not (root / 'Widgets/WidgetConfiguration.swift').exists(), \
         '可编辑版已撤除，WidgetConfiguration.swift 不应再存在'
     widget_link_region = build_sh.split('widget_args=', 1)[1].split('broadcast_args=', 1)[0]
-    assert '-Xlinker -e -Xlinker _NSExtensionMain' not in widget_link_region, \
-        'WidgetKit 必须走 Swift @main 的 _main，不能强制普通扩展入口'
+    assert '-Xlinker -e -Xlinker _NSExtensionMain' in widget_link_region, \
+        'Widget 进程需先初始化系统扩展，再通过 __swift5_entry 调用 Swift main'
     assert '-Xlinker -e -Xlinker _NSExtensionMain' in build_sh.split('broadcast_args=', 1)[1], \
         'Broadcast 仍需使用传统 _NSExtensionMain 入口'
-    # Widget body / WidgetBundle.body 都没有 result builder，不能写 if #available；
-    # 必须用 static main() 在两条 bundle 之间分派。
-    assert 'static func main()' in widget_bundle, '两条 bundle 必须用 static main() 分派'
-    assert 'ZeehoModernWidgets.main()' in widget_bundle and 'ZeehoLegacyWidgets.main()' in widget_bundle, \
-        'static main() 必须按 iOS 17 可用性分派两条 WidgetBundle'
+    assert '@main\nstruct ZeehoWidgets: WidgetBundle' in widget_bundle, 'Widget 必须直接使用标准 WidgetBundle 入口'
+    assert 'ZeehoModernWidgets.main()' not in widget_bundle and 'ZeehoLegacyWidgets.main()' not in widget_bundle, \
+        '相同注册内容不应再通过自定义 main 分派'
     # kind 字符串必须与宿主侧 SystemSurfaces 完全一致（各写一份常量）。
     surfaces_src = (root / 'SystemSurfaces.swift').read_text(encoding='utf-8')
     widget_commands = (root / 'Widgets/WidgetCommands.swift').read_text(encoding='utf-8')

@@ -1,5 +1,6 @@
 import Foundation
 import os
+import ZeehoSystemShared
 
 // 诊断日志：写进 App 沙盒的 Documents 目录，用户可以用「文件」App 或
 // 系统分享直接导出，不需要连电脑、不需要 Xcode。
@@ -146,13 +147,23 @@ final class IOSDiagnostics {
                     mainMissing = !FileManager.default.fileExists(atPath: url.path)
                 }
             }
-            // 有内容就先给内容：主日志被用户删掉时 `-1.log` 里往往还留着完整的上一次会话，
-            // 只因为主文件缺失就回「文件不存在」会把现有证据藏起来。
-            if !text.isEmpty { return text }
-            // 两者都空时才区分「文件不存在」（通道坏了）和「文件是空的」（这次真没写）。
-            // 混成同一句会把故障伪装成正常。
-            if mainMissing { return IOSStrings.diagnosticsMissing }
-            return IOSStrings.diagnosticsEmpty
+            if text.isEmpty {
+                text = mainMissing ? IOSStrings.diagnosticsMissing : IOSStrings.diagnosticsEmpty
+            }
+            // 每次查看/分享时读取扩展自己的记录，无须先打开网页系统展示面板。
+            let build = Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String ?? "unknown"
+            let events = WidgetDiagnostics.recent().filter { $0.build == build }
+            text += "\n=== Widget 扩展诊断（当前 build \(build)，非桌面显示确认）===\n"
+            if events.isEmpty {
+                let resolution = AppGroup.resolution()
+                text += "未读取到当前版本扩展事件；可能未启动、共享容器不可读或记录已过期。\n"
+                text += "appGroup=\(resolution["identifier"] ?? "unknown") source=\(resolution["source"] ?? "unknown") available=\(SystemSnapshotStore.isAvailable())\n"
+            } else {
+                for event in events {
+                    text += "at=\(event.recordedAt) phase=\(event.phase.rawValue) trace=\(event.requestID ?? "") pid=\(event.processID ?? 0) family=\(event.family ?? "") elapsedMs=\(event.elapsedMs ?? -1) hasVehicle=\(event.hasVehicle ?? false) origin=\(event.origin) reason=\(event.reason) bundle=\(event.bundleIdentifier) group=\(event.appGroupIdentifier) sampleAt=\(event.capturedAt ?? 0)\n"
+                }
+            }
+            return text
         }
     }
 

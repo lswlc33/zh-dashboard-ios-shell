@@ -78,7 +78,8 @@ FIXED_INPUTS = {
     # 移交闸门与构建脚本同为可信代码：公开 CI 用它决定是否覆盖线上产物，
     # 必须进指纹白名单，否则「门禁代码被改过」不会被 sourceTreeSha256 发现。
     'ios-shell/publish-artifacts.py',
-    'ios-shell/test.py', 'ios-shell/bridge-bootstrap.js', 'test/ios-parity-build-contract.mjs',
+    'ios-shell/test.py', 'ios-shell/widget-delivery-test.py', 'ios-shell/bridge-bootstrap.js', 'test/ios-parity-build-contract.mjs',
+    'test/ios-widget-data-source-contract.mjs',
     'ios-shell/Entitlements/App.entitlements', 'ios-shell/Entitlements/Widgets.entitlements',
     'ios-shell/Entitlements/Broadcast.entitlements', 'ios-shell/Broadcast/Info.plist',
     CAST_SHARED_SOURCE, CAST_ENCODER_SOURCE, 'ios-shell/CastSession.swift',
@@ -568,6 +569,7 @@ def macho(data, expected_type, signed=True, expected_minimum=0x000F0400):
     require(0 < ncmds <= 8192 and command_size <= len(data) - 32, 'Invalid Mach-O load commands')
     offset, imports, rpaths, platform, minimum, sdk, signature, symtab, dysymtab, entrypoint = 32, [], [], None, None, None, None, None, None, False
     entry_offset, text_ranges, sections = None, [], []
+    text_address_ranges, swift_entry_address, swift_entry_flags = [], None, None
     for _ in range(ncmds):
         require(offset + 8 <= 32 + command_size, 'Truncated load command')
         command, size = struct.unpack_from('<II', data, offset)
@@ -575,11 +577,12 @@ def macho(data, expected_type, signed=True, expected_minimum=0x000F0400):
         if command == 0x19:
             require(size >= 72, 'Truncated LC_SEGMENT_64')
             segment = data[offset + 8:offset + 24].split(b'\x00', 1)[0]
-            vm_address = struct.unpack_from('<Q', data, offset + 24)[0]
+            vm_address, vm_size = struct.unpack_from('<QQ', data, offset + 24)
             file_offset, file_size = struct.unpack_from('<QQ', data, offset + 40)
             require(file_offset + file_size <= len(data), 'Segment file range exceeds binary')
             if segment == b'__TEXT':
                 text_ranges.append((file_offset, file_offset + file_size, vm_address))
+                text_address_ranges.append((vm_address, vm_address + min(vm_size, file_size)))
             # 记下 S_SYMBOL_STUBS 段落：扩展的入口常常不是已定义符号，
             # 而是 lazy bind 的 `_NSExtensionMain` stub（真机产物实测就是这样）。
             section_count = struct.unpack_from('<I', data, offset + 64)[0]
@@ -589,6 +592,23 @@ def macho(data, expected_type, signed=True, expected_minimum=0x000F0400):
                 section_addr, section_size = struct.unpack_from('<QQ', data, base + 32)
                 section_flags = struct.unpack_from('<I', data, base + 64)[0]
                 reserved1, reserved2 = struct.unpack_from('<II', data, base + 68)
+                section_name = data[base:base + 16].split(b'\x00', 1)[0]
+                section_segment = data[base + 16:base + 32].split(b'\x00', 1)[0]
+                if section_name == b'__swift5_entry' and segment == b'__TEXT':
+                    require(swift_entry_address is None, 'Duplicate __TEXT,__swift5_entry')
+                    section_offset = struct.unpack_from('<I', data, base + 48)[0]
+                    # relative pointer 以记录自己的虚拟地址为基准；文件偏移和地址必须对应，
+                    # 否则可能把签名或其他 segment 的字节误当作 Swift 入口证据。
+                    require(section_segment == b'__TEXT' and section_size >= 8
+                            and file_offset <= section_offset
+                            and section_offset + section_size <= file_offset + file_size
+                            and section_offset + section_size <= len(data)
+                            and vm_address <= section_addr
+                            and section_addr + section_size <= vm_address + vm_size
+                            and section_addr - vm_address == section_offset - file_offset,
+                            'Invalid __TEXT,__swift5_entry file/address range (requires at least 8 bytes)')
+                    relative, swift_entry_flags = struct.unpack_from('<iI', data, section_offset)
+                    swift_entry_address = section_addr + relative
                 if section_flags & 0xFF == 0x8:  # S_SYMBOL_STUBS
                     sections.append((section_addr, section_size, reserved1, reserved2))
         elif command in (0xC, 0x80000018, 0x8000001F, 0x80000023, 0x20, 0x8000001C):
@@ -632,6 +652,9 @@ def macho(data, expected_type, signed=True, expected_minimum=0x000F0400):
             if start <= entry_offset < end:
                 lc_main_address = base + (entry_offset - start)
                 break
+    if swift_entry_address is not None:
+        require(any(start <= swift_entry_address < end for start, end in text_address_ranges),
+                '__swift5_entry relative pointer must address the file-backed __TEXT range')
     if expected_type == 2:
         require(minimum == expected_minimum and sdk is not None and sdk >= minimum, 'Executable deployment/SDK load-command record is missing or incorrect')
         require(entrypoint and entry_offset is not None and any(start <= entry_offset < end for start, end, _ in text_ranges),
@@ -709,7 +732,8 @@ def macho(data, expected_type, signed=True, expected_minimum=0x000F0400):
             indirect_offset, indirect_count = dysymtab[12], dysymtab[13]
             require(indirect_offset + indirect_count * 4 <= len(data), 'Invalid indirect symbol table')
             for section_address, section_size, first, stride in sections:
-                if stride and section_address <= lc_main_address < section_address + section_size:
+                if (stride and section_address <= lc_main_address < section_address + section_size
+                        and (lc_main_address - section_address) % stride == 0):
                     slot = first + (lc_main_address - section_address) // stride
                     require(slot < indirect_count, 'LC_MAIN stub index outside the indirect symbol table')
                     value = struct.unpack_from('<I', data, indirect_offset + slot * 4)[0] & 0x7FFFFFFF
@@ -726,14 +750,15 @@ def macho(data, expected_type, signed=True, expected_minimum=0x000F0400):
             'signature': signature_metadata, 'entrypointPresent': entrypoint, 'mainSymbols': main_symbols,
             'extensionEntrypointSymbols': widget_symbols, 'entryAddress': lc_main_address,
             'mainEntryAddress': main_entry_address, 'extensionEntryAddress': extension_entry_address,
+            'swiftEntryAddress': swift_entry_address, 'swiftEntryFlags': swift_entry_flags,
             'definedObjCClasses': sorted(objc_classes),
             'sharedClassSymbolCount': len(shared_symbols), 'sharedClassSymbols': shared_symbols[:8]}
 
 
 def validate_entrypoint(report, target):
-    # WidgetKit 与 UIKit Host 都要执行 Swift 生成的 main；Broadcast 才走传统扩展入口。
-    # 只检查符号存在不够：旧包同时含 _main，却把 LC_MAIN 指到了 _NSExtensionMain stub。
-    if target in ('host', 'widgets'):
+    # Host 直接进入 Swift main；两个扩展先进入系统初始化流程，Widget 再由
+    # __swift5_entry 的相对指针调用已定义的 Swift main，两个入口缺一不可。
+    if target == 'host':
         require('_main' in report['mainSymbols'] and report.get('mainEntryAddress') is not None
                 and report['entryAddress'] == report['mainEntryAddress'],
                 'Swift _main must be the real LC_MAIN entrypoint: ' + target)
@@ -741,6 +766,12 @@ def validate_entrypoint(report, target):
         require(report['extensionEntrypointSymbols'] and report['extensionEntryAddress'] is not None
                 and report['entryAddress'] == report['extensionEntryAddress'],
                 'Extension _NSExtensionMain must be the real LC_MAIN entrypoint: ' + target)
+        if target == 'widgets':
+            require('_main' in report['mainSymbols'] and report.get('mainEntryAddress') is not None
+                    and report.get('swiftEntryAddress') == report['mainEntryAddress'],
+                    'Widget __swift5_entry relative pointer must address defined Swift _main')
+            require(report.get('swiftEntryFlags') is not None and report['swiftEntryFlags'] & 1,
+                    'Widget __swift5_entry flags must include the Swift main bit')
 
 
 def objc_runtime_class(symbol):

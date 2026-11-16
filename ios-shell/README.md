@@ -43,6 +43,8 @@ Swift UIKit + WKWebView 面板壳，默认从 `https://lswlc33.github.io/zeeho-3
 
 诊断日志记录 App build、实际加载的网页 build、桥握手与受限错误码，不记录账号参数或 token。消息按本条 JSON 的保守字节上界计入 32MiB 在途预算，不按每个方法的最大包大小预占；普通读取与偏好写入可以同时受理，真正超出预算时仍拒绝并记录大小与数量。文档加载完成后仍继续观察业务就绪，避免卡住的骨架被误判成功；原生服务未就绪时会打开可复制/分享的诊断页，也可在「版本与更新 → 查看诊断日志」主动导出。
 
+小组件诊断随同一日志自动导出，不必先打开系统展示页。最近 24 小时、当前 build 的最多 32 条扩展事件包含阶段、请求 trace、进程、尺寸、单调时钟耗时、是否有车辆数据、来源和错误码；不包含 token、VIN、位置或车况数值。阶段按 `launch → snapshotStarted / timelineStarted → localReadStarted / fetchStarted → localReadFinished / fetchFinished → fallback / snapshot / timelineReady → viewBuilt` 排查；同一 trace 才能串联一次请求。`timelineReady` 只证明交付时间线，`viewBuilt` 只证明 SwiftUI 视图被构造，都不证明桌面已显示。无事件可能是未启动、共享区不可读或事件已过期；即使无事件，导出也附共享组解析来源与宿主访问状态。诊断异步写盘，不阻塞 Widget 注册和 completion。
+
 ## 构建与发布（唯一路线：公开镜像仓库 CI）
 
 **构建只通过公开镜像仓库 [`lswlc33/zh-dashboard-ios-shell`](https://github.com/lswlc33/zh-dashboard-ios-shell) 的 GitHub Actions（macOS runner + 真实 Xcode）进行，产出 ad-hoc 签名 IPA，不是 Apple 分发签名包**。私有仓库是唯一源码来源，按白名单用 `tools/sync-public-ios.sh` 同步；公开仓库是投影，不在公开侧维护业务源码。`build.sh` 服务于这条 CI 路线，Windows 不编译 Swift 或生成 IPA。

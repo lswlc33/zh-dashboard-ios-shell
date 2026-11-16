@@ -4,8 +4,8 @@ import Foundation
 //
 // 顺序（每一步失败都往下退，绝不因为上层失败就把卡片清空）：
 //   1. 有可用凭据 → 扩展自己调接口（官方 `ZHWidgetExtension` 同款做法）；
-//   2. 接口失败/没凭据 → 读上一次自己拉到的缓存（30 分钟内有效）；
-//   3. 都没有 → 读主 App 写的前台快照（原有链路，也是现在唯一的数据来源）。
+//   2. 命中缓存或接口失败 → 合法同完整 owner 的缓存/宿主快照按核心车况采样时间择新；
+//   3. 没凭据/缓存不可用 → 读主 App 写的前台快照。
 //
 // 这样既拿到「自己拉」的三个好处（无 180 秒 TTL、无残留 vehicleID、不依赖宿主存活），
 // 又保留了弱网/未授权时的老行为。**任何异常都不得让卡片变成空白**——只有三条路
@@ -64,7 +64,8 @@ public enum WidgetDataSource {
                       WidgetCredentialStore.read(at: date) == credential else {
                     return currentSnapshot(at: date, reason: "stale_credential")
                 }
-                return WidgetDataSourceResult(snapshot: cached, origin: .cache, reason: "")
+                return preferredLocal(cached, owner: currentOwner, credential: credential,
+                                      at: date, reason: "")
             }
             let result = await WidgetVehicleClient.fetch(credential, at: date)
             let completedAt = Date()
@@ -81,7 +82,8 @@ public enum WidgetDataSource {
                 // 车名、充电态或账号统计不等于核心测量成功，空 live 不能盖掉好缓存。
                 if !vehicle.hasCoreMeasurements {
                     liveReason = "no_data"
-                } else if let snapshot = makeSnapshot(vehicle, credential: credential, at: completedAt) {
+                } else if let snapshot = makeSnapshot(vehicle, credential: credential, owner: currentOwner,
+                                                      at: completedAt) {
                     WidgetFetchCache.write(snapshot)
                     return WidgetDataSourceResult(snapshot: snapshot, origin: .live, reason: "")
                 } else {
@@ -93,7 +95,8 @@ public enum WidgetDataSource {
             // 只有 await 后授权仍完整匹配，才允许失败/空结果回退到该凭据的缓存。
             if let cached = WidgetFetchCache.read(ownerID: credential.ownerID, at: completedAt,
                                                   maxAgeSeconds: cacheMaxAgeSeconds) {
-                return WidgetDataSourceResult(snapshot: cached, origin: .cache, reason: liveReason)
+                return preferredLocal(cached, owner: currentOwner, credential: credential,
+                                      at: completedAt, reason: liveReason)
             }
             return currentSnapshot(at: completedAt, reason: liveReason)
         }
@@ -110,9 +113,41 @@ public enum WidgetDataSource {
                                                maxAgeSeconds: cacheMaxAgeSeconds),
            (try? SystemSnapshotStore.currentOwner()) == active,
            WidgetCredentialStore.read(at: date) == credential {
-            return WidgetDataSourceResult(snapshot: cached, origin: .cache, reason: "")
+            return preferredLocal(cached, owner: active, credential: credential, at: date, reason: "")
         }
         return currentSnapshot(at: date, reason: "local_fallback")
+    }
+
+    /// 三条本地路径共用整份择新：不拼接字段，避免账号/车辆或不同采样批次混用。
+    private static func preferredLocal(_ cached: SystemSnapshot, owner: SystemSnapshotOwner,
+                                       credential: WidgetCredential, at date: Date,
+                                       reason: String) -> WidgetDataSourceResult {
+        let host = currentSnapshot(at: date, reason: reason)
+        // 读宿主快照也可能遇到换车/撤权；在交付缓存前再次核对完整 owner 和完整凭据。
+        guard (try? SystemSnapshotStore.currentOwner()) == owner,
+              host.snapshot.map({ $0.owner == owner }) ?? true,
+              owner.ownerIdentifierString == credential.ownerID,
+              WidgetCredentialStore.read(at: date) == credential else {
+            return currentSnapshot(at: date, reason: "stale_credential")
+        }
+        // cache store 只按短 id/年龄过滤；此处补齐 schema 与 accountHash 的完整归属校验。
+        guard (try? cached.validated(expectedOwner: owner, now: date)) != nil else { return host }
+        if let snapshot = host.snapshot, snapshot.owner == owner,
+           let hostTime = coreSampleTime(snapshot),
+           hostTime > (coreSampleTime(cached) ?? 0) {
+            return host
+        }
+        return WidgetDataSourceResult(snapshot: cached, origin: .cache, reason: reason)
+    }
+
+    private static func coreSampleTime(_ snapshot: SystemSnapshot) -> Int64? {
+        guard let vehicle = snapshot.vehicle else { return nil }
+        // capturedAt / updatedAt 会随骑行、gauge 或统计推进；只能比较有值字段自己的车况时间。
+        // 统计字段没有独立的核心采样时间，不能用 statsUpdatedAt 给旧电量续鲜。
+        return [vehicle.socPercent == nil ? nil : vehicle.socUpdatedAt,
+                vehicle.charging == nil ? nil : vehicle.chargingUpdatedAt,
+                vehicle.chargeProgressPercent == nil ? nil : vehicle.chargeProgressUpdatedAt]
+            .compactMap { $0 }.max()
     }
 
     private static func currentSnapshot(at date: Date, reason: String) -> WidgetDataSourceResult {
@@ -137,9 +172,10 @@ public enum WidgetDataSource {
     /// 一旦违反 schema（时间倒挂、owner 非法、数值越界）就该当场失败，
     /// 而不是等渲染时显示成一片「--」还查不出原因。
     private static func makeSnapshot(_ vehicle: WidgetFetchedVehicle,
-                                     credential: WidgetCredential, at date: Date) -> SystemSnapshot? {
-        // owner 必须能从凭据解析出来；解析不出说明凭据本身坏了，直接失败。
-        guard let owner = SystemSnapshotStore.ownerIdentifier(credential.ownerID) else { return nil }
+                                     credential: WidgetCredential, owner: SystemSnapshotOwner,
+                                     at date: Date) -> SystemSnapshot? {
+        // 沿用刚复核的完整 owner（含 accountHash），不能从短 id 重建并丢掉账号归属。
+        guard owner.isValid, owner.ownerIdentifierString == credential.ownerID else { return nil }
         let suffix = credential.vin.utf8.count > 6 ? String(credential.vin.suffix(4)) : nil
         let statsAt = vehicle.statsUpdatedAt
         let value = SystemVehicleSnapshot(

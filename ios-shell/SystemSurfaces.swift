@@ -733,7 +733,13 @@ final class IOSSystemSurfacesService: NSObject, IOSBridgeService, IOSBridgeCance
                 execution[phase.rawValue] = ["recordedAt": receipt.recordedAt, "build": receipt.build,
                     "bundleIdentifier": receipt.bundleIdentifier, "appGroupIdentifier": receipt.appGroupIdentifier,
                     "ownerID": receipt.ownerID as Any? ?? NSNull(), "capturedAt": receipt.capturedAt as Any? ?? NSNull(),
-                    "origin": receipt.origin, "reason": receipt.reason]
+                    "origin": receipt.origin, "reason": receipt.reason,
+                    "requestID": receipt.requestID as Any? ?? NSNull(), "family": receipt.family as Any? ?? NSNull(),
+                    "elapsedMs": receipt.elapsedMs as Any? ?? NSNull(), "processID": receipt.processID as Any? ?? NSNull(),
+                    "hasVehicle": receipt.hasVehicle as Any? ?? NSNull()]
+            }
+            for receipt in WidgetDiagnostics.recent() where receipt.build == build {
+                IOSDiagnostics.shared.log("widget-event: phase=\(receipt.phase.rawValue) trace=\(receipt.requestID ?? "") family=\(receipt.family ?? "") elapsedMs=\(receipt.elapsedMs ?? -1) hasVehicle=\(receipt.hasVehicle ?? false) origin=\(receipt.origin) reason=\(receipt.reason)")
             }
             DispatchQueue.main.async { [weak self] in
                 guard let self = self, self.epoch == ticket, self.current(job) else { return }

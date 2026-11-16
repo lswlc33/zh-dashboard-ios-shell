@@ -22,6 +22,8 @@ struct ZeehoVehicleEntry: TimelineEntry {
     var statsHidden = false
     /// 这一帧的数据来源（诊断用，也决定「打开面板同步」那句提示要不要出现）。
     var origin: WidgetDataSourceResult.Origin = .snapshot
+    var requestID = ""
+    var diagnosticReason = ""
 
     var presentation: WidgetVehiclePresentation {
         // 桌面小组件过期后保留最后已知电量/充电状态，只把时间标注成过期，
@@ -60,21 +62,18 @@ struct ZeehoVehicleEntry: TimelineEntry {
 // 前两条对应官方 `ZHWidgetExtension` 的做法（扩展自带网络层，不依赖宿主存活），
 // 第三条保留原有兜底，未授权后台凭据/弱网时行为不变。
 
-/// `getTimeline` 的一次性闸门：网络结果与超时兜底**先到先赢**，`completion` 只调一次。
-///
-/// 网络可能在扩展完成时间线之前尚未返回；系统也可能提前停止扩展。
-/// 用本地兜底尽早交出 timeline，不能把 3.5 秒当作系统保证的固定执行预算。
-private final class TimelineGate {
+/// 网络、读盘和兜底先到先交付；兜底值提前构造，计时器里不再访问共享容器。
+private final class WidgetCompletionGate<Value> {
     private let lock = NSLock()
-    private var completion: ((Timeline<ZeehoVehicleEntry>) -> Void)?
+    private var completion: ((Value) -> Void)?
     private var fallback: DispatchWorkItem?
 
-    init(completion: @escaping (Timeline<ZeehoVehicleEntry>) -> Void) {
+    init(completion: @escaping (Value) -> Void) {
         self.completion = completion
     }
 
-    /// 正常完成（网络结果 / 缓存 / 快照）：取消超时兜底并交结果。
-    func finish(_ timeline: Timeline<ZeehoVehicleEntry>) {
+    @discardableResult
+    func finish(_ value: Value) -> Bool {
         lock.lock()
         let callback = completion
         completion = nil
@@ -82,37 +81,19 @@ private final class TimelineGate {
         self.fallback = nil
         lock.unlock()
         fallback?.cancel()
-        callback?(timeline)
-        if callback != nil, let entry = timeline.entries.first {
-            WidgetDiagnostics.record(.timelineReady, snapshot: entry.snapshot, origin: entry.origin.rawValue)
-        }
+        callback?(value)
+        return callback != nil
     }
 
-    /// 超时兜底：到点还没 finish 就先交一份「只读本地」的 timeline。
-    func scheduleFallback(seconds: Double,
-                          build: @escaping () -> Timeline<ZeehoVehicleEntry>) {
-        let item = DispatchWorkItem { [weak self] in
-            guard let self = self else { return }
-            self.lock.lock()
-            let callback = self.completion
-            self.completion = nil
-            self.fallback = nil
-            self.lock.unlock()
-            guard let callback = callback else { return }
-            let timeline = build()
-            callback(timeline)
-            if let entry = timeline.entries.first {
-                WidgetDiagnostics.record(.timelineReady, snapshot: entry.snapshot,
-                                         origin: entry.origin.rawValue, reason: "local_fallback")
-            }
-        }
+    func scheduleFallback(seconds: Double, value: Value) {
+        // item 强持有 gate，独立于可能卡住的网络/读盘任务，交付后取消并释放。
+        let item = DispatchWorkItem { _ = self.finish(value) }
         lock.lock()
-        fallback = item
         let armed = completion != nil
+        if armed { fallback = item }
         lock.unlock()
-        // 已经被网络结果抢先完成时不再排队。
         guard armed else { return }
-        DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + max(0.5, seconds), execute: item)
+        DispatchQueue.global(qos: .userInitiated).asyncAfter(deadline: .now() + seconds, execute: item)
     }
 }
 
@@ -120,32 +101,87 @@ struct ZeehoVehicleProvider: TimelineProvider {
     private static let refreshInterval: TimeInterval = 15 * 60
 
     func placeholder(in context: Context) -> ZeehoVehicleEntry {
-        // 占位和图库都不能伪造一辆车或 100% 电量。
         ZeehoVehicleEntry(date: Date(), snapshot: nil, requiresRefresh: false)
     }
 
     func getSnapshot(in context: Context, completion: @escaping (ZeehoVehicleEntry) -> Void) {
-        // 图库预览不联网：只读已有快照/缓存，避免添加小组件时卡住预览面板。
-        let entry = ZeehoWidgetReader.read(at: Date())
-        WidgetDiagnostics.record(.snapshot, snapshot: entry.snapshot, origin: entry.origin.rawValue)
-        completion(entry)
+        let start = ProcessInfo.processInfo.systemUptime
+        let requestID = UUID().uuidString
+        let family = String(describing: context.family)
+        let gate = WidgetCompletionGate<ZeehoVehicleEntry> { entry in
+            completion(entry)
+            if entry.diagnosticReason == "snapshot_deadline" {
+                WidgetDiagnostics.record(.fallback, reason: entry.diagnosticReason, requestID: requestID,
+                                         family: family, elapsedMs: Self.elapsed(start))
+            }
+            WidgetDiagnostics.record(.snapshot, snapshot: entry.snapshot, origin: entry.origin.rawValue,
+                reason: entry.diagnosticReason, requestID: requestID, family: family, elapsedMs: Self.elapsed(start))
+        }
+        var empty = ZeehoVehicleEntry(date: Date(), snapshot: nil, requiresRefresh: false)
+        empty.requestID = requestID
+        empty.diagnosticReason = "snapshot_deadline"
+        gate.scheduleFallback(seconds: 1, value: empty)
+        WidgetDiagnostics.record(.snapshotStarted, reason: context.isPreview ? "gallery" : "system",
+                                 requestID: requestID, family: family)
+        DispatchQueue.global(qos: .userInitiated).async {
+            WidgetDiagnostics.record(.localReadStarted, requestID: requestID, family: family)
+            var entry = ZeehoWidgetReader.read(at: Date())
+            entry.requestID = requestID
+            WidgetDiagnostics.record(.localReadFinished, snapshot: entry.snapshot, origin: entry.origin.rawValue,
+                reason: entry.diagnosticReason, requestID: requestID, family: family, elapsedMs: Self.elapsed(start))
+            gate.finish(entry)
+        }
     }
 
     func getTimeline(in context: Context, completion: @escaping (Timeline<ZeehoVehicleEntry>) -> Void) {
-        // 网络可能串行等待多轮请求；本地兜底先交付，避免时间线完全依赖网络完成。
-        // 这是应用选择的等待上限，系统没有承诺给扩展固定的秒数预算。
-        WidgetDiagnostics.record(.timelineStarted)
-        let gate = TimelineGate(completion: completion)
+        let now = Date()
+        let start = ProcessInfo.processInfo.systemUptime
+        let requestID = UUID().uuidString
+        let family = String(describing: context.family)
+        var empty = ZeehoVehicleEntry(date: now, snapshot: nil, requiresRefresh: false)
+        empty.requestID = requestID
+        empty.diagnosticReason = "timeline_deadline"
+        let gate = WidgetCompletionGate<Timeline<ZeehoVehicleEntry>> { timeline in
+            completion(timeline)
+            if let entry = timeline.entries.first {
+                if entry.diagnosticReason == "timeline_deadline" {
+                    WidgetDiagnostics.record(.fallback, reason: entry.diagnosticReason, requestID: requestID,
+                                             family: family, elapsedMs: Self.elapsed(start))
+                }
+                WidgetDiagnostics.record(.timelineReady, snapshot: entry.snapshot, origin: entry.origin.rawValue,
+                    reason: entry.diagnosticReason, requestID: requestID, family: family, elapsedMs: Self.elapsed(start))
+            }
+        }
+        // 先武装纯内存兜底，再开始诊断、共享容器和网络操作；无数据也交付可读提示。
+        gate.scheduleFallback(seconds: 3.5, value: Timeline(entries: [empty], policy: .after(now.addingTimeInterval(60))))
+        WidgetDiagnostics.record(.timelineStarted, requestID: requestID, family: family)
+        DispatchQueue.global(qos: .userInitiated).async {
+            WidgetDiagnostics.record(.localReadStarted, requestID: requestID, family: family)
+            var local = ZeehoWidgetReader.read(at: Date())
+            local.requestID = requestID
+            WidgetDiagnostics.record(.localReadFinished, snapshot: local.snapshot, origin: local.origin.rawValue,
+                reason: local.diagnosticReason, requestID: requestID, family: family, elapsedMs: Self.elapsed(start))
+            if local.snapshot != nil {
+                let timeline = Self.timeline(entry: local, now: Date())
+                // 给自取请求一个短窗口；本地结果仍先于纯内存截止兜底交付。
+                DispatchQueue.global(qos: .userInitiated).asyncAfter(deadline: .now() + 3) {
+                    gate.finish(timeline)
+                }
+            }
+        }
         Task {
+            WidgetDiagnostics.record(.fetchStarted, requestID: requestID, family: family)
             let result = await WidgetDataSource.load(at: Date())
-            gate.finish(Self.timeline(entry: ZeehoWidgetReader.entry(result, at: Date()), now: Date()))
+            WidgetDiagnostics.record(.fetchFinished, snapshot: result.snapshot, origin: result.origin.rawValue,
+                reason: result.reason, requestID: requestID, family: family, elapsedMs: Self.elapsed(start))
+            var entry = ZeehoWidgetReader.entry(result, at: Date())
+            entry.requestID = requestID
+            gate.finish(Self.timeline(entry: entry, now: Date()))
         }
-        // 最多等待网络 3.5 秒，再交本地结果；这不是系统保证的执行时长。
-        gate.scheduleFallback(seconds: 3.5) {
-            let now = Date()
-            // 多语句闭包必须显式 return（单表达式闭包才允许省略）。
-            return Self.timeline(entry: ZeehoWidgetReader.read(at: now), now: now)
-        }
+    }
+
+    private static func elapsed(_ start: TimeInterval) -> Int64 {
+        Int64(max(0, ProcessInfo.processInfo.systemUptime - start) * 1000)
     }
 
     static func timeline(entry: ZeehoVehicleEntry, now: Date) -> Timeline<ZeehoVehicleEntry> {
@@ -186,8 +222,10 @@ enum ZeehoWidgetReader {
     /// 把取数结果组装成 entry（Provider 用）。
     static func entry(_ result: WidgetDataSourceResult, at date: Date,
                       showName: Bool? = nil, showTime: Bool? = nil) -> ZeehoVehicleEntry {
-        makeEntry(snapshot: result.snapshot, origin: result.origin, at: date,
-                  showName: showName, showTime: showTime)
+        var value = makeEntry(snapshot: result.snapshot, origin: result.origin, at: date,
+                              showName: showName, showTime: showTime)
+        value.diagnosticReason = result.reason
+        return value
     }
 
     private static func makeEntry(snapshot: SystemSnapshot?, origin: WidgetDataSourceResult.Origin,
@@ -305,6 +343,12 @@ struct ZeehoVehicleWidgetView: View {
     @Environment(\.widgetFamily) private var family
     @Environment(\.colorScheme) private var colorScheme
     let entry: ZeehoVehicleEntry
+
+    init(entry: ZeehoVehicleEntry) {
+        self.entry = entry
+        WidgetDiagnostics.record(.viewBuilt, snapshot: entry.snapshot, origin: entry.origin.rawValue,
+                                 reason: entry.diagnosticReason, requestID: entry.requestID)
+    }
 
     private var presentation: WidgetVehiclePresentation { entry.presentation }
     private var colors: WidgetPalette.Colors { WidgetPalette.colors(dark: entry.isDark(colorScheme)) }
@@ -766,18 +810,8 @@ struct ZeehoVehicleWidgetView: View {
 
 // MARK: - 小组件定义
 
-/// 原车辆小组件：**必须保持 StaticConfiguration**。
-///
-/// ## 为什么不能把它换成 AppIntentConfiguration（1.1.19 的真实事故）
-///
-/// WidgetKit 把已放置实例的配置**按 intent 类型名**存档。1.1.19 把同一 kind
-/// (`ZeehoVehicleWidget`) 从 `StaticConfiguration` 换成了 `AppIntentConfiguration`，
-/// 存量实例持有的旧配置类型不存在了 → WidgetKit **再也不会为它产出 timeline**
-/// → 桌面上永远停在占位骨架屏，用户只能删掉重加。
-/// （Stack Overflow #64075386、callstackincubator/voltra#272、tmeng53/wildcard#822
-///  三份独立实测；Apple 没有文档化这条行为。）
-///
-/// 结论：**kind 一旦对外发布，它的配置类型就不能改**。要加原生编辑只能开新 kind。
+/// 保留已发布的 kind 和 StaticConfiguration，避免破坏已有实例的配置兼容。
+/// 配置变更与灰色占位曾同时出现，但不能据此断言永久失效或要求用户重加。
 struct ZeehoVehicleWidget: Widget {
     let kind = ZeehoWidgetKind.vehicle
 
@@ -797,48 +831,13 @@ struct ZeehoVehicleWidget: Widget {
 // 相关类型与 provider 从 `Widgets/WidgetConfiguration.swift` 一并删除，
 // 避免以后有人看到「有这个类型」就以为图库里应该有。
 
-// 为什么不用 `if #available` 写在 `WidgetBundle.body` 里：
-// `Widget` 与 `WidgetBundle` 的 body 都**没有** result builder，苹果也没有提供
-// `WidgetConfigurationBuilder`（SDK 里查无此类型）。带 else 的 if #available 会直接
-// 编译失败（"closure containing control flow statement cannot be used with result builder"）。
-// 所以用 `static func main()` 把分派提到 builder 之上。`WidgetBundle.main()` 是
-// WidgetKit 里真实存在的 `@MainActor public static func main()`，可以这样调用
-// （Chromium / Home Assistant 都这么做，见「小组件自取数」的记忆条目）。
-// iOS 17+ 的 bundle 同时注册两个 kind：原 kind 保持静态配置，新 kind 提供编辑。
+// 两条历史 bundle 的内容已完全相同；按 WidgetKit 标准入口直接注册，启动时不读写共享容器。
 @main
-struct ZeehoWidgets {
-    static func main() {
+struct ZeehoWidgets: WidgetBundle {
+    init() {
         WidgetDiagnostics.record(.launch)
-        if #available(iOS 17.0, *) {
-            ZeehoModernWidgets.main()
-        } else {
-            ZeehoLegacyWidgets.main()
-        }
     }
-}
 
-/// iOS 17+：车辆小组件 + Live Activity。
-///
-/// **可编辑版（AppIntentConfiguration）已从 bundle 中撤下（1.1.23）**：
-/// 真机实测它添加后整个是空白，而同一份视图在静态版上完全正常。
-/// 已核实 CI 产物里的 `Metadata.appintents` 完整（配置 intent + 4 个参数 +
-/// 两个枚举的全部取值），二进制里 kind/类型也都在，所以不是索引缺失，
-/// 而是 `AppIntentConfiguration` 在「手写 swiftc + 弱链接 AppIntents」这套
-/// 构建方式下的运行时问题。排查成本高、且每次验证都要烧一个正式版本，
-/// 因此改为：**图库只保留能用的静态版**，编辑能力放到 App 内
-/// （`widget.set` 支持 showName/showTime/dark/stats，见 SystemSurfaces）。
-@available(iOS 17.0, *)
-struct ZeehoModernWidgets: WidgetBundle {
-    var body: some Widget {
-        ZeehoVehicleWidget()
-        if #available(iOS 16.1, *) {
-            ZeehoLiveActivityWidget()
-        }
-    }
-}
-
-/// iOS 15.4~16.x：静态配置的车辆小组件 + Live Activity。
-struct ZeehoLegacyWidgets: WidgetBundle {
     var body: some Widget {
         ZeehoVehicleWidget()
         if #available(iOS 16.1, *) {
