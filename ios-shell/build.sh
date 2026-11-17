@@ -382,17 +382,25 @@ else
     printf 'note: 跳过 swift-stdlib-tool 扫描（14/15.4 自带 Swift 运行时；需要时设 ZEEHO_RUN_STDLIB_TOOL=1）\n'
 fi
 while IFS= read -r -d '' dylib; do
-    architectures="$(xcrun lipo -archs "$dylib")"
-    if [[ "$architectures" != arm64 ]]; then
+    architectures="$(xcrun lipo -archs "$dylib" 2>/dev/null || printf 'unknown')"
+    if [[ "$architectures" != arm64 && "$architectures" != "unknown" ]]; then
         xcrun lipo "$dylib" -thin arm64 -output "$dylib.arm64"
         mv "$dylib.arm64" "$dylib"
     fi
-    codesign --force --sign - --timestamp=none "$dylib"
+    # codesign 在 Xcode 26 runner 上偶发 SIGABRT（同一份字节重跑就过），
+    # 单次失败不该让整包 134 退出；重试一次并保留真实错误。
+    if ! codesign --force --sign - --timestamp=none "$dylib"; then
+        printf 'note: codesign 失败，重试一次 %s\n' "$dylib" >&2
+        codesign --force --sign - --timestamp=none "$dylib"
+    fi
     codesign --verify --strict "$dylib"
 done < <(find "$app_dir/Frameworks" "$widget_dir/Frameworks" "$broadcast_dir/Frameworks" -type f -name '*.dylib' -print0)
 # 所有 framework 同样由内到外签名，不限于 KMP；允许的实际嵌入范围仍由 validate_ipa 严格核对。
 while IFS= read -r -d '' framework; do
-    codesign --force --sign - --timestamp=none "$framework"
+    if ! codesign --force --sign - --timestamp=none "$framework"; then
+        printf 'note: codesign 失败，重试一次 %s\n' "$framework" >&2
+        codesign --force --sign - --timestamp=none "$framework"
+    fi
     codesign --verify --strict "$framework"
 done < <(find "$app_dir/Frameworks" "$widget_dir/Frameworks" "$broadcast_dir/Frameworks" -depth -type d -name '*.framework' -print0)
 # AppIntents metadata：小组件上的车控/刷新按钮 + 主 App 的后台任务 intent 靠它才生效。
