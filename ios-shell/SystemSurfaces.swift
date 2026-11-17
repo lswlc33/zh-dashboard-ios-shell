@@ -150,6 +150,10 @@ private actor IOSLiveActivityManager {
     func setScope(_ next: SystemSnapshotOwner?, generation ticket: UInt64) async {
         guard ticket >= generation else { return }
         generation = ticket; owner = next
+        // 系统划掉或自行结束的活动也要回收缓存，不能只依赖主动 end。
+        let liveIDs = Set(Activity<ZeehoActivityAttributes>.activities.filter { Self.isLive($0.activityState) }.map { $0.id })
+        lastUpdates = lastUpdates.filter { liveIDs.contains($0.key) }
+        lastContents = lastContents.filter { liveIDs.contains($0.key) }
         // nil 表示「网页还没确认车辆」的未知状态，不是撤销：冷启动 installBridge 时
         // scopeProvider() 恒为 nil，这里若按 != next 结束活动，会把用户上次会话的
         // Live Activity 全部杀掉。撤销只能走显式的 clearScope()。
@@ -252,6 +256,7 @@ private actor IOSLiveActivityManager {
                 && Self.isLive($0.activityState)
         }
         guard !targets.isEmpty else { throw SystemSnapshotError("live_activity_not_running") }
+        var updated = 0
         for activity in targets {
             guard lease.valid, ticket == generation, owner == snapshot.owner else { throw SystemSnapshotError("stale_session") }
             // 每个 id 独立节流且 await 期间占槽，云端/骑行/gauge 同时到达也不会叠发。
@@ -268,6 +273,11 @@ private actor IOSLiveActivityManager {
                 await activity.update(ActivityContent(state: state, staleDate: staleDate(value, kind: activity.attributes.kind)))
             } else { await activity.update(using: state) }
             updating.remove(activity.id)
+            guard Self.isLive(activity.activityState) else {
+                lastUpdates.removeValue(forKey: activity.id)
+                lastContents.removeValue(forKey: activity.id)
+                continue
+            }
             lastUpdates[activity.id] = now
             lastContents[activity.id] = value
             // actor 在 await 时允许换 scope；不能用已经失效的样本确认成功或留下旧活动。
@@ -275,8 +285,9 @@ private actor IOSLiveActivityManager {
                 if owner != snapshot.owner { await finish(activity) }
                 throw SystemSnapshotError("operation_cancelled")
             }
+            updated += 1
         }
-        return targets.count
+        return updated
     }
 
     func end(owner expected: SystemSnapshotOwner, id: String? = nil, kind: ZeehoActivityKind? = nil,
@@ -325,6 +336,11 @@ private actor IOSLiveActivityManager {
     }
 
     private func finish(_ activity: Activity<ZeehoActivityAttributes>) async {
+        // await 期间可能仍有更新收尾，返回前再次清理该活动的缓存。
+        defer {
+            lastUpdates.removeValue(forKey: activity.id)
+            lastContents.removeValue(forKey: activity.id)
+        }
         if #available(iOS 16.2, *) { await activity.end(nil, dismissalPolicy: .immediate) }
         else { await activity.end(using: nil, dismissalPolicy: .immediate) }
     }
@@ -1355,11 +1371,25 @@ final class IOSSystemSurfacesService: NSObject, IOSBridgeService, IOSBridgeCance
               IOSBackgroundCredentialStore.load() == event.credential else { return }
         let sample = event.sample
         guard sample.capturedAt >= (latest?.vehicle?.updatedAt ?? 0) else { return }
-        let vehicle = SystemVehicleSnapshot(name: latest?.vehicle?.name,
+        // 后台只补电量/充电，其他字段沿用原值和原时间，不能把仍有效的统计清空或续鲜。
+        let previous = latest?.vehicle
+        let vehicle = SystemVehicleSnapshot(name: previous?.name,
             vinDisplaySuffix: captured.vin.utf8.count > 6 ? String(captured.vin.suffix(4)) : nil,
-            socPercent: sample.socPercent, socUpdatedAt: sample.socPercent == nil ? nil : sample.capturedAt,
-            charging: sample.charging, chargingUpdatedAt: sample.charging == nil ? nil : sample.capturedAt,
-            updatedAt: sample.capturedAt)
+            socPercent: sample.socPercent ?? previous?.socPercent,
+            socUpdatedAt: sample.socPercent == nil ? previous?.socUpdatedAt : sample.capturedAt,
+            charging: sample.charging ?? previous?.charging,
+            chargingUpdatedAt: sample.charging == nil ? previous?.chargingUpdatedAt : sample.capturedAt,
+            chargeProgressPercent: previous?.chargeProgressPercent,
+            chargeProgressUpdatedAt: previous?.chargeProgressUpdatedAt,
+            updatedAt: sample.capturedAt,
+            voltage: previous?.voltage, current: previous?.current, power: previous?.power,
+            lockState: previous?.lockState, seatState: previous?.seatState, online: previous?.online,
+            todayMileKm: previous?.todayMileKm, lastMileKm: previous?.lastMileKm,
+            lastRideMinutes: previous?.lastRideMinutes, totalMileKm: previous?.totalMileKm,
+            rangeKm: previous?.rangeKm, integral: previous?.integral, unread: previous?.unread,
+            tireFrontBar: previous?.tireFrontBar, tireRearBar: previous?.tireRearBar,
+            tireFrontTemp: previous?.tireFrontTemp, tireRearTemp: previous?.tireRearTemp,
+            statsUpdatedAt: previous?.statsUpdatedAt)
         do {
             let value = try candidate(vehicle: vehicle)
             try persist(value, job: nil, context: event.context)
