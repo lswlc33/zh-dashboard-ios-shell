@@ -7,6 +7,23 @@ import ZeehoSystemShared
 // 色值直接抄 Android `WidgetTheme.color(dark, role)` 与 res/drawable/widget_*.xml，
 // 目标是 iOS 与 Android 视觉 1:1（用户口径：安卓什么样，iOS 就要什么样）。
 // 深浅色按实例偏好（dark = -1 跟随系统 / 0 浅色 / 1 深色）选一套，不依赖 values-night。
+/// 小组件刷新节奏。
+///
+/// Apple 的 24 小时预算对常看的小组件约 40–70 次（约 15–60 分钟一次），
+/// 申请 15 分钟会被系统静默压到更慢，反而更容易看到「可能已过期」。
+/// 这里按预算中位申请 30 分钟，并给每台车加 0–9 分钟抖动，
+/// 避免同一时刻大量设备一起打接口。
+enum WidgetRefreshPolicy {
+    static let timelineIntervalSeconds: TimeInterval = 30 * 60
+    /// 展示窗口必须比刷新间隔略长：正好等于间隔时，刚刷到就会卡在「可能已过期」。
+    static let displayMaxAgeSeconds: Double = 45 * 60
+    /// 宿主快照还算新鲜时直接渲染，省掉一次网络等待；
+    /// 超过这个年龄就说明它已经不代表当前车况，应让扩展自取先试。
+    static let freshSnapshotSeconds: Double = 15 * 60
+    /// 快照不新鲜时的自取宽限：到点仍没取到就回落到旧快照，不能变成空提示。
+    static let staleSnapshotGraceSeconds: Double = 2.5
+}
+
 enum WidgetPalette {
     // MARK: - 语义色（WidgetTheme.color）
     struct Colors {
@@ -194,7 +211,7 @@ enum WidgetStatusText {
     /// 按十几分钟一次的节奏唤醒，180 秒判会让刚同步/刚自己拉到的数据一渲染就掉成「--」，
     /// 用户看到的是「小组件永远空白」。Android 小组件同样是 30 分钟口径（BaseWidget.updated()）。
     /// 这里统一传给 Shared 的 visible* 方法，替代 1.1.17 里那条被废掉的 keepsLastKnown 路。
-    private static let freshWindow = WidgetFreshness.maxAgeSeconds
+    private static let freshWindow = WidgetRefreshPolicy.displayMaxAgeSeconds
 
     /// 充电/在线状态行的语义色标记（调用点映射到具体色）。
     enum LineTone { case normal, warn, accent }

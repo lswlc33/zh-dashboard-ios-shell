@@ -1,6 +1,7 @@
 import Foundation
 import UserNotifications
 import UIKit
+import WidgetKit
 import ZeehoSystemShared
 
 // 后台任务的实际执行体：签到、电量采样、充电状态变化通知。
@@ -143,12 +144,41 @@ enum IOSBackgroundRunner {
                 guard context.canDeliver, IOSBackgroundCredentialStore.load() == credential else { return }
                 IOSSystemSurfacesService.acceptBackgroundSample(sample, credential: credential, context: context)
             }
+            // 后台唤醒是「没打开 App 也能更新桌面」的唯一入口：
+            // 以前只靠前台快照落盘时镜像凭据，用户长期不进 App 时凭据会到期，
+            // 小组件就只能读旧快照。这里成功采样后同样续期并请求一次时间线。
+            if #available(iOS 14.0, *) { Self.refreshWidgetSurface(credential: credential) }
         }
         if let message = notify {
             IOSBackgroundNotifier.post(id: "charge-change", title: message.0, body: message.1, context: context)
         }
         IOSBackgroundLog.write("采样结束 \(report.lastResult)")
         return report
+    }
+
+    /// 后台采样成功后：续期小组件取数凭据并请求刷新时间线。
+    ///
+    /// 小组件「自己拉接口」依赖 App Group 里那份最小凭据（7 天窗口）。
+    /// 只在前台快照落盘时续期的话，长期不打开 App 的用户会看到卡片停在旧数据；
+    /// 后台成功采样说明 token 与密钥仍然有效，正是最合适的续期时机。
+    /// 续期失败不阻断采样本身：扩展仍能读刚写入的宿主快照。
+    /// WidgetCenter 从 iOS 14 起可用；本工程 deployment 是 15.4，仍显式标注以满足编译器。
+    @available(iOS 14.0, *)
+    static func refreshWidgetSurface(credential: IOSBackgroundCredential) {
+        // 采样期间可能发生换号/撤销：只接受仍然相同的凭据，
+        // 不能把旧 token 再写回共享区让扩展继续拿它拉车。
+        guard IOSBackgroundCredentialStore.load() == credential,
+              SystemSnapshotStore.isAvailable(),
+              let owner = IOSSystemSurfacesService.widgetOwner(accountID: credential.accountID,
+                                                              vin: credential.vin) else { return }
+        let value = WidgetCredential(ownerID: owner.ownerIdentifierString, vin: credential.vin,
+                                     token: credential.token, appID: credential.appID,
+                                     appSecret: credential.appSecret,
+                                     updatedAt: Int64(Date().timeIntervalSince1970 * 1000))
+        if WidgetCredentialStore.save(value) {
+            IOSBackgroundLog.write("小组件凭据已续期")
+        }
+        WidgetCenter.shared.reloadTimelines(ofKind: IOSSystemSurfacesService.widgetKind)
     }
 
     static func runDailyTasks(force: Bool = false, signInDone: Bool = false,

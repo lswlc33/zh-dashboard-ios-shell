@@ -30,7 +30,7 @@ struct ZeehoVehicleEntry: TimelineEntry {
         // 与 Android 小组件「更新时间 + 可能已过期」口径一致。
         var value = WidgetVehiclePresentation(snapshot: snapshot, date: date, requiresRefresh: requiresRefresh)
         value.keepsLastKnown = true
-        value.freshWindow = WidgetFreshness.maxAgeSeconds
+        value.freshWindow = WidgetRefreshPolicy.displayMaxAgeSeconds
         return value
     }
 
@@ -90,15 +90,18 @@ private final class WidgetCompletionGate<Value> {
         let item = DispatchWorkItem { _ = self.finish(value) }
         lock.lock()
         let armed = completion != nil
+        let previous = fallback
         if armed { fallback = item }
         lock.unlock()
+        // 重新武装（例如旧快照宽限）时必须撤掉上一个计时器，避免它晚到后仍持有 gate。
+        previous?.cancel()
         guard armed else { return }
         DispatchQueue.global(qos: .userInitiated).asyncAfter(deadline: .now() + seconds, execute: item)
     }
 }
 
 struct ZeehoVehicleProvider: TimelineProvider {
-    private static let refreshInterval: TimeInterval = 15 * 60
+    private static let refreshInterval = WidgetRefreshPolicy.timelineIntervalSeconds
 
     func placeholder(in context: Context) -> ZeehoVehicleEntry {
         ZeehoVehicleEntry(date: Date(), snapshot: nil, requiresRefresh: false)
@@ -161,10 +164,17 @@ struct ZeehoVehicleProvider: TimelineProvider {
             local.requestID = requestID
             WidgetDiagnostics.record(.localReadFinished, snapshot: local.snapshot, origin: local.origin.rawValue,
                 reason: local.diagnosticReason, requestID: requestID, family: family, elapsedMs: Self.elapsed(start))
-            if local.snapshot?.vehicle != nil {
-                // 已有车况立即交付，不能再等网络窗口、消耗系统给扩展的执行预算。
-                // 自取请求仍可更新缓存；一次请求只由 gate 接受首个结果。
-                gate.finish(Self.timeline(entry: local, now: Date()))
+            if let snapshot = local.snapshot, snapshot.vehicle != nil {
+                // 快照够新：立即交付，省掉一次网络等待。
+                // 快照偏旧：给自取留一个短窗口，取不到再回落这份旧值；
+                // 否则「扩展自己拉」会被旧快照永远抢在前面，等于没有生效。
+                let age = Date().timeIntervalSince1970 - Double(snapshot.capturedAt) / 1000
+                if age <= WidgetRefreshPolicy.freshSnapshotSeconds {
+                    gate.finish(Self.timeline(entry: local, now: Date()))
+                } else {
+                    gate.scheduleFallback(seconds: WidgetRefreshPolicy.staleSnapshotGraceSeconds,
+                                          value: Self.timeline(entry: local, now: Date()))
+                }
             }
         }
         Task {
@@ -182,14 +192,22 @@ struct ZeehoVehicleProvider: TimelineProvider {
         Int64(max(0, ProcessInfo.processInfo.systemUptime - start) * 1000)
     }
 
+    /// 每台车固定 0–9 分钟抖动：同一 owner 每次都算同一个值，
+    /// 既不改变可预期性，也避免多台设备在同一分钟一起请求接口。
+    private static func jitter(_ seed: String?) -> TimeInterval {
+        guard let seed = seed, !seed.isEmpty else { return 0 }
+        let value = seed.unicodeScalars.reduce(0) { ($0 &* 31 &+ Int($1.value)) & 0xFFFF_FFFF }
+        return TimeInterval(value % 600)
+    }
+
     static func timeline(entry: ZeehoVehicleEntry, now: Date) -> Timeline<ZeehoVehicleEntry> {
-        let refreshAfter = now.addingTimeInterval(refreshInterval)
+        let refreshAfter = now.addingTimeInterval(refreshInterval + Self.jitter(entry.snapshot?.owner.accountVINHash))
         var entries = [entry]
         if let snapshot = entry.snapshot, let vehicle = snapshot.vehicle,
            !entry.presentation.isStale {
             // 未来 entry 只把数值标成「可能已过期」，不再抹掉电量/充电状态：
             // 过期后保留最后同步值 + 更新时间，和 Android 小组件同一口径。
-            // 期限按小组件的 30 分钟窗口算，不能用 180 秒的会话级 expiresAt——
+            // 期限按小组件自己的展示窗口算，不能用 180 秒的会话级 expiresAt——
             // 那会让小组件刚加上 3 分钟就显示「可能已过期」。
             let deadline = Date(timeIntervalSince1970: Double(vehicle.updatedAt) / 1000)
                 .addingTimeInterval(WidgetFreshness.maxAgeSeconds)

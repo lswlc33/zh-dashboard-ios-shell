@@ -314,9 +314,11 @@ def main():
     # 纯函数级一致性：把两份实现的源码断言成「同一个表达式顺序」，防止单边改动漂移。
     assert widget_client.count('sorted { $0.0 < $1.0 }') == 1 and signing.count('sorted { $0.0 < $1.0 }') == 1, \
         '两边 query 排序规则必须一致（按 key 字典序）'
-    assert 'freshWindow = WidgetFreshness.maxAgeSeconds' in (
-        root / 'Widgets/WidgetStyle.swift').read_text(encoding='utf-8'), \
-        '桌面小组件必须用 30 分钟窗口（180 秒会让数据一渲染就掉成 --）'
+    style_src = (root / 'Widgets/WidgetStyle.swift').read_text(encoding='utf-8')
+    assert 'freshWindow = WidgetRefreshPolicy.displayMaxAgeSeconds' in style_src, \
+        '桌面小组件必须用展示窗口（180 秒会让数据一渲染就掉成 --）'
+    assert 'displayMaxAgeSeconds: Double = 45 * 60' in style_src, \
+        '展示窗口必须长于 30 分钟的时间线间隔，否则刚刷到就判过期'
     # 撤销「编辑面板的 protocol 必须进清单」那条：可编辑版已整体撤除（1.1.23），
     # 现在反而**不该**把它留在清单里（对应控件真机空白）。
     # 只检查协议数组那一行，避免注释里提到名字就误判。

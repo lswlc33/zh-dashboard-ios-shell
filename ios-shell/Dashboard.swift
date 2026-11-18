@@ -32,6 +32,13 @@ final class AppDelegate: UIResponder, UIApplicationDelegate {
         }
         return true
     }
+
+    func applicationDidEnterBackground(_ application: UIApplication) {
+        // 退后台时重提一次后台采样请求：系统可能在上次执行后没有继续唤醒，
+        // 只靠「handler 内 reschedule」会在链条断掉后永久停摆。
+        // 这里不承诺执行时间，只是让下一次机会始终处于排队状态。
+        if #available(iOS 13.0, *) { IOSBackgroundScheduler.shared.scheduleAll() }
+    }
 }
 
 // 启动分流：有可用快照且不是刚升级过就直接进面板，否则先走原生欢迎/恢复页。
