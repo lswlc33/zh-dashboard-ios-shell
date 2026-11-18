@@ -19,7 +19,6 @@ final class IOSHistoryService: IOSBridgeService {
         static let pending = 32
         static let requestBytes = 24 * 1024
         static let safeInteger: Int64 = 9_007_199_254_740_991
-        static let sessions = 12          // 与 ChargeLog.MAX_SESSIONS 一致，超出按结束时间丢最旧。
         static let staleTemporarySeconds: Int64 = 3_600
         static let sweepEntries = 2_048   // 单次清扫最多检查的目录项，避免超大目录拖住读盘。
         // BatteryHistory.wanted() 的最小阈值是「供电 60s 再减 10s 容差」，低于它就是必节流。
@@ -346,18 +345,14 @@ final class IOSHistoryService: IOSBridgeService {
             for key in ["soc", "voltage", "current", "power", "chargedMin"] {
                 inputSample[key] = numericValue(sample[key])
             }
+            guard explicitlyCharging(snapshot, sample, at: at, clock: clock) else {
+                var skipped = skippedBatteryRecord(request, at: at)
+                noteDrops(&skipped, loaded)
+                complete(request, skipped); return
+            }
             inputSample["charging"] = integer(sample["charging"]) ?? -1
             inputSample["chargeSource"] = boundedText(sample["chargeSource"], limit: 16) ?? "unknown"
             inputSample["chargeCode"] = boundedText(sample["chargeCode"], limit: 32) ?? ""
-            let chargeSource = inputSample["chargeSource"] as? String ?? "unknown"
-            let chargeCode = inputSample["chargeCode"] as? String ?? ""
-            if !["battery", "vehicle"].contains(chargeSource) || chargeCode.isEmpty || chargeCode == "-1"
-                || (chargeSource == "vehicle" && !freshVehicle) {
-                // 不接共享兼容旧协议的无来源捷径；本服务要求网页本轮真实码证据。
-                inputSample["chargeSource"] = "unknown"
-                inputSample["chargeCode"] = ""
-                inputSample["charging"] = -1
-            }
             inputSample["batteryAt"] = at
             inputSample["vehicleAt"] = suppliedSampleVehicleAt
             var input: Object = ["vin": request.owner.stableID, "batteryAt": at,
@@ -379,6 +374,12 @@ final class IOSHistoryService: IOSBridgeService {
             }
             guard let point = result["sample"] as? Object, integer(point["t"]) == at else {
                 throw Failure("history_invalid_shared_result")
+            }
+            // KMP 才是最终状态来源；即使原始字段声称充电，也不能把归一化后的未知/停充点落盘。
+            guard integer(point["state"]) == 1 else {
+                var skipped = skippedBatteryRecord(request, at: at)
+                noteDrops(&skipped, loaded)
+                complete(request, skipped); return
             }
             nextSnapshot = candidate.snapshotJSON()
             _ = try validatedSnapshot(nextSnapshot, owner: request.owner, now: clock)
@@ -433,26 +434,53 @@ final class IOSHistoryService: IOSBridgeService {
         complete(request, result)
     }
 
-    // ④ record 的廉价准入。只在「凭本进程已知水位就能确定写不进去」时提前回执，
-    // 拿不准一律返回 nil 走完整读盘，绝不复制 KMP 的采样解析规则。
+    // iOS 只积累明确充电的电池点；车况 state 事件仍独立入账，供停充/充满收尾。
+    // vehicle 来源还必须满足 KMP 的本轮归属条件，不能借缓存车况证明正在充电。
+    private func explicitlyCharging(_ snapshot: Object, _ sample: Object, at: Int64, clock: Int64) -> Bool {
+        guard integer(sample["charging"]) == 1,
+              boundedText(sample["chargeCode"], limit: 32)?.trimmingCharacters(in: .whitespacesAndNewlines) == "1",
+              let source = boundedText(sample["chargeSource"], limit: 16) else { return false }
+        if source == "battery" { return true }
+        return source == "vehicle" && rawEvidence(snapshot, sample, at: at, clock: clock).vehicleOwned
+    }
+
+    private func skippedBatteryRecord(_ request: Request, at: Int64) -> Object {
+        let known = hint.flatMap { $0.owner == request.owner.stableID ? $0 : nil }
+        return ["ok": true, "accepted": false, "persisted": false,
+                "status": "not_charging", "sampleAt": at, "vin": request.scope.vin,
+                "droppedPoints": known?.dropped ?? 0, "droppedSessions": known?.droppedSessions ?? 0,
+                "metadata": metadata(request)]
+    }
+
+    // ④ record 的廉价准入。非充电点即使冷启动也不用读档；节流水位仍只信本 owner 的 hint。
+    // 时间相关的 vehicle 来源用最大合法时钟检查，避免把读盘抬钟后有效的证据提前丢掉。
     private func earlyRecord(_ arguments: Object, _ request: Request) -> Object? {
-        guard let known = hint, known.owner == request.owner.stableID,
-              arguments["accepted"] as? Bool == true, let snapshot = arguments["snapshot"] as? Object,
+        guard arguments["accepted"] as? Bool == true, let snapshot = arguments["snapshot"] as? Object,
               !synthetic(arguments), !synthetic(snapshot),
               let source = arguments["source"] as? String, ["battery", "vehicle"].contains(source) else {
             return nil
         }
         let now = nowMillis()
         guard let at = integer(arguments["sampleAt"]), at > 0, at <= now else { return nil }
+        let known = hint.flatMap { $0.owner == request.owner.stableID ? $0 : nil }
         var base: Object = ["ok": true, "accepted": false, "persisted": false,
                             "vin": request.scope.vin, "metadata": metadata(request)]
-        base["droppedPoints"] = known.dropped
-        base["droppedSessions"] = known.droppedSessions
-        if at <= known.clearAt {
+        base["droppedPoints"] = known?.dropped ?? 0
+        base["droppedSessions"] = known?.droppedSessions ?? 0
+        if let known = known, at <= known.clearAt {
             // 与 record 完整路径相同的清除闸门回执，同样不需要读盘。
             base["status"] = "cleared"; base["clearAt"] = known.clearAt
             return base
         }
+        if source == "battery" {
+            guard snapshot["batteryFresh"] as? Bool == true, integer(snapshot["batteryAt"]) == at,
+                  let sample = snapshot["sample"] as? Object, integer(sample["batteryAt"]) == at,
+                  !synthetic(sample) else { return nil }
+            if !explicitlyCharging(snapshot, sample, at: at, clock: Limit.safeInteger) {
+                return skippedBatteryRecord(request, at: at)
+            }
+        }
+        guard let known = known else { return nil }
         if source == "vehicle" {
             guard snapshot["vehicleFresh"] as? Bool == true, integer(snapshot["vehicleAt"]) == at,
                   let code = boundedText(snapshot["vehicleChargeCode"], limit: 32),
@@ -1222,12 +1250,8 @@ final class IOSHistoryService: IOSBridgeService {
             }
             segments.append(segment)
         }
-        // 超出上限按结束时间丢最旧，和 KMP retainNewest 的口径一致。
-        if segments.count > Limit.sessions {
-            dropped += segments.count - Limit.sessions
-            segments.sort { (integer($0["to"]) ?? 0) > (integer($1["to"]) ?? 0) }
-            segments.removeLast(segments.count - Limit.sessions)
-        }
+        // 场次数不截断；31 天周期由 KMP 按实际读取时钟处理。
+        segments.sort { (integer($0["to"]) ?? 0) > (integer($1["to"]) ?? 0) }
         var current: Any = NSNull()
         if let value = raw["current"] as? Object {
             if Set(value.keys).isSubset(of: ["id", "from"]), boundedText(value["id"], limit: 200) != nil,

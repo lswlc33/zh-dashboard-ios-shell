@@ -87,6 +87,12 @@ internal class BatteryHistory {
             return buildJsonObject {
                 put("ok", true); put("range", range); put("from", from); put("to", now); put("count", inRange.size)
                 put("points", JsonArray(buckets.map { (b, r) -> JsonObject(r.point() + ("b" to JsonPrimitive(b))) }))
+                // 续航证据取原始相邻放电点；超过传输预算不给估值，不截成偏样本。
+                val rangePairs = retained.zipWithNext().filter { (a, b) ->
+                    a.state == 0 && b.state == 0 && b.t - a.t in 1..900_000 &&
+                        a.soc > b.soc && a.soc - b.soc <= 5 && a.odo >= 0 && b.odo > a.odo
+                }
+                put("rangePoints", JsonArray(if (rangePairs.size <= 3000) rangePairs.flatMap { (a, b) -> listOf(a.point(), b.point()) } else emptyList()))
                 put("summary", buildJsonObject {
                     put("socMax", inRange.maxOfOrNull { it.soc }?.let { JsonPrimitive(it) } ?: JsonNull)
                     put("socMin", inRange.minOfOrNull { it.soc }?.let { JsonPrimitive(it) } ?: JsonNull)

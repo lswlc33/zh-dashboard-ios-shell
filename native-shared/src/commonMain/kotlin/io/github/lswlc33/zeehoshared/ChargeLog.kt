@@ -11,7 +11,6 @@ import kotlinx.serialization.json.put
 /** 可重放的纯账本 reducer。段与墓碑由平台持久化，原始样本不在这里复制。 */
 internal object ChargeLog {
     const val VERSION = 3
-    const val MAX_SESSIONS = 12
     const val MAX_POINTS = 600
     private const val MAX_LEDGER_CHARS = 2 * 1024 * 1024
 
@@ -34,7 +33,6 @@ internal object ChargeLog {
             && ledger.long("at", -1) >= ledger.long("clearAt") && ledger.int("state") in -1..2) { "invalid_watermark" }
         val segments = ledger["segments"] as? JsonArray ?: throw IllegalArgumentException("invalid_ledger")
         val legacy = ledger["legacy"] as? JsonArray ?: throw IllegalArgumentException("invalid_ledger")
-        require(segments.size + legacy.size <= MAX_SESSIONS) { "too_many_sessions" }
         val clearAt = ledger.long("clearAt")
         val current = ledger["current"]
         require(current == JsonNull || current is JsonObject) { "invalid_current" }
@@ -85,7 +83,7 @@ internal object ChargeLog {
                     val segments = (ledger["segments"] as JsonArray).toMutableList()
                     segments.add(0, buildJsonObject { put("id", current.text("id")); put("from", current.long("from")); put("to", at) })
                     next["segments"] = JsonArray(segments); next["current"] = JsonNull
-                    retainNewest(next)
+                    retainNewest(next, now)
                 }
                 next["at"] = JsonPrimitive(at); next["state"] = JsonPrimitive(state); next["revision"] = JsonPrimitive(nextRevision(ledger, now))
             }
@@ -114,11 +112,11 @@ internal object ChargeLog {
         val identity = JsonArray(listOf(JsonPrimitive(ledger.text("ownerId")), JsonPrimitive(ledger.text("ownerUid")), JsonPrimitive(ledger.text("vin")), JsonPrimitive(at)))
         return "charge-" + InductiveKeyCodec.hex(platformSha256(identity.toString().encodeToByteArray())).take(32)
     }
-    private fun retainNewest(ledger: MutableMap<String, JsonElement>) {
+    private fun retainNewest(ledger: MutableMap<String, JsonElement>, now: Long) {
         val all = mutableListOf<Pair<Boolean, JsonObject>>()
         (ledger["segments"] as JsonArray).forEach { all += false to (it as JsonObject) }
         (ledger["legacy"] as JsonArray).forEach { all += true to (it as JsonObject) }
-        val kept = all.sortedByDescending { (_, s) -> (s["pts"] as? JsonArray)?.lastOrNull()?.let { (it as JsonObject).long("t") } ?: s.long("to", s.long("from")) }.take(MAX_SESSIONS)
+        val kept = all.sortedByDescending { (_, s) -> (s["pts"] as? JsonArray)?.lastOrNull()?.let { (it as JsonObject).long("t") } ?: s.long("to", s.long("from")) }.filter { (_, s) -> ((s["pts"] as? JsonArray)?.lastOrNull()?.let { (it as JsonObject).long("t") } ?: s.long("to", s.long("from"))) >= now - BatteryHistory.RETENTION_MS }
         ledger["segments"] = JsonArray(kept.filter { !it.first }.map { it.second })
         ledger["legacy"] = JsonArray(kept.filter { it.first }.map { it.second })
     }
@@ -139,7 +137,7 @@ internal object ChargeLog {
         (ledger["segments"] as JsonArray).forEach {
             val s = it as JsonObject
             val from = maxOf(clearAt + 1, s.long("from")); val to = minOf(now, s.long("to"))
-            if (to >= from) sessions += JsonObject(slice(pool, from, to) + mapOf("id" to JsonPrimitive(s.text("id")), "ended" to JsonPrimitive(true), "at" to JsonPrimitive(to)))
+            if (to >= from && to >= now - BatteryHistory.RETENTION_MS) sessions += JsonObject(slice(pool, from, to) + mapOf("id" to JsonPrimitive(s.text("id")), "ended" to JsonPrimitive(true), "at" to JsonPrimitive(to)))
         }
         (ledger["legacy"] as JsonArray).forEach {
             val s = it as JsonObject
@@ -149,7 +147,7 @@ internal object ChargeLog {
         return buildJsonObject {
             put("ok", true); put("version", 2)
             listOf("vin", "ownerId", "ownerUid", "revision", "clearAt", "at", "state").forEach { put(it, ledger[it] ?: JsonNull) }
-            put("current", currentCurve ?: JsonNull); put("sessions", JsonArray(sessions.sortedByDescending { it.long("at") }.take(MAX_SESSIONS)))
+            put("current", currentCurve ?: JsonNull); put("sessions", JsonArray(sessions.sortedByDescending { it.long("at") }))
         }
     }
     private fun sliceLastTime(pool: List<BatteryRecord>, from: Long, to: Long): Long? = pool.lastOrNull { it.t in from..to && it.state == 1 }?.t

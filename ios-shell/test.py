@@ -69,8 +69,77 @@ def literal_constant(path, name):
     return None
 
 
+def check_charging_only_history(root):
+    """只检查原生历史准入/队列边界；源码契约不冒充 Swift 编译或设备实跑。"""
+    history = strip_comments((root / 'History.swift').read_text(encoding='utf-8'))
+    runner = strip_comments((root / 'BackgroundRunner.swift').read_text(encoding='utf-8'))
+
+    def method(source, name):
+        found = re.search(r'^    (?:private )?(?:static )?func ' + re.escape(name)
+                          + r'\([\s\S]*?^    \}', source, re.M)
+        assert found, name
+        return found[0]
+
+    handle = method(history, 'handle')
+    assert handle.index('requireCurrent(request)') < handle.index('self.earlyRecord(') < handle.index('self.load('), \
+        '廉价准入必须在生命周期检查后、读盘前'
+    early = method(history, 'earlyRecord')
+    assert early.index('at <= known.clearAt') < early.index('if source == "battery"'), '已知清除水位优先'
+    assert early.index('skippedBatteryRecord(') < early.index('guard let known = known else'), \
+        '冷启动没有 hint 时也应跳过明确不充电的样本'
+    assert 'integer(snapshot["batteryAt"]) == at' in early and '!synthetic(sample)' in early
+    assert 'clock: Limit.safeInteger' in early, '廉价准入不能误丢读盘抬钟后有效的车况证据'
+    policy = method(history, 'explicitlyCharging')
+    for fragment in ('integer(sample["charging"]) == 1',
+                     'boundedText(sample["chargeCode"], limit: 32)?.trimmingCharacters(in: .whitespacesAndNewlines) == "1"',
+                     'boundedText(sample["chargeSource"], limit: 16)',
+                     'if source == "battery" { return true }',
+                     'source == "vehicle" && rawEvidence(snapshot, sample, at: at, clock: clock).vehicleOwned'):
+        assert fragment in policy, '原生准入必须有一致且属于本轮的充电证据：' + fragment
+    evidence = method(history, 'rawEvidence')
+    for fragment in ('snapshot["vehicleFresh"] as? Bool == true', 'vehicleAt > 0 && vehicleAt <= clock',
+                     'sampleVehicleAt == vehicleAt', 'abs(vehicleAt - at) <= 90_000'):
+        assert fragment in evidence, '车况来源必须保持时钟/归属边界：' + fragment
+    skipped = method(history, 'skippedBatteryRecord')
+    for fragment in ('"ok": true', '"accepted": false', '"persisted": false',
+                     '"status": "not_charging"', '$0.owner == request.owner.stableID', 'metadata(request)'):
+        assert fragment in skipped, '跳过应返回普通、同 owner 的回执：' + fragment
+    assert 'history_non_charging_sample' not in history, '非充电是普通跳过，不能刷失败日志'
+    record = method(history, 'record')
+    assert record.index('at <= clearAt') < record.index('guard explicitlyCharging(') < record.index('candidate.acceptSampleJSON(')
+    assert record.index('candidate.acceptSampleJSON(') < record.index('guard integer(point["state"]) == 1') \
+        < record.index('nextSnapshot = candidate.snapshotJSON()') < record.index('try save('), \
+        'KMP 归一化后的状态必须在生成持久化快照前再次验证'
+    state_guard = record.split('guard integer(point["state"]) == 1', 1)[1].split('nextSnapshot =', 1)[0]
+    assert 'skippedBatteryRecord(' in state_guard and 'complete(request, skipped); return' in state_guard
+    vehicle = record.split('throw Failure("history_unknown_vehicle_state")', 1)[1].split('let revision =', 1)[0]
+    assert 'nextLedger = try reduce(previous.ledger' in vehicle and '"state": state' in vehicle, \
+        '停充/充满仍应通过车况事件收尾账本'
+    assert 'snapshotJSON' not in vehicle and 'acceptSampleJSON' not in vehicle, '车况事件不能借旧 SOC 补点'
+
+    queue = runner.split('enum IOSBackgroundSampleQueue {', 1)[1].split('enum IOSBackgroundHistory {', 1)[0]
+    append = method(queue, 'append')
+    assert append.index('guard sample.charging == true') < append.index('queue.async'), '不充电的新点无需排队或读盘'
+    assert append.index('context?.canDeliver != false') < append.index('Data(contentsOf: url)'), '撤销后不能读写队列'
+    assert 'map { chargingSamples($0) }' in append and 'items.append(sample)' in append, '追加时滤掉旧非充电点'
+    filtered = method(queue, 'chargingSamples')
+    assert '$0.charging == true' in filtered and '$0.socPercent.isFinite' in filtered \
+        and '(0...100).contains($0.socPercent)' in filtered, '队列只返回明确充电的真实有效 SOC'
+    assert 'return chargingSamples(data)' in method(queue, 'take'), 'take 不能输出旧非充电点'
+    assert 'return chargingSamples(data).count' in method(queue, 'count'), '待合并计数应与 take 一致'
+    assert 'guard sample.charging == true, let soc = sample.socPercent' in runner
+    assert 'report.lastResult = "ok"; report.lastSocPercent = sample.socPercent' in runner, '最新状态应继续显示非充电 SOC'
+    assert 'if let charging = sample.charging { report.lastCharging = charging }' in runner
+    assert 'IOSSystemSurfacesService.acceptBackgroundSample(sample, credential: credential, context: context)' in runner
+    assert 'IOSBackgroundNotifier.post(id: "charge-change"' in runner
+
+
 def main():
     root = pathlib.Path(__file__).resolve().parent
+    if sys.argv[1:] == ['--charging-history-only']:
+        check_charging_only_history(root)
+        print('iOS charging-only history/queue source contracts passed (no Apple compilation or device validation)')
+        return
     repo = root.parent
     with (root / 'Info.plist').open('rb') as f:
         info = plistlib.load(f)
@@ -421,6 +490,7 @@ def main():
     # 必须走待合并队列，由前台用 history.record 入账。
     assert 'IOSBackgroundSampleQueue' in runner, '后台采样必须走待合并队列'
     assert 'IOSHistoryService' not in runner, '后台不能直接调 IOSHistoryService（会破坏历史文件格式）'
+    check_charging_only_history(root)
     # 收尾已并入充电状态协调：缺测不结束，明确停充只结束 charging 活动。
     charging = strip_comments(surfaces_src).split('private func reconcileCharging(', 1)[1].split('private func endCharging(', 1)[0]
     assert 'let charging = vehicle.charging' in charging, '充电状态缺测不能当停充'

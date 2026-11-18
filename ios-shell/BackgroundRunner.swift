@@ -327,11 +327,20 @@ enum IOSBackgroundSampleQueue {
         return root.appendingPathComponent(fileName, isDirectory: false)
     }
 
+    // 旧版队列可能含停充/未知点；只过滤待合并队列，不碰已经存下的历史档案。
+    private static func chargingSamples(_ data: Data) -> [Sample] {
+        ((try? JSONDecoder().decode([Sample].self, from: data)) ?? []).filter {
+            $0.charging == true && $0.socPercent.isFinite && (0...100).contains($0.socPercent)
+        }
+    }
+
     static func append(_ sample: Sample, context: IOSBackgroundRunContext? = nil) {
+        guard sample.charging == true, sample.socPercent.isFinite,
+              (0...100).contains(sample.socPercent) else { return }
         queue.async {
             guard context?.canDeliver != false else { return }
             guard let url = fileURL else { return }
-            var items = (try? Data(contentsOf: url)).flatMap { try? JSONDecoder().decode([Sample].self, from: $0) } ?? []
+            var items = (try? Data(contentsOf: url)).map { chargingSamples($0) } ?? []
             // 同一毫秒的重复点直接替换：后台与前台可能几乎同时采到同一秒。
             items.removeAll { $0.vin == sample.vin && $0.capturedAt == sample.capturedAt }
             items.append(sample)
@@ -349,7 +358,7 @@ enum IOSBackgroundSampleQueue {
         queue.sync {
             guard let url = fileURL, let data = try? Data(contentsOf: url) else { return [] }
             try? FileManager.default.removeItem(at: url)
-            return (try? JSONDecoder().decode([Sample].self, from: data)) ?? []
+            return chargingSamples(data)
         }
     }
 
@@ -357,7 +366,7 @@ enum IOSBackgroundSampleQueue {
     static func count() -> Int {
         queue.sync {
             guard let url = fileURL, let data = try? Data(contentsOf: url) else { return 0 }
-            return ((try? JSONDecoder().decode([Sample].self, from: data)) ?? []).count
+            return chargingSamples(data).count
         }
     }
 }
@@ -365,8 +374,8 @@ enum IOSBackgroundSampleQueue {
 enum IOSBackgroundHistory {
     static func append(sample: IOSBackgroundClient.VehicleSample, credential: IOSBackgroundCredential,
                        context: IOSBackgroundRunContext) {
-        // 电量缺失时没有任何可记录的量，直接跳过（不记 0）。
-        guard let soc = sample.socPercent, soc >= 0, soc <= 100 else { return }
+        // 只把明确正在充电的样本排进前台合并队列，避免非充电时的电量点占用本机空间。
+        guard sample.charging == true, let soc = sample.socPercent, soc >= 0, soc <= 100 else { return }
         IOSBackgroundSampleQueue.append(IOSBackgroundSampleQueue.Sample(
             vin: credential.vin, capturedAt: sample.capturedAt,
             socPercent: soc, charging: sample.charging), context: context)
