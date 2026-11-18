@@ -161,12 +161,10 @@ struct ZeehoVehicleProvider: TimelineProvider {
             local.requestID = requestID
             WidgetDiagnostics.record(.localReadFinished, snapshot: local.snapshot, origin: local.origin.rawValue,
                 reason: local.diagnosticReason, requestID: requestID, family: family, elapsedMs: Self.elapsed(start))
-            if local.snapshot != nil {
-                let timeline = Self.timeline(entry: local, now: Date())
-                // 给自取请求一个短窗口；本地结果仍先于纯内存截止兜底交付。
-                DispatchQueue.global(qos: .userInitiated).asyncAfter(deadline: .now() + 3) {
-                    gate.finish(timeline)
-                }
+            if local.snapshot?.vehicle != nil {
+                // 已有车况立即交付，不能再等网络窗口、消耗系统给扩展的执行预算。
+                // 自取请求仍可更新缓存；一次请求只由 gate 接受首个结果。
+                gate.finish(Self.timeline(entry: local, now: Date()))
             }
         }
         Task {

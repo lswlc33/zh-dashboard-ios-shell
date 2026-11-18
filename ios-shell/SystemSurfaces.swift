@@ -938,6 +938,9 @@ final class IOSSystemSurfacesService: NSObject, IOSBridgeService, IOSBridgeCance
         let deliveredOwner = delivered?["ownerID"] as? String
         let executionState = widgetSnapshotReadError ?? (!approved ? "disabled"
             : deliveredOwner == owner?.ownerIdentifierString && deliveredOwner != nil ? "timeline_delivered"
+            : delivered != nil ? "timeline_without_current_vehicle"
+            : widgetExecution[WidgetDiagnostics.Phase.timelineStarted.rawValue] != nil ? "timeline_in_progress"
+            : widgetExecution[WidgetDiagnostics.Phase.snapshotStarted.rawValue] != nil ? "snapshot_only"
             : widgetExecution[WidgetDiagnostics.Phase.launch.rawValue] != nil ? "awaiting_timeline"
             : "extension_not_observed")
         return ["ok": true, "supported": supported, "enabled": supported && approved,
