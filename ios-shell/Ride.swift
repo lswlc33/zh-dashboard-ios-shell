@@ -1349,27 +1349,37 @@ final class IOSRideService: NSObject, IOSBridgeService, IOSBridgeCancellableServ
         // not_recorded 是无文件终态，公共 UI 按 completed 退役；保留 nativeRecordState 解释真实原因。
         let saved = (run.completed && !run.saveFailed) || run.empty
         var value = permissionProjection(gpsValue, ble)
-        value.merge(["ok": true, "accepted": false, "id": run.id.uuidString.lowercased(), "ticket": run.id.uuidString.lowercased(),
+        // 这个合并字面量字段太多，整块交给类型检查器会超时（Xcode 26 实测报
+        // "unable to type-check this expression in reasonable time"），所以按语义拆成三小段。
+        let identity: [String: Any] = ["ok": true, "accepted": false,
+            "id": run.id.uuidString.lowercased(), "ticket": run.id.uuidString.lowercased(),
             "recordingId": run.id.uuidString.lowercased(), "state": run.state,
             "sourceLeaseId": run.sourceLeaseID as Any? ?? NSNull(),
             "sourceConnectionGeneration": run.sourceConnectionGeneration as Any? ?? NSNull(),
-            "connectionGeneration": live && bluetooth.connected ? ble["connectionGeneration"] ?? NSNull() : NSNull(),
             "nativeAuthenticated": sameLease, "authorizationFresh": sameLease, "canAcceptTelemetry": sameLease,
-            "canObserveTelemetry": live && bluetooth.canObserveTelemetry,
             "recordState": IOSRideJSON.publicRecordState(run.recordState), "nativeRecordState": run.recordState,
-            "reason": run.reason, "startedAt": run.startedAt, "endedAt": run.endedAt as Any? ?? NSNull(),
-            "samples": run.samples, "recordedSamples": run.samples, "elapsedMs": run.elapsedMs, "durationMs": run.durationMs,
-            "gps": gpsValue, "gpsEnabled": run.gpsWanted, "gpsOver50": run.gpsOver50,
+            "reason": run.reason, "startedAt": run.startedAt, "endedAt": run.endedAt as Any? ?? NSNull()]
+        let connection: [String: Any] = [
+            "connectionGeneration": live && bluetooth.connected ? ble["connectionGeneration"] ?? NSNull() : NSNull(),
+            "canObserveTelemetry": live && bluetooth.canObserveTelemetry,
             "connected": live && bluetooth.connected,
             "telemetry": readings["telemetry"] ?? [:], "telemetryTimes": readings["telemetryTimes"] ?? [:],
             "fields": live && bluetooth.connected ? run.latestBLEFields : [:],
             "telemetryRunning": live && bleFresh(run), "dashSeen": live && run.latestBLETimes["speedKph"] != nil,
             "dashRunning": live && (readings["telemetryTimes"] as? [String: Int64])?["speedKph"] != nil,
-            "dashConfirmed": false, "backgroundRequested": run.backgroundWanted,
+            "dashConfirmed": false]
+        let progress: [String: Any] = [
+            "samples": run.samples, "recordedSamples": run.samples,
+            "elapsedMs": run.elapsedMs, "durationMs": run.durationMs,
+            "gps": gpsValue, "gpsEnabled": run.gpsWanted, "gpsOver50": run.gpsOver50,
+            "backgroundRequested": run.backgroundWanted,
             "backgroundEnabled": live && (gps.backgroundAllowed || ble["backgroundEnabled"] as? Bool == true),
             "backgroundGuaranteed": false, "busy": run.saveInFlight || run.recordState == "saving",
             "finished": saved, "saved": saved, "retryAvailable": run.saveFailed, "savedBytes": run.savedBytes,
-            "orphans": orphanSummary(), "report": report(run)]) { _, new in new }
+            "orphans": orphanSummary(), "report": report(run)]
+        value.merge(identity) { _, new in new }
+        value.merge(connection) { _, new in new }
+        value.merge(progress) { _, new in new }
         if run.empty {
             value["reason"] = "no_samples"
             value["summary"] = IOSRideText.notRecorded
