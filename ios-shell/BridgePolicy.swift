@@ -17,7 +17,7 @@ enum IOSBridgePolicy {
         "file.share", "file.save", "photos.save", "clipboard.read", "clipboard.write", "media.permission",
         "notifications.request", "notifications.schedule", "notifications.cancel", "app.settings",
         "gps.begin", "ble.scan", "ble.connect", "ble.write", "ride.begin", "history.clear",
-        "system.snapshot", "liveActivity.start", "liveActivity.end", "panel.update",
+        "system.snapshot", "system.displayPreference", "liveActivity.start", "liveActivity.end", "panel.update",
         "ui.confirm", "wifi.join", "network.open", "blob.pick", "ble.open", "ble.systemPairing",
         "ble.diagnostic.open", "session.renew.prepare", "compat.call", "cast.start",
         // 本地实验壁纸 ZIP 构建+MD5 可能超默认 30s；与 ios-bridge.js 的 INTERACTIVE 逐项对齐，

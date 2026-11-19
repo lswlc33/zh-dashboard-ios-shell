@@ -249,7 +249,8 @@ enum ZeehoWidgetReader {
         // 显示开关只是装饰：配置文件坏了也必须照样显示车况，不能连带吞掉快照。
         let settings = (try? SystemSnapshotStore.currentOwner())
             .flatMap { try? SystemSnapshotStore.widgetSettings(expectedOwner: $0) }
-        return ZeehoVehicleEntry(date: date, snapshot: snapshot, requiresRefresh: false,
+        let projected = SystemSnapshotStore.applyingDualDisplay(snapshot)
+        return ZeehoVehicleEntry(date: date, snapshot: projected, requiresRefresh: false,
             showName: showName ?? settings?.showName ?? true,
             showTime: showTime ?? settings?.showTime ?? true,
             darkMode: settings?.darkMode ?? -1,

@@ -161,9 +161,13 @@ struct WidgetStatValue {
         case .soc: return WidgetStatValue(label: field.title, value: num(vehicle.visibleSOCPercent(at: date)), unit: "%")
         case .range: return WidgetStatValue(label: field.title, value: statsFresh ? km(vehicle.rangeKm) : "—", unit: "km")
         case .voltage: return WidgetStatValue(label: field.title, value: num(vehicle.visibleVoltage(at: date), 1), unit: "V")
-        case .current: return WidgetStatValue(label: field.title, value: num(vehicle.visibleCurrent(at: date), 1), unit: "A")
+        case .current:
+            let rate = vehicle.dualDisplay == true ? 2.0 : 1.0
+            return WidgetStatValue(label: field.title,
+                value: num(vehicle.visibleCurrent(at: date).map { $0 * rate }, 1), unit: "A")
         case .power:
-            let watts = vehicle.visiblePower(at: date)
+            let rate = vehicle.dualDisplay == true ? 2.0 : 1.0
+            let watts = vehicle.visiblePower(at: date).map { $0 * rate }
             if let watts = watts, abs(watts) >= 1000 {
                 return WidgetStatValue(label: field.title, value: String(format: "%.1f", watts / 1000), unit: "kW")
             }

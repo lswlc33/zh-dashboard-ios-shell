@@ -348,7 +348,7 @@ private actor IOSLiveActivityManager {
 
 final class IOSSystemSurfacesService: NSObject, IOSBridgeService, IOSBridgeCancellableService,
                                       IOSSystemSurfacePublisher {
-    let methods = ["system.surfaces.status", "system.snapshot", "liveActivity.start", "liveActivity.update", "liveActivity.end", "widgets.reload"]
+    let methods = ["system.surfaces.status", "system.snapshot", "system.displayPreference", "liveActivity.start", "liveActivity.update", "liveActivity.end", "widgets.reload"]
     // 与扩展里的 `ZeehoWidgetKind.vehicle` 必须是同一个字符串（扩展在 Widgets 模块，
     // Host 不链接它，所以只能各写一份常量）。test.py 会断言两边一致。
     // **这个字符串是已发布的对外契约，永远不要改**：WidgetKit 按 kind 归档已放置实例，
@@ -680,6 +680,16 @@ final class IOSSystemSurfacesService: NSObject, IOSBridgeService, IOSBridgeCance
             let job = try begin(method, args: args, reply: reply)
             operation = job
             switch method {
+            case "system.displayPreference":
+                try validateAction(options, allowing: ["dualDisplay"], includeID: false)
+                guard Set(options.keys).isSubset(of: ["accountId", "vin", "generation", "dualDisplay"]),
+                      let enabled = try optionalBoolean(options["dualDisplay"]),
+                      let selected = owner, selected.accountVINHash == current.ownerHash else {
+                    throw SystemSnapshotError("invalid_args")
+                }
+                try SystemSnapshotStore.writeDualDisplay(enabled, expectedOwner: selected)
+                _ = reloadWidgets(force: true, snapshot: latest)
+                finish(job, ["ok": true, "stored": true, "dualDisplay": enabled])
             case "system.snapshot":
                 if try optionalBoolean(options["enable"]) == false {
                     try validateSnapshotKeys(options)
@@ -987,7 +997,7 @@ final class IOSSystemSurfacesService: NSObject, IOSBridgeService, IOSBridgeCance
             "voltage", "current", "power", "lockState", "seatState", "online",
             "todayMileKm", "lastMileKm", "lastRideMinutes", "totalMileKm", "rangeKm",
             "integral", "unread", "tireFrontBar", "tireRearBar",
-            "tireFrontTemp", "tireRearTemp", "statsUpdatedAt", "artUrl"]
+            "tireFrontTemp", "tireRearTemp", "statsUpdatedAt", "dualDisplay", "artUrl"]
         guard Set(options.keys).isSubset(of: allowed) else { throw SystemSnapshotError("invalid_args") }
     }
     private func vehicleSnapshot(_ options: [String: Any], scope: IOSRideScope) throws -> SystemVehicleSnapshot {
@@ -1037,6 +1047,7 @@ final class IOSSystemSurfacesService: NSObject, IOSBridgeService, IOSBridgeCance
         let tireRear = try number(options["tireRearBar"], range: 0...20)
         let tireFrontTemp = try number(options["tireFrontTemp"], range: -60...200)
         let tireRearTemp = try number(options["tireRearTemp"], range: -60...200)
+        let dualDisplay = try optionalBoolean(options["dualDisplay"]) == true
         // 统计时间用宽窗口：这些量本来就不是秒级刷新，按 180 秒判会整块恒为空。
         let statsAt = try statsTimestamp(options["statsUpdatedAt"])
         guard (statsAt == nil) == (voltage == nil && current == nil && power == nil && lockState == nil
@@ -1059,7 +1070,8 @@ final class IOSSystemSurfacesService: NSObject, IOSBridgeService, IOSBridgeCance
             online: online, todayMileKm: todayMile, lastMileKm: lastMile, lastRideMinutes: lastMinutes,
             totalMileKm: totalMile, rangeKm: rangeKm, integral: integral, unread: unread,
             tireFrontBar: tireFront, tireRearBar: tireRear,
-            tireFrontTemp: tireFrontTemp, tireRearTemp: tireRearTemp, statsUpdatedAt: statsAt)
+            tireFrontTemp: tireFrontTemp, tireRearTemp: tireRearTemp, statsUpdatedAt: statsAt,
+            dualDisplay: dualDisplay)
     }
     private func timestamp(_ value: Any?) throws -> Int64? {
         guard let value = value, !(value is NSNull) else { return nil }
@@ -1392,7 +1404,7 @@ final class IOSSystemSurfacesService: NSObject, IOSBridgeService, IOSBridgeCance
             rangeKm: previous?.rangeKm, integral: previous?.integral, unread: previous?.unread,
             tireFrontBar: previous?.tireFrontBar, tireRearBar: previous?.tireRearBar,
             tireFrontTemp: previous?.tireFrontTemp, tireRearTemp: previous?.tireRearTemp,
-            statsUpdatedAt: previous?.statsUpdatedAt)
+            statsUpdatedAt: previous?.statsUpdatedAt, dualDisplay: previous?.dualDisplay == true)
         do {
             let value = try candidate(vehicle: vehicle)
             try persist(value, job: nil, context: event.context)

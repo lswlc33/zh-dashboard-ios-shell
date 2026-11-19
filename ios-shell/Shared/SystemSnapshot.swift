@@ -80,6 +80,8 @@ public struct SystemVehicleSnapshot: Codable, Equatable, Hashable, Sendable {
     public let tireFrontTemp: Double?    // 前胎温度
     public let tireRearTemp: Double?     // 后胎温度
     public let statsUpdatedAt: Int64?    // 上述统计字段的统一采样时间
+    /// 仅用于系统展示的双电倍率；旧快照缺字段时默认单电，原始 current/power 永远保持单倍。
+    public let dualDisplay: Bool?
 
     public init(name: String? = nil, vinDisplaySuffix: String? = nil, socPercent: Double? = nil,
                 socUpdatedAt: Int64? = nil, charging: Bool? = nil, chargingUpdatedAt: Int64? = nil,
@@ -89,7 +91,8 @@ public struct SystemVehicleSnapshot: Codable, Equatable, Hashable, Sendable {
                 todayMileKm: Double? = nil, lastMileKm: Double? = nil, lastRideMinutes: Double? = nil,
                 totalMileKm: Double? = nil, rangeKm: Double? = nil, integral: Double? = nil, unread: Int? = nil,
                 tireFrontBar: Double? = nil, tireRearBar: Double? = nil,
-                tireFrontTemp: Double? = nil, tireRearTemp: Double? = nil, statsUpdatedAt: Int64? = nil) {
+                tireFrontTemp: Double? = nil, tireRearTemp: Double? = nil, statsUpdatedAt: Int64? = nil,
+                dualDisplay: Bool? = false) {
         self.name = name; self.vinDisplaySuffix = vinDisplaySuffix; self.socPercent = socPercent
         self.socUpdatedAt = socUpdatedAt; self.charging = charging; self.chargingUpdatedAt = chargingUpdatedAt
         self.chargeProgressPercent = chargeProgressPercent; self.chargeProgressUpdatedAt = chargeProgressUpdatedAt
@@ -101,6 +104,7 @@ public struct SystemVehicleSnapshot: Codable, Equatable, Hashable, Sendable {
         self.tireFrontBar = tireFrontBar; self.tireRearBar = tireRearBar
         self.tireFrontTemp = tireFrontTemp; self.tireRearTemp = tireRearTemp
         self.statsUpdatedAt = statsUpdatedAt
+        self.dualDisplay = dualDisplay == true
     }
     // 云端时间是接口同步时间，不宣称是传感器时间；缺时间或超过 maxAgeSeconds 一律显示未知。
     //

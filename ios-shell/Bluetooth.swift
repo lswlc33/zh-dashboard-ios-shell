@@ -567,6 +567,8 @@ final class IOSBluetoothService: NSObject, IOSBridgeService, IOSBridgeCancellabl
 
     private func openPipe(_ options: [String: Any], diagnostic: Bool = false, reply: @escaping (Any?, String?) -> Void) {
         guard UIApplication.shared.applicationState == .active else { reply(failure("foreground_required"), nil); return }
+        // 扫描确认/授权仍在途时不能开连接，避免 scan 收尾覆盖连接状态。
+        guard scanCall == nil, !scanRequested, central?.isScanning != true else { reply(failure("scan_busy"), nil); return }
         guard pipeOpenCall == nil, pipePairCall == nil, pipeExchange == nil, operation == nil,
               currentRequest == nil, requests.isEmpty, connectCall == nil, confirmationCall == nil else {
             reply(failure("operation_busy"), nil); return
@@ -900,8 +902,14 @@ final class IOSBluetoothService: NSObject, IOSBridgeService, IOSBridgeCancellabl
         observers.removeValue(forKey: id)
     }
 
+    func foregroundTelemetrySource() -> (leaseID: String, generation: String)? {
+        precondition(Thread.isMainThread)
+        guard let lease = pipeLease, lease.purpose == "telemetry", pipeCurrent(lease) else { return nil }
+        return (lease.id.uuidString.lowercased(), lease.generation.uuidString.lowercased())
+    }
     func setRecordingContext(id: UUID?, background: Bool, scope: IOSRideScope?) {
         precondition(Thread.isMainThread)
+        let wasRecording = recordingID != nil
         if recordingID != id || recordingScope != scope {
             detachRecordingAuthorization(); renewalBoundRecordingID = nil
             if id != nil {
@@ -912,6 +920,10 @@ final class IOSBluetoothService: NSObject, IOSBridgeService, IOSBridgeCancellabl
         recordingID = id
         recordingBackground = id != nil && background
         recordingScope = scope
+        if wasRecording && id == nil {
+            // 停止/暂停立即排空旧录制连接；过期的只读 lease 不能变成可写前台租约。
+            closeConnection("recording_ended"); return
+        }
         if legacyObservationLease == nil, let id = id, let scope = scope, let lease = pipeLease,
            pipeCurrent(lease), lease.purpose == "telemetry", lease.authorization.scope == scope,
            let run = actualRecordingProvider?(), run.id == id, run.scope == scope {
@@ -1204,7 +1216,9 @@ final class IOSBluetoothService: NSObject, IOSBridgeService, IOSBridgeCancellabl
 
     private func scan(_ options: [String: Any], reply: @escaping (Any?, String?) -> Void) {
         guard userAction(options) else { reply(failure("user_action_required"), nil); return }
-        guard scanCall == nil else { reply(failure("scan_busy"), nil); return }
+        guard scanCall == nil, !scanRequested, central?.isScanning != true else { reply(failure("scan_busy"), nil); return }
+        guard pipeOpenCall == nil, connectCall == nil, peripheral == nil, operation == nil,
+              currentRequest == nil, requests.isEmpty else { reply(failure("operation_busy"), nil); return }
         let timeout = (options["timeoutMs"] as? NSNumber)?.doubleValue ?? 10000
         guard timeout.isFinite, timeout >= 1000, timeout <= 15000 else { reply(failure("invalid_timeout"), nil); return }
         let serviceTexts = options["services"] as? [String] ?? [Self.serviceUUID.uuidString]
@@ -1238,6 +1252,7 @@ final class IOSBluetoothService: NSObject, IOSBridgeService, IOSBridgeCancellabl
 
     private func startScan() {
         guard scanRequested, scanCall != nil, central?.state == .poweredOn,
+              pipeOpenCall == nil, connectCall == nil, peripheral == nil, operation == nil,
               UIApplication.shared.applicationState == .active,
               ProcessInfo.processInfo.systemUptime < scanDeadline else { return }
         // iOS 不提供 MAC；只扫真实车辆服务，默认不重复广播，无无界附近设备收集。
@@ -1260,6 +1275,7 @@ final class IOSBluetoothService: NSObject, IOSBridgeService, IOSBridgeCancellabl
 
     private func connect(_ options: [String: Any], reply: @escaping (Any?, String?) -> Void) {
         guard userAction(options) else { reply(failure("user_action_required"), nil); return }
+        guard scanCall == nil, !scanRequested, central?.isScanning != true else { reply(failure("scan_busy"), nil); return }
         guard let scope = scopeProvider?(), scope.valid else { reply(failure("authorized_vehicle_required"), nil); return }
         guard let text = options["id"] as? String, let id = UUID(uuidString: text) else {
             reply(failure("uuid_required_not_mac"), nil); return

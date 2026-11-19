@@ -34,6 +34,9 @@ final class IOSCastService: IOSBridgeCancellableService {
     private var wifiMonitor: NWPathMonitor?
     private var wifiConnected = false
     private var wifiKnown = false
+    private var wifiRouteReason = "wifi_required"
+    private var wifiPath: Network.NWPath?
+    private var activeRoute: IOSCastRoute?
     private var diagnostics: [[String: Any]] = []
     private var lastDiagnostic = ""
     private var selectionIsPending = false
@@ -48,11 +51,12 @@ final class IOSCastService: IOSBridgeCancellableService {
         let monitor = NWPathMonitor(requiredInterfaceType: .wifi)
         wifiMonitor = monitor
         monitor.pathUpdateHandler = { [weak self] path in
-            let connected = path.status == .satisfied && path.usesInterfaceType(.wifi)
+            let connected = IOSWiFiRouteChecks.pathError(path) == nil
             DispatchQueue.main.async { [weak self] in
                 guard let self = self else { return }
-                self.wifiKnown = true; self.wifiConnected = connected
-                if !connected, self.sessionID != nil { self.revoke(reason: "wifi_disconnected") }
+                self.wifiKnown = true; self.wifiConnected = connected; self.wifiPath = path
+                self.wifiRouteReason = IOSWiFiRouteChecks.pathError(path) ?? ""
+                if let route = self.activeRoute, let error = route.pathError(path) { self.revoke(reason: error) }
             }
         }
         monitor.start(queue: DispatchQueue(label: "io.github.lswlc33.dashboard.ios.cast.wifi"))
@@ -262,7 +266,7 @@ final class IOSCastService: IOSBridgeCancellableService {
     }
     private func environmentError() -> Any {
         if let missing = integrationReason() { return missing }
-        if wifiKnown && !wifiConnected { return "wifi_required" }
+        if wifiKnown && !wifiConnected { return wifiRouteReason.isEmpty ? "wifi_required" : wifiRouteReason }
         return NSNull()
     }
     private func capabilities() -> [String: Any] {
@@ -283,12 +287,14 @@ final class IOSCastService: IOSBridgeCancellableService {
             throw IOSCastError.reason("session_active")
         }
         if let missing = integrationReason() { throw IOSCastError.reason(missing) }
-        guard wifiKnown, wifiConnected else { throw IOSCastError.reason("wifi_required") }
+        guard wifiKnown, wifiConnected else { throw IOSCastError.reason(wifiRouteReason.isEmpty ? "wifi_path_unavailable" : wifiRouteReason) }
         guard UIApplication.shared.applicationState == .active, let presenter = presenterProvider?(),
               presenter.viewIfLoaded?.window != nil, presenter.presentedViewController == nil else {
             throw IOSCastError.reason("cast_presenter_unavailable")
         }
         let target = try IOSCastTarget.validate(options["targetIP"] as? String ?? selectedTarget ?? "")
+        guard let path = wifiPath else { throw IOSCastError.reason("wifi_path_unavailable") }
+        let route = try IOSCastRoute.capture(path, targetIP: target)
         let recipe = try options["recipe"].map { try IOSCastRecipe.from($0) } ?? selectedRecipe
         guard let recipe = recipe else { throw IOSCastError.reason("cast_recipe_required") }
         let settingOptions = options["settings"] as? [String: Any] ?? options
@@ -300,10 +306,11 @@ final class IOSCastService: IOSBridgeCancellableService {
         guard let extensionID = broadcastExtensionID() else { throw IOSCastError.reason("broadcast_extension_missing") }
         let now = Date().timeIntervalSince1970
         let id = UUID().uuidString
-        let grant = IOSCastGrant(version: 1, id: id, extensionID: extensionID, targetIP: target, issuedAt: now, selectBefore: now + 120,
+        let grant = IOSCastGrant(version: 1, id: id, extensionID: extensionID, targetIP: target, route: route, issuedAt: now, selectBefore: now + 120,
                                  endBefore: now + 7200, revoked: false, reason: "", settings: settings, recipe: recipe)
         try mailbox.setGrant(grant)
-        sessionID = id; activeCall = call; activeScope = scope; selectionDeadline = grant.selectBefore; selectionIsPending = true
+        sessionID = id; activeCall = call; activeScope = scope; activeRoute = route
+        selectionDeadline = grant.selectBefore; selectionIsPending = true
         localPhase = "provisioning"; localReason = "waiting_user_broadcast_confirmation"
         let controller = IOSCastPickerController(extensionID: extensionID)
         controller.onCancelled = { [weak self] in
@@ -322,6 +329,7 @@ final class IOSCastService: IOSBridgeCancellableService {
         guard let id = sessionID else { return }
         let isRevoked = (try? mailbox?.grant())?.revoked == true
         if !isRevoked, let scope = activeScope, scopeProvider?() != scope { revoke(reason: "stale_session"); return }
+        if !isRevoked, let route = activeRoute, let error = route.sourceError() { revoke(reason: error); return }
         if let heartbeat = try? mailbox?.heartbeat(), heartbeat.id == id, heartbeat.version == 1, heartbeat.fresh {
             if heartbeat.broadcastActive {
                 if isRevoked { localPhase = "stopping"; return }
@@ -367,7 +375,7 @@ final class IOSCastService: IOSBridgeCancellableService {
     }
     private func finishLocal() {
         if let controller = pickerController { controller.onCancelled = nil; controller.dismiss(animated: true); pickerController = nil }
-        sessionID = nil; activeCall = nil; activeScope = nil; selectionIsPending = false
+        sessionID = nil; activeCall = nil; activeScope = nil; activeRoute = nil; selectionIsPending = false
     }
     private func snapshot() -> [String: Any] {
         let heartbeat: IOSCastHeartbeat? = {

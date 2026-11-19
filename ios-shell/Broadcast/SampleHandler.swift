@@ -37,6 +37,8 @@ final class IOSCastBroadcastEngine {
     private var ports: IOSCastRecipe.Ports { grant!.recipe.ports }
     private var recipe: IOSCastRecipe { grant!.recipe }
     private var timer: DispatchSourceTimer?
+    private var routeMonitor: NWPathMonitor?
+    private var routePath: Network.NWPath?
     private var finish: ((String) -> Void)?
     private var observing = false
     private var active = false
@@ -102,6 +104,10 @@ final class IOSCastBroadcastEngine {
                 if let heartbeat = try? mailbox.heartbeat(), heartbeat.id == grant.id, heartbeat.fresh, heartbeat.broadcastActive {
                     throw IOSCastError.reason("cast_session_active")
                 }
+                guard let route = grant.route, route.valid, route.targetIP == grant.targetIP else {
+                    throw IOSCastError.reason("cast_route_required")
+                }
+                if let error = route.sourceError() { throw IOSCastError.reason(error) }
                 self.mailbox = mailbox; self.grant = grant; self.settings = grant.settings; self.active = true
                 self.lastSampleAt = ProcessInfo.processInfo.systemUptime
                 self.observe()
@@ -109,7 +115,18 @@ final class IOSCastBroadcastEngine {
                 timer.schedule(deadline: .now(), repeating: .milliseconds(250))
                 timer.setEventHandler { [weak self] in self?.tick() }
                 self.timer = timer; timer.resume()
-                self.beginAttempt()
+                // 扩展重新解析同一个真实接口；未收到路径证据前不监听或探测。
+                self.attemptStarted = ProcessInfo.processInfo.systemUptime
+                let monitor = NWPathMonitor(requiredInterfaceType: .wifi)
+                self.routeMonitor = monitor
+                monitor.pathUpdateHandler = { [weak self] path in
+                    guard let self = self, self.active else { return }
+                    if let error = route.pathError(path) { self.fail(error); return }
+                    let firstPath = self.routePath == nil
+                    self.routePath = path
+                    if firstPath { self.beginAttempt() }
+                }
+                monitor.start(queue: self.queue)
             } catch { self.fail(IOSCastError.code(error)) }
         }
     }
@@ -130,7 +147,8 @@ final class IOSCastBroadcastEngine {
         lastGrantCheckAt = now
         do {
             let current = try mailbox.grant()
-            guard current.id == old.id, current.extensionID == old.extensionID, current.targetIP == old.targetIP, !current.revoked,
+            guard current.id == old.id, current.extensionID == old.extensionID, current.targetIP == old.targetIP,
+                  current.route == old.route, !current.revoked,
                   Date().timeIntervalSince1970 < current.endBefore else {
                 fail(current.reason.isEmpty ? "cast_session_revoked" : current.reason); return false
             }
@@ -144,7 +162,9 @@ final class IOSCastBroadcastEngine {
         } catch { fail("cast_grant_unavailable"); return false }
     }
     private func beginAttempt() {
-        guard active, checkGrant(), let grant = grant else { return }
+        guard active, checkGrant(), let grant = grant, let route = grant.route, let path = routePath else { return }
+        if let error = route.pathError(path) { fail(error); return }
+        guard let interface = route.interface(in: path) else { fail("cast_interface_changed"); return }
         teardownTransport()
         generation &+= 1
         let epoch = generation
@@ -153,7 +173,8 @@ final class IOSCastBroadcastEngine {
         plan = nil; probeAccepted = false; phase = retries == 0 ? "provisioning" : "adapting"
         do {
             for port in [ports.data, ports.media, ports.control] {
-                let listener = try NWListener(using: IOSCastTarget.wifiParameters(), on: NWEndpoint.Port(rawValue: port)!)
+                let parameters = try route.parameters(interface: interface, port: NWEndpoint.Port(rawValue: port)!)
+                let listener = try NWListener(using: parameters)
                 listeners[port] = listener
                 listener.stateUpdateHandler = { [weak self, weak listener] state in
                     guard let self = self, self.active, self.generation == epoch, let listener = listener,
@@ -163,7 +184,8 @@ final class IOSCastBroadcastEngine {
                         self.listenerReady.insert(port)
                         if self.listenerReady.count == 3 { self.beginProbe(epoch: epoch, target: grant.targetIP) }
                     case let .failed(error):
-                        self.fail(IOSCastError.network(error) == "local_network_permission_denied" ? "local_network_permission_denied" : "listener_port_unavailable")
+                        let code = IOSCastError.network(error)
+                        self.fail(IOSCastError.routeFailure(code) ? code : "listener_port_unavailable")
                     default: break
                     }
                 }
@@ -179,17 +201,25 @@ final class IOSCastBroadcastEngine {
                 listener.start(queue: queue)
             }
             publish()
-        } catch { fail("listener_port_unavailable") }
+        } catch {
+            let code = IOSCastError.code(error)
+            fail(IOSCastError.routeFailure(code) ? code : "listener_port_unavailable")
+        }
     }
     private func beginProbe(epoch: UInt64, target: String) {
-        guard active, generation == epoch, probe == nil else { return }
+        guard active, generation == epoch, probe == nil, let route = grant?.route, let path = routePath else { return }
+        if let error = route.pathError(path) { fail(error); return }
+        guard let interface = route.interface(in: path) else { fail("cast_interface_changed"); return }
+        let parameters: NWParameters
+        do { parameters = try route.parameters(interface: interface) }
+        catch { fail(IOSCastError.code(error)); return }
         let connection = NWConnection(host: .ipv4(IPv4Address(target)!), port: NWEndpoint.Port(rawValue: ports.probe)!,
-                                      using: IOSCastTarget.wifiParameters())
-        let socket = IOSCastSocket(connection, queue: queue, control: true)
+                                      using: parameters)
+        let socket = IOSCastSocket(connection, queue: queue, control: true, route: route)
         probe = socket; probeDeadline = ProcessInfo.processInfo.systemUptime + 4
         socket.onClosed = { [weak self, weak socket] code in
             guard let self = self, self.active, self.generation == epoch, self.probe === socket else { return }
-            self.fail(["cast_peer_rejected", "local_network_permission_denied"].contains(code) ? code : "vehicle_status_unavailable")
+            self.fail(IOSCastError.routeFailure(code) || code == "cast_peer_rejected" ? code : "vehicle_status_unavailable")
         }
         socket.onControl = { [weak self, weak socket] frame, _ in
             guard let self = self, let socket = socket, self.active, self.generation == epoch, self.probe === socket else { return }
@@ -215,11 +245,11 @@ final class IOSCastBroadcastEngine {
         }
     }
     private func accept(_ connection: NWConnection, port: UInt16, epoch: UInt64) {
-        guard let grant = grant, active, generation == epoch else { connection.cancel(); return }
+        guard let grant = grant, let route = grant.route, active, generation == epoch else { connection.cancel(); return }
         if let old = sockets.removeValue(forKey: port) { old.onClosed = nil; old.close("replaced") }
         connected.remove(port)
         if port == ports.data { frameIndex = 0; encoder.resetDelivery() }
-        let socket = IOSCastSocket(connection, queue: queue, control: port == ports.control)
+        let socket = IOSCastSocket(connection, queue: queue, control: port == ports.control, route: route)
         sockets[port] = socket
         socket.onClosed = { [weak self, weak socket] code in
             guard let self = self, let socket = socket, self.active, self.generation == epoch, self.sockets[port] === socket else { return }
@@ -311,6 +341,8 @@ final class IOSCastBroadcastEngine {
         } catch { fail(IOSCastError.code(error)) }
     }
     private func channelEnded(port: UInt16, reason: String) {
+        guard !IOSCastError.routeFailure(reason) else { fail(reason); return }
+        if let error = grant?.route?.sourceError() { fail(error); return }
         let elapsed = ProcessInfo.processInfo.systemUptime - castingStarted
         if port != ports.control, castingStarted > 0, elapsed >= 0, elapsed < 15,
            attemptFrames > 0, retries < 5, let index = recipe.tiers.firstIndex(where: { $0.id == settings.tier }),
@@ -339,6 +371,7 @@ final class IOSCastBroadcastEngine {
     func stop() { queue.async { [weak self] in self?.end("idle", reason: "user_stopped", notifySystem: false) } }
     private func tick() {
         guard active, checkGrant() else { return }
+        if let error = grant?.route?.sourceError() { fail(error); return }
         let now = ProcessInfo.processInfo.systemUptime
         if probe != nil, now > probeDeadline { fail("vehicle_status_unavailable"); return }
         if castingStarted == 0, now - attemptStarted > 35 { fail("frame_pull_timeout"); return }
@@ -381,7 +414,9 @@ final class IOSCastBroadcastEngine {
     private func end(_ phase: String, reason: String, notifySystem: Bool, publishFinal: Bool = true) {
         guard active || finish != nil else { return }
         active = false; generation &+= 1; self.phase = phase; self.reason = reason
-        timer?.cancel(); timer = nil; teardownTransport()
+        timer?.cancel(); timer = nil
+        routeMonitor?.pathUpdateHandler = nil; routeMonitor?.cancel(); routeMonitor = nil; routePath = nil
+        teardownTransport()
         if observing {
             CFNotificationCenterRemoveObserver(CFNotificationCenterGetDarwinNotifyCenter(), Unmanaged.passUnretained(self).toOpaque(),
                 CFNotificationName(IOSCastMailbox.changedNotification as CFString), nil)

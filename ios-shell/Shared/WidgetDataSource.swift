@@ -137,7 +137,7 @@ public enum WidgetDataSource {
            hostTime > (coreSampleTime(cached) ?? 0) {
             return host
         }
-        return WidgetDataSourceResult(snapshot: cached, origin: .cache, reason: reason)
+        return WidgetDataSourceResult(snapshot: SystemSnapshotStore.applyingDualDisplay(cached), origin: .cache, reason: reason)
     }
 
     private static func coreSampleTime(_ snapshot: SystemSnapshot) -> Int64? {
@@ -154,7 +154,7 @@ public enum WidgetDataSource {
         // 保留合法的最后车况，过期由展示层标注；读取不能把真实采样时间改成现在。
         do {
             if let snapshot = try SystemSnapshotStore.readCurrent(now: date), snapshot.vehicle != nil {
-                return WidgetDataSourceResult(snapshot: snapshot, origin: .snapshot, reason: reason)
+                return WidgetDataSourceResult(snapshot: SystemSnapshotStore.applyingDualDisplay(snapshot), origin: .snapshot, reason: reason)
             }
         } catch {
             let code = (error as? SystemSnapshotError)?.code ?? "snapshot_read_failed"
@@ -192,7 +192,8 @@ public enum WidgetDataSource {
             rangeKm: vehicle.rangeKm, integral: vehicle.integral, unread: vehicle.unread,
             tireFrontBar: vehicle.tireFrontBar, tireRearBar: vehicle.tireRearBar,
             tireFrontTemp: vehicle.tireFrontTemp, tireRearTemp: vehicle.tireRearTemp,
-            statsUpdatedAt: statsAt)
+            statsUpdatedAt: statsAt,
+            dualDisplay: SystemSnapshotStore.dualDisplay(expectedOwner: owner))
         // 有效期给足 15 分钟（schema 上限）：扩展自己拉的条目靠 capturedAt 判新旧，
         // expiresAt 只是让 `isStale` 在绘制时有个一致的参考。
         let captured = max(vehicle.sampledAt, statsAt ?? 0)

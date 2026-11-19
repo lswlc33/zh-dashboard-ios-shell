@@ -14,7 +14,7 @@ const noop = () => { throw new Error('sensitive_sink_used'); };
 let passed = 0;
 async function check(name, action) { await action(); passed++; console.log('ok ' + name); }
 function fixture({ missing = '', preparedOnly = false, wrongID = false, receiptFailure = false, cancelledConfirmation = false, mutateOnImport = false } = {}) {
-  let time = 100000, seq = 0, nativeSeq = 0, current = true, credentialRev = 1, pendingPoll = null;
+  let time = 100000, seq = 0, nativeSeq = 0, current = true, recording = false, credentialRev = 1, pendingPoll = null;
   const calls = [], imported = [], commands = [], queue = [], nativeActions = [];
   const s = { Uint8Array, DataView, TextEncoder, TextDecoder, btoa, atob, crypto: webcrypto, AbortController, setTimeout, clearTimeout,
     document: { hidden: false, createElement: noop, getElementById: noop }, localStorage: { setItem: noop, getItem: noop },
@@ -66,10 +66,18 @@ function fixture({ missing = '', preparedOnly = false, wrongID = false, receiptF
       generation: lease.generation, recordingId: recordID, authenticated: false, backgroundGuaranteed: false };
     if (method === 'session.renew.prepare') return snapshot();
     if (method === 'session.renew.poll') { if (pendingPoll) { const reply = pendingPoll; pendingPoll = null; return reply; } return snapshot(); }
-    if (method === 'compat.call') return receiptFailure ? { ok: false, accepted: false, ticket: 'ride-ticket', recordingId: recordID }
-      : { ok: true, accepted: true, ticket: 'ride-ticket', recordingId: recordID, recordState: 'recording', recordedSamples: 3,
-        authenticated: true, nativeAuthenticated: true, authorizationFresh: true, canAcceptTelemetry: true,
-        connected: true, connectionGeneration: lease.generation, telemetry: { speedKph: 0 }, telemetryTimes: { speedKph: time } };
+    if (method === 'compat.call') {
+      const value = () => ({ ok: true, accepted: true, ticket: 'ride-ticket', recordingId: recordID, recordState: 'recording', recordedSamples: 3,
+        authenticated: true, nativeAuthenticated: true, authorizationFresh: true, canAcceptTelemetry: true, canObserveTelemetry: true,
+        connected: true, sourceLeaseId: lease.leaseId, sourceConnectionGeneration: lease.generation, connectionGeneration: lease.generation,
+        telemetry: { speedKph: 0 }, telemetryTimes: { speedKph: time } });
+      if (a.method === 'beginRideRecording') {
+        recording = !receiptFailure;
+        return receiptFailure ? { ok: false, accepted: false, ticket: '', recordingId: '' } : value();
+      }
+      if (a.method === 'rideRecordingAction') { if (a.args[2] === 'stop') recording = false; return value(); }
+      return recording ? value() : { ok: true, state: 'idle', recordState: 'waiting', ticket: '', recordingId: '' };
+    }
     return { ok: true };
   } };
   s.IOSBR = bridge;
@@ -78,6 +86,7 @@ function fixture({ missing = '', preparedOnly = false, wrongID = false, receiptF
   const driver = s.IOSVehicleDriver.create({ bridge, cloud, selectPeripheral: async () => lease.id, now: () => time,
     delay: async ms => { time += ms; }, foreground: () => true });
   return { s, W, ctx, driver, calls, imported, commands, nativeActions,
+    restoreNative: () => { recording = true; },
     start: () => driver.call('beginRideRecording', [scope.navId, scope.vin, scope.frame, false], ctx),
     poll: () => driver.call('pollRideRecording', [scope.navId, 'ride-ticket'], ctx),
     stop: () => driver.call('rideRecordingAction', [scope.navId, 'ride-ticket', 'stop'], ctx),
@@ -161,7 +170,7 @@ await check('old native primitive absent keeps foreground and support false; fai
   const failed = fixture({ receiptFailure: true }); await assert.rejects(failed.start(), /native_failed|recording_receipt_invalid/); assert.equal(failed.imported.length, 0); await failed.driver.dispose();
 });
 await check('restore uses current native recording receipt only; no import, prepare, cloud or BLE reconnect', async () => {
-  const f = fixture();
+  const f = fixture(); f.restoreNative();
   const result = await f.driver.call('restoreRideRecording', [scope.navId, 'ride-ticket'], f.ctx);
   assert.equal(result.backgroundAuthRenewalSupported, true); assert.equal(result.authenticated, true); assert.equal(result.telemetry.speedKph, 0);
   assert.ok(f.calls.every(c => ['compat.call', 'session.renew.poll'].includes(c.method))); assert.equal(f.imported.length, 0);

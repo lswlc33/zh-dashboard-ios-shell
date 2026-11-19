@@ -8,6 +8,17 @@ import Darwin
 struct IOSVehicleNetworkError: Error {
     let code: String
     init(_ code: String) { self.code = code }
+    static func network(_ error: NWError, path: Network.NWPath?) -> String {
+        if let path = path, path.unsatisfiedReason == .localNetworkDenied { return "local_network_permission_denied" }
+        if case let .posix(code) = error {
+            if code == .EACCES || code == .EPERM { return "local_network_permission_denied" }
+            if [.ENETDOWN, .ENETUNREACH, .EHOSTUNREACH, .ENODEV].contains(code) { return "wifi_path_unavailable" }
+            if code == .EADDRNOTAVAIL { return "source_ip_unavailable" }
+            if code == .ECONNREFUSED { return "vehicle_port_refused" }
+            if code == .ETIMEDOUT { return "vehicle_port_timeout" }
+        }
+        return "vehicle_port_unreachable"
+    }
 }
 
 // 只代表可加入的标准 AP。二维码中的 P2P MAC 不构成 iOS 的 Wi-Fi Direct 能力。
@@ -51,6 +62,7 @@ final class IOSVehicleCancellation {
         lock.lock(); defer { lock.unlock() }
         return !cancelled && ProcessInfo.processInfo.systemUptime < deadline
     }
+    var isCancelled: Bool { lock.lock(); defer { lock.unlock() }; return cancelled }
     func cancel() { lock.lock(); cancelled = true; lock.unlock() }
     func check() throws {
         guard valid else { throw IOSVehicleNetworkError("cancelled_or_timeout") }
@@ -63,12 +75,19 @@ struct IOSVehicleRoute {
     let ssid: String
     let carIP: String
 
-    // Network 与 NetworkExtension/SystemConfiguration 存在同名符号，显式限定到 Network 模块。
-    func matches(_ path: Network.NWPath) -> Bool {
-        path.status == .satisfied && path.usesInterfaceType(.wifi)
-            && !path.usesInterfaceType(.cellular) && !path.usesInterfaceType(.other)
-            && path.availableInterfaces.contains(where: { $0.name == interface.name && $0.type == .wifi })
+    // 连接路径必须与 requiredInterface / requiredLocalEndpoint 的实际结果相符，不把候选接口当出口证明。
+    func failure(_ path: Network.NWPath, connection: Bool = true) -> String? {
+        if let error = IOSWiFiRouteChecks.pathError(path) { return error }
+        guard path.availableInterfaces.contains(where: {
+            $0.name == interface.name && $0.index == interface.index && $0.type == .wifi
+        }), if_nametoindex(interface.name) == UInt32(interface.index) else { return "wifi_interface_changed" }
+        let source = IOSWiFiRouteChecks.source(interface: interface.name, target: carIP)
+        guard let address = source.address else { return "source_ip_unverified" }
+        guard address == sourceIP else { return "source_ip_changed" }
+        if connection && !IOSWiFiRouteChecks.localSource(path, matches: sourceIP) { return "local_endpoint_unverified" }
+        return nil
     }
+    func matches(_ path: Network.NWPath) -> Bool { failure(path) == nil }
 
     func parameters() -> Network.NWParameters {
         let tcp = Network.NWProtocolTCP.Options(); tcp.noDelay = true
@@ -88,7 +107,10 @@ struct IOSVehicleRoute {
 final class IOSVehicleSocket {
     let route: IOSVehicleRoute
     private let connection: NWConnection
-    private let guardRoute: (@escaping (Bool) -> Void) -> Void
+    private let guardRoute: (@escaping (String?) -> Void) -> Void
+    private var validationTimer: DispatchWorkItem?
+    private var validationReply: ((String?) -> Void)?
+    private(set) var closeReason = ""
     private var buffer = Data()
     private var reader: ((Result<Data, Error>) -> Void)?
     private var requested = 0
@@ -101,19 +123,49 @@ final class IOSVehicleSocket {
     var pathVerified: Bool { !closed && connection.currentPath.map(route.matches) == true }
 
     init(connection: NWConnection, route: IOSVehicleRoute,
-         guardRoute: @escaping (@escaping (Bool) -> Void) -> Void) {
+         guardRoute: @escaping (@escaping (String?) -> Void) -> Void) {
         self.connection = connection; self.route = route; self.guardRoute = guardRoute
         connection.pathUpdateHandler = { [weak self] path in
-            guard let self = self else { return }
-            if !self.route.matches(path) { self.cancel(); self.onInvalidated?() }
+            guard let self = self, !self.closed else { return }
+            if let code = self.route.failure(path) { self.invalidate(code) }
         }
         connection.stateUpdateHandler = { [weak self] state in
-            guard let self = self else { return }
+            guard let self = self, !self.closed else { return }
             switch state {
-            case .failed, .cancelled: self.cancel(); self.onInvalidated?()
+            case let .failed(error), let .waiting(error):
+                self.invalidate(IOSVehicleNetworkError.network(error, path: self.connection.currentPath))
+            case .cancelled: self.invalidate("cancelled")
             default: break
             }
         }
+    }
+
+    // 系统 SSID 回调没有取消 API；每次只挂一个有界核验，迟到回调不能恢复已关闭 socket。
+    private func verify(_ completion: @escaping (String?) -> Void) {
+        guard !closed else { completion(closeReason.isEmpty ? "cancelled" : closeReason); return }
+        guard validationTimer == nil else { completion("route_check_busy"); return }
+        guard let path = connection.currentPath else { completion("route_lost"); return }
+        if let code = route.failure(path) { completion(code); return }
+        var delivered = false
+        let finish: (String?) -> Void = { [weak self] error in
+            guard !delivered else { return }; delivered = true
+            self?.validationTimer?.cancel(); self?.validationTimer = nil; self?.validationReply = nil
+            completion(error)
+        }
+        let timer = DispatchWorkItem { finish("route_check_timeout") }
+        validationTimer = timer; validationReply = finish
+        DispatchQueue.main.asyncAfter(deadline: .now() + 3, execute: timer)
+        guardRoute { [weak self] error in
+            guard let self = self, !self.closed else { finish(self?.closeReason ?? "cancelled"); return }
+            guard error == nil else { finish(error); return }
+            guard let path = self.connection.currentPath else { finish("route_lost"); return }
+            finish(self.route.failure(path))
+        }
+    }
+    private func invalidate(_ code: String) {
+        guard !closed else { return }
+        let notify = onInvalidated
+        cancel(code: code); notify?()
     }
 
     func send(_ bytes: Data, completion: @escaping (Result<Void, Error>) -> Void) {
@@ -122,17 +174,21 @@ final class IOSVehicleSocket {
             completion(.failure(IOSVehicleNetworkError("socket_unavailable"))); return
         }
         writing = true
-        guardRoute { [weak self] valid in
-            guard let self = self, !self.closed, valid, let path = self.connection.currentPath,
-                  self.route.matches(path) else {
-                self?.writing = false; self?.cancel()
-                completion(.failure(IOSVehicleNetworkError("route_lost"))); return
+        verify { [weak self] error in
+            guard let self = self, !self.closed, error == nil else {
+                self?.writing = false; self?.cancel(code: error ?? "cancelled")
+                completion(.failure(IOSVehicleNetworkError(error ?? self?.closeReason ?? "cancelled"))); return
             }
             self.connection.send(content: bytes, completion: .contentProcessed { [weak self] error in
                 self?.writing = false
-                if let error = error { self?.cancel(); completion(.failure(error)) }
-                else if self?.closed != false { completion(.failure(IOSVehicleNetworkError("cancelled"))) }
-                else { completion(.success(())) }
+                if let error = error {
+                    let code = IOSVehicleNetworkError.network(error, path: self?.connection.currentPath)
+                    self?.cancel(code: code); completion(.failure(IOSVehicleNetworkError(code)))
+                } else if self?.closed != false {
+                    completion(.failure(IOSVehicleNetworkError(self?.closeReason ?? "cancelled")))
+                } else if self?.pathVerified != true {
+                    self?.invalidate("route_lost"); completion(.failure(IOSVehicleNetworkError("route_lost")))
+                } else { completion(.success(())) }
             })
         }
     }
@@ -146,9 +202,9 @@ final class IOSVehicleSocket {
         let timer = DispatchWorkItem { [weak self] in self?.cancel(code: "read_timeout") }
         readTimer = timer
         DispatchQueue.main.asyncAfter(deadline: .now() + Double(timeoutMs) / 1000, execute: timer)
-        guardRoute { [weak self] valid in
+        verify { [weak self] error in
             guard let self = self, !self.closed else { return }
-            guard valid, self.pathVerified else { self.cancel(code: "route_lost"); return }
+            guard error == nil, self.pathVerified else { self.invalidate(error ?? "route_lost"); return }
             self.receive()
         }
     }
@@ -157,9 +213,9 @@ final class IOSVehicleSocket {
         guard !closed, reader != nil else { return }
         if buffer.count >= requested {
             let data = Data(buffer.prefix(requested)); buffer.removeFirst(requested)
-            guardRoute { [weak self] valid in
+            verify { [weak self] error in
                 guard let self = self, !self.closed else { return }
-                guard valid, self.pathVerified else { self.cancel(code: "route_lost"); return }
+                guard error == nil, self.pathVerified else { self.invalidate(error ?? "route_lost"); return }
                 let reply = self.reader; self.reader = nil; self.readTimer?.cancel(); self.readTimer = nil
                 reply?(.success(data))
             }
@@ -180,10 +236,12 @@ final class IOSVehicleSocket {
     func cancel(code: String = "cancelled") {
         precondition(Thread.isMainThread)
         guard !closed else { return }
-        closed = true; connection.pathUpdateHandler = nil; connection.stateUpdateHandler = nil
+        closed = true; closeReason = code; connection.pathUpdateHandler = nil; connection.stateUpdateHandler = nil
         connection.cancel(); readTimer?.cancel(); readTimer = nil
+        validationReply?(code); validationReply = nil
+        validationTimer?.cancel(); validationTimer = nil
         buffer.removeAll(); let reply = reader; reader = nil
-        let cleanup = onClosed; onClosed = nil; cleanup?()
+        let cleanup = onClosed; onClosed = nil; onInvalidated = nil; cleanup?()
         reply?(.failure(IOSVehicleNetworkError(code)))
     }
 
@@ -459,20 +517,26 @@ final class IOSVehicleNetworkService: IOSBridgeCancellableService {
                 let known = ssid != nil && !(ssid?.isEmpty ?? true)
                 let joined = known && ssid == profile.ssid
                 result["joined"] = known ? joined : NSNull()
-                result["targetJoined"] = known ? joined : NSNull()
                 result["ssidReadable"] = known
                 let interfaces = path.availableInterfaces.filter { $0.type == .wifi }
-                let verified = joined && path.status == .satisfied && path.usesInterfaceType(.wifi)
-                    && !path.usesInterfaceType(.other) && !path.usesInterfaceType(.cellular)
-                    && interfaces.count == 1 && !Self.hasVPNInterface()
-                    && Self.sourceIP(interface: interfaces[0].name, target: profile.carIP) != nil
-                result["connected"] = verified; result["targetVerified"] = verified
+                let source = interfaces.count == 1
+                    ? IOSWiFiRouteChecks.source(interface: interfaces[0].name, target: profile.carIP)
+                    : IOSWiFiRouteChecks.Source(state: "interface_unavailable", address: nil)
+                let routeReason = IOSWiFiRouteChecks.pathError(path)
+                    ?? (!known ? "ssid_unknown" : !joined ? "ssid_mismatch" : nil)
+                    ?? (source.address == nil ? "source_ip_" + source.state : nil)
+                let verified = routeReason == nil
+                // 网页的 targetJoined 是可执行目标路由判据，不只表示 SSID 文本相等。
+                result["connected"] = verified; result["targetVerified"] = verified; result["targetJoined"] = verified
                 result["ssid"] = joined ? profile.ssid : ""
                 result["connectionMode"] = verified ? "wifi" : ""
                 result["interface"] = verified ? interfaces[0].name : ""
-                result["sourceIP"] = verified ? Self.sourceIP(interface: interfaces[0].name, target: profile.carIP) ?? "" : ""
+                result["sourceIP"] = verified ? source.address ?? "" : ""
+                result["pathStatus"] = IOSWiFiRouteChecks.pathStatus(path)
+                result["sourceState"] = source.state
+                result["routeReason"] = routeReason ?? ""
                 result["ok"] = known
-                result["error"] = known ? "" : "ssid_unknown"
+                result["error"] = routeReason ?? ""
                 finish(result, nil)
             }
         }
@@ -510,21 +574,28 @@ final class IOSVehicleNetworkService: IOSBridgeCancellableService {
         DispatchQueue.main.asyncAfter(deadline: .now() + 7, execute: timeout)
         monitor.pathUpdateHandler = { [weak self] path in
             guard let self = self, !delivered, !inspecting else { return }
-            guard self.page == revision, self.current(scope, token), path.status == .satisfied,
-                  path.usesInterfaceType(.wifi),
-                  !path.usesInterfaceType(.other), !path.usesInterfaceType(.cellular) else {
-                finish(.failure(IOSVehicleNetworkError("wifi_path_unavailable"))); return
+            guard self.page == revision, self.current(scope, token) else {
+                finish(.failure(IOSVehicleNetworkError(token.isCancelled ? "cancelled" : "stale_context"))); return
             }
-            let interfaces = path.availableInterfaces.filter { $0.type == .wifi }
-            guard interfaces.count == 1 else { finish(.failure(IOSVehicleNetworkError("ambiguous_wifi_path"))); return }
+            if let error = IOSWiFiRouteChecks.pathError(path) { finish(.failure(IOSVehicleNetworkError(error))); return }
             inspecting = true
             self.currentSSID { ssid in
-                guard !delivered, self.page == revision, self.current(scope, token), ssid == profile.ssid,
-                      let source = Self.sourceIP(interface: interfaces[0].name, target: profile.carIP),
-                      !Self.hasVPNInterface() else {
-                    finish(.failure(IOSVehicleNetworkError("ssid_or_local_route_unverified"))); return
+                guard !delivered else { return }
+                guard self.page == revision, self.current(scope, token) else {
+                    finish(.failure(IOSVehicleNetworkError(token.isCancelled ? "cancelled" : "stale_context"))); return
                 }
-                let route = IOSVehicleRoute(interface: interfaces[0], sourceIP: source, ssid: ssid ?? "", carIP: profile.carIP)
+                guard let ssid = ssid, !ssid.isEmpty else { finish(.failure(IOSVehicleNetworkError("ssid_unknown"))); return }
+                guard ssid == profile.ssid else { finish(.failure(IOSVehicleNetworkError("ssid_mismatch"))); return }
+                let livePath = monitor.currentPath
+                if let error = IOSWiFiRouteChecks.pathError(livePath) { finish(.failure(IOSVehicleNetworkError(error))); return }
+                guard let interface = livePath.availableInterfaces.first(where: { $0.type == .wifi }) else {
+                    finish(.failure(IOSVehicleNetworkError("wifi_path_unavailable"))); return
+                }
+                let evidence = IOSWiFiRouteChecks.source(interface: interface.name, target: profile.carIP)
+                guard let source = evidence.address else {
+                    finish(.failure(IOSVehicleNetworkError("source_ip_" + evidence.state))); return
+                }
+                let route = IOSVehicleRoute(interface: interface, sourceIP: source, ssid: ssid, carIP: profile.carIP)
                 let socketConnection = NWConnection(host: NWEndpoint.Host(profile.carIP),
                     port: NWEndpoint.Port(rawValue: port)!, using: route.parameters())
                 connection = socketConnection
@@ -532,12 +603,15 @@ final class IOSVehicleNetworkService: IOSBridgeCancellableService {
                     guard let self = self, !delivered else { return }
                     switch state {
                     case .ready:
-                        self.validate(route: route, scope: scope, cancellation: token) { valid in
-                            guard !delivered, valid, let live = socketConnection.currentPath, route.matches(live) else {
-                                finish(.failure(IOSVehicleNetworkError("route_unverified"))); return
+                        self.validate(route: route, scope: scope, cancellation: token) { error in
+                            guard !delivered else { return }
+                            if let error = error { finish(.failure(IOSVehicleNetworkError(error))); return }
+                            guard let live = socketConnection.currentPath else {
+                                finish(.failure(IOSVehicleNetworkError("route_lost"))); return
                             }
+                            if let error = route.failure(live) { finish(.failure(IOSVehicleNetworkError(error))); return }
                             let socket = IOSVehicleSocket(connection: socketConnection, route: route) { [weak self] reply in
-                                guard let self = self, self.page == revision else { reply(false); return }
+                                guard let self = self, self.page == revision else { reply("stale_context"); return }
                                 self.validate(route: route, scope: scope, cancellation: token, completion: reply)
                             }
                             if self.vehicleProfiles[scope.ownerHash, default: []].insert(profile.ssid).inserted {
@@ -550,9 +624,16 @@ final class IOSVehicleNetworkService: IOSBridgeCancellableService {
                             }
                             finish(.success(socket))
                         }
-                    case .failed, .cancelled: finish(.failure(IOSVehicleNetworkError("vehicle_port_unreachable")))
+                    case let .failed(error), let .waiting(error):
+                        finish(.failure(IOSVehicleNetworkError(IOSVehicleNetworkError.network(error, path: socketConnection.currentPath))))
+                    case .cancelled: finish(.failure(IOSVehicleNetworkError("cancelled")))
                     default: break
                     }
+                }
+                socketConnection.pathUpdateHandler = { path in
+                    guard !delivered else { return }
+                    // 建连前还没有本地端口；ready 后再核对实际 localEndpoint。
+                    if let error = route.failure(path, connection: false) { finish(.failure(IOSVehicleNetworkError(error))) }
                 }
                 socketConnection.start(queue: .main)
             }
@@ -561,16 +642,28 @@ final class IOSVehicleNetworkService: IOSBridgeCancellableService {
     }
 
     func validate(route: IOSVehicleRoute, scope: IOSRideScope, cancellation token: IOSVehicleCancellation,
-                  completion: @escaping (Bool) -> Void) {
+                  completion: @escaping (String?) -> Void) {
         precondition(Thread.isMainThread)
-        guard current(scope, token), !Self.hasVPNInterface(),
-              Self.sourceIP(interface: route.interface.name, target: route.carIP) == route.sourceIP else {
-            completion(false); return
+        guard current(scope, token) else { completion(token.isCancelled ? "cancelled" : "stale_context"); return }
+        let revision = page
+        var delivered = false
+        let finish: (String?) -> Void = { error in
+            guard !delivered else { return }; delivered = true; completion(error)
         }
+        // SSID 查询没有取消 API，必须有界，迟到回调不重复交付。
+        let timeout = DispatchWorkItem { finish("route_check_timeout") }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 3, execute: timeout)
         currentSSID { [weak self] ssid in
-            guard let self = self else { completion(false); return }
-            completion(self.current(scope, token) && ssid == route.ssid && !Self.hasVPNInterface()
-                && Self.sourceIP(interface: route.interface.name, target: route.carIP) == route.sourceIP)
+            timeout.cancel()
+            guard let self = self, self.page == revision, self.current(scope, token) else {
+                finish(token.isCancelled ? "cancelled" : "stale_context"); return
+            }
+            guard let ssid = ssid, !ssid.isEmpty else { finish("ssid_unknown"); return }
+            guard ssid == route.ssid else { finish("ssid_changed"); return }
+            guard if_nametoindex(route.interface.name) == UInt32(route.interface.index) else { finish("wifi_interface_changed"); return }
+            let source = IOSWiFiRouteChecks.source(interface: route.interface.name, target: route.carIP)
+            guard let address = source.address else { finish("source_ip_" + source.state); return }
+            finish(address == route.sourceIP ? nil : "source_ip_changed")
         }
     }
 
@@ -604,30 +697,7 @@ final class IOSVehicleNetworkService: IOSBridgeCancellableService {
     }
 
     static func sourceIP(interface: String, target: String) -> String? {
-        var targetAddress = in_addr()
-        guard inet_pton(AF_INET, target, &targetAddress) == 1 else { return nil }
-        let targetBits = UInt32(bigEndian: targetAddress.s_addr)
-        var list: UnsafeMutablePointer<ifaddrs>?
-        guard getifaddrs(&list) == 0 else { return nil }
-        defer { freeifaddrs(list) }
-        var pointer = list, candidates: [String] = []
-        while let node = pointer {
-            let item = node.pointee; pointer = item.ifa_next
-            guard String(cString: item.ifa_name) == interface, item.ifa_flags & UInt32(IFF_UP) != 0,
-                  item.ifa_flags & UInt32(IFF_LOOPBACK) == 0,
-                  let address = item.ifa_addr, let netmask = item.ifa_netmask,
-                  Int32(address.pointee.sa_family) == AF_INET, Int32(netmask.pointee.sa_family) == AF_INET else { continue }
-            let addr = UnsafeRawPointer(address).assumingMemoryBound(to: sockaddr_in.self).pointee.sin_addr
-            let maskAddr = UnsafeRawPointer(netmask).assumingMemoryBound(to: sockaddr_in.self).pointee.sin_addr
-            let bits = UInt32(bigEndian: addr.s_addr), mask = UInt32(bigEndian: maskAddr.s_addr)
-            let prefix = mask.nonzeroBitCount
-            guard prefix >= 16, prefix <= 30, mask == UInt32.max << (32 - prefix),
-                  bits != targetBits, bits & mask == targetBits & mask,
-                  bits & ~mask != 0, bits & ~mask != ~mask else { continue }
-            var copy = addr, chars = [CChar](repeating: 0, count: Int(INET_ADDRSTRLEN))
-            if inet_ntop(AF_INET, &copy, &chars, socklen_t(INET_ADDRSTRLEN)) != nil { candidates.append(String(cString: chars)) }
-        }
-        return candidates.count == 1 ? candidates.first : nil
+        IOSWiFiRouteChecks.source(interface: interface, target: target).address
     }
 
     func internetRouteAllowed(scope: IOSRideScope, completion: @escaping (Bool) -> Void) {
@@ -802,9 +872,10 @@ final class IOSVehicleTCPService: IOSBridgeCancellableService {
             if method == "network.close" { close(); reply(["ok": true, "ticket": ticket, "closed": true], nil); return }
             guard !s.busy else { throw IOSVehicleNetworkError("network_busy") }
             s.busy = true
-            network.validate(route: socket.route, scope: s.lease.scope, cancellation: s.token) { [weak self] valid in
-                guard let self = self, self.current(s), valid, socket.pathVerified else {
-                    self?.closeIfOwned(s); reply(nil, "route_lost"); return
+            network.validate(route: socket.route, scope: s.lease.scope, cancellation: s.token) { [weak self] error in
+                guard let self = self, self.current(s), error == nil, socket.pathVerified else {
+                    let reason = error ?? (socket.closeReason.isEmpty ? "route_lost" : socket.closeReason)
+                    self?.closeIfOwned(s); reply(nil, reason); return
                 }
                 do {
                     switch method {

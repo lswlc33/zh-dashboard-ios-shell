@@ -14,6 +14,7 @@ public enum SystemSnapshotStore {
     private static let markerName = "active-owner.json"
     private static let lockName = ".snapshot-lock"
     private static let settingsName = "widget-settings.json"
+    private static let dualDisplayName = "dual-display-v1.dat"
 
     public static func isAvailable() -> Bool {
         #if os(iOS) || os(macOS)
@@ -75,6 +76,55 @@ public enum SystemSnapshotStore {
 
     public static func currentOwner() throws -> SystemSnapshotOwner? {
         try coordinated(create: false) { root in try owner(at: root) }
+    }
+
+    /// Widget 扩展无法读取网页偏好；展示倍率必须绑定到当前匿名 owner。
+    public static func dualDisplay(expectedOwner: SystemSnapshotOwner) -> Bool {
+        guard expectedOwner.isValid else { return false }
+        return (try? coordinated(create: false) { root in
+            guard try owner(at: root) == expectedOwner,
+                  let data = try boundedRead(root.appendingPathComponent(dualDisplayName), limit: 256),
+                  let value = try JSONSerialization.jsonObject(with: data) as? [String: Any],
+                  Set(value.keys) == ["accountVINHash", "enabled"],
+                  value["accountVINHash"] as? String == expectedOwner.accountVINHash,
+                  let enabled = value["enabled"] as? Bool else { return false }
+            return enabled
+        }) ?? false
+    }
+
+    public static func applyingDualDisplay(_ snapshot: SystemSnapshot?) -> SystemSnapshot? {
+        guard let snapshot = snapshot, let vehicle = snapshot.vehicle else { return snapshot }
+        let display = dualDisplay(expectedOwner: snapshot.owner)
+        let projected = SystemVehicleSnapshot(name: vehicle.name, vinDisplaySuffix: vehicle.vinDisplaySuffix,
+            socPercent: vehicle.socPercent, socUpdatedAt: vehicle.socUpdatedAt,
+            charging: vehicle.charging, chargingUpdatedAt: vehicle.chargingUpdatedAt,
+            chargeProgressPercent: vehicle.chargeProgressPercent,
+            chargeProgressUpdatedAt: vehicle.chargeProgressUpdatedAt, updatedAt: vehicle.updatedAt,
+            voltage: vehicle.voltage, current: vehicle.current, power: vehicle.power,
+            lockState: vehicle.lockState, seatState: vehicle.seatState, online: vehicle.online,
+            todayMileKm: vehicle.todayMileKm, lastMileKm: vehicle.lastMileKm,
+            lastRideMinutes: vehicle.lastRideMinutes, totalMileKm: vehicle.totalMileKm,
+            rangeKm: vehicle.rangeKm, integral: vehicle.integral, unread: vehicle.unread,
+            tireFrontBar: vehicle.tireFrontBar, tireRearBar: vehicle.tireRearBar,
+            tireFrontTemp: vehicle.tireFrontTemp, tireRearTemp: vehicle.tireRearTemp,
+            statsUpdatedAt: vehicle.statsUpdatedAt, dualDisplay: display)
+        return SystemSnapshot(owner: snapshot.owner, capturedAt: snapshot.capturedAt,
+            expiresAt: snapshot.expiresAt, vehicle: projected, ride: snapshot.ride, gauge: snapshot.gauge)
+    }
+
+    public static func writeDualDisplay(_ enabled: Bool, expectedOwner: SystemSnapshotOwner) throws {
+        guard expectedOwner.isValid else { throw SystemSnapshotError("invalid_snapshot_owner") }
+        try coordinated(create: true) { root in
+            if let active = try owner(at: root), active != expectedOwner {
+                throw SystemSnapshotError("snapshot_owner_mismatch")
+            }
+            let file = root.appendingPathComponent(dualDisplayName, isDirectory: false)
+            try ensureRegularFile(file, missingAllowed: true)
+            let data = try JSONSerialization.data(withJSONObject: [
+                "accountVINHash": expectedOwner.accountVINHash, "enabled": enabled
+            ], options: [.sortedKeys])
+            try protectedWrite(data, to: file)
+        }
     }
 
     public static func read(expectedOwner: SystemSnapshotOwner, now: Date = Date()) throws -> SystemSnapshot? {
@@ -226,6 +276,13 @@ public enum SystemSnapshotStore {
             // 先完整原子写数据，再原子发布 owner；崩溃中断时最多读不到，绝不读到另一账号的数据。
             try ensureRegularFile(target, missingAllowed: true)
             try protectedWrite(data, to: target)
+            let dual = root.appendingPathComponent(dualDisplayName, isDirectory: false)
+            try ensureRegularFile(dual, missingAllowed: true)
+            let markerData = try JSONSerialization.data(withJSONObject: [
+                "accountVINHash": expectedOwner.accountVINHash,
+                "enabled": value.vehicle?.dualDisplay == true
+            ], options: [.sortedKeys])
+            try protectedWrite(markerData, to: dual)
             let marker = root.appendingPathComponent(markerName, isDirectory: false)
             try ensureRegularFile(marker, missingAllowed: true)
             try protectedWrite(try encoder.encode(expectedOwner), to: marker)
@@ -262,10 +319,12 @@ public enum SystemSnapshotStore {
         let active = try owner(at: root)
         if active?.sharesAccount(with: expectedOwner) == true {
             try FileManager.default.removeItem(at: root.appendingPathComponent(markerName))
-            let settings = root.appendingPathComponent(settingsName)
-            if (try? ensureRegularFile(settings, missingAllowed: true)) != nil,
-               FileManager.default.fileExists(atPath: settings.path) {
-                try? FileManager.default.removeItem(at: settings)
+            for name in [settingsName, dualDisplayName] {
+                let file = root.appendingPathComponent(name)
+                if (try? ensureRegularFile(file, missingAllowed: true)) != nil,
+                   FileManager.default.fileExists(atPath: file.path) {
+                    try? FileManager.default.removeItem(at: file)
+                }
             }
         }
         // 只有验证过归属与真实 regular file 的摘要才删；坏文件/未知条目原样保留，不牵连撤权。
@@ -345,7 +404,7 @@ public enum SystemSnapshotStore {
                                       "voltage", "current", "power", "lockState", "seatState", "online",
                                       "todayMileKm", "lastMileKm", "lastRideMinutes", "totalMileKm", "rangeKm",
                                       "integral", "unread", "tireFrontBar", "tireRearBar",
-                                      "tireFrontTemp", "tireRearTemp", "statsUpdatedAt"],
+                                      "tireFrontTemp", "tireRearTemp", "statsUpdatedAt", "dualDisplay"],
                      required: ["updatedAt"])
         }
         if let source = value["gauge"], !(source is NSNull) {
@@ -401,7 +460,7 @@ public enum SystemSnapshotStore {
         let entries = try FileManager.default.contentsOfDirectory(at: root, includingPropertiesForKeys: [.isRegularFileKey], options: [])
         for entry in entries {
             let name = entry.lastPathComponent
-            if [markerName, lockName, settingsName].contains(name) { continue }
+            if [markerName, lockName, settingsName, dualDisplayName].contains(name) { continue }
             if name.hasPrefix(".dat.nosync") {
                 try ensureRegularFile(entry, missingAllowed: false)
                 try FileManager.default.removeItem(at: entry)

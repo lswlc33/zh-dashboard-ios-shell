@@ -600,6 +600,7 @@ final class IOSRideService: NSObject, IOSBridgeService, IOSBridgeCancellableServ
         let scope: IOSRideScope
         let method: String
         let id: UUID?
+        var sourceLeaseID: String?
         var reply: ((Any?, String?) -> Void)?
         var timeout: DispatchWorkItem?
         init(page: UInt64, scope: IOSRideScope, method: String, id: UUID?, reply: @escaping (Any?, String?) -> Void) {
@@ -615,6 +616,9 @@ final class IOSRideService: NSObject, IOSBridgeService, IOSBridgeCancellableServ
         var gpsWanted: Bool
         var gpsOver50 = false
         var backgroundWanted: Bool
+        // begin 对应的不可变来源，模糊回执清理只能核对这一份，不能误停别的原生入口。
+        var sourceLeaseID: String?
+        var sourceConnectionGeneration: String?
         // 文件保留完整历史；实时读数独立缓存，截断文件不能让仪表倒退回旧样本。
         var latestBLE: [String: Any] = [:]
         var latestBLETimes: [String: Int64] = [:]
@@ -909,6 +913,9 @@ final class IOSRideService: NSObject, IOSBridgeService, IOSBridgeCancellableServ
             }
             guard self.pendingSaveCapacity else { self.finish(consent, self.failure("pending_save_limit")); return }
             let run = Run(scope: scope, gps: wantedGPS, background: background)
+            if let source = self.bluetooth.foregroundTelemetrySource() {
+                run.sourceLeaseID = source.leaseID; run.sourceConnectionGeneration = source.generation
+            }
             run.gpsOver50 = self.preferences.bool(forKey: self.gpsAutoKey(scope))
             run.systemBLEConnected = self.bluetooth.connected
             self.active = run
@@ -1344,8 +1351,11 @@ final class IOSRideService: NSObject, IOSBridgeService, IOSBridgeCancellableServ
         var value = permissionProjection(gpsValue, ble)
         value.merge(["ok": true, "accepted": false, "id": run.id.uuidString.lowercased(), "ticket": run.id.uuidString.lowercased(),
             "recordingId": run.id.uuidString.lowercased(), "state": run.state,
-            "connectionGeneration": sameLease ? (nativeLease?.connectionGeneration as Any? ?? NSNull()) : NSNull(),
+            "sourceLeaseId": run.sourceLeaseID as Any? ?? NSNull(),
+            "sourceConnectionGeneration": run.sourceConnectionGeneration as Any? ?? NSNull(),
+            "connectionGeneration": live && bluetooth.connected ? ble["connectionGeneration"] ?? NSNull() : NSNull(),
             "nativeAuthenticated": sameLease, "authorizationFresh": sameLease, "canAcceptTelemetry": sameLease,
+            "canObserveTelemetry": live && bluetooth.canObserveTelemetry,
             "recordState": IOSRideJSON.publicRecordState(run.recordState), "nativeRecordState": run.recordState,
             "reason": run.reason, "startedAt": run.startedAt, "endedAt": run.endedAt as Any? ?? NSNull(),
             "samples": run.samples, "recordedSamples": run.samples, "elapsedMs": run.elapsedMs, "durationMs": run.durationMs,
@@ -1665,6 +1675,16 @@ final class IOSRideService: NSObject, IOSBridgeService, IOSBridgeCancellableServ
 
     private func action(scope: IOSRideScope, options: [String: Any], reply: @escaping (Any?, String?) -> Void) {
         guard let action = options["action"] as? String else { reply(failure("invalid_action"), nil); return }
+        if action == "cancel_begin" {
+            // 仅撤销本 scope 尚在等待的开始确认；没有票据也绝不停止现存录制。
+            if let consent = confirmation, consent.method == "ride.begin", consent.scope == scope,
+               let source = consent.sourceLeaseID, options["id"] as? String == source {
+                cancelConsent("operation_cancelled")
+            }
+            var value = active.map { snapshot($0) } ?? idleSnapshot(scope: scope)
+            value["accepted"] = true
+            reply(value, nil); return
+        }
         let suppliedID = options["id"] ?? options["ticket"] ?? options["recordingId"]
         if suppliedID != nil && requestedID(options) == nil { reply(failure("invalid_recording_id"), nil); return }
         let id = requestedID(options) ?? active?.id
@@ -2004,6 +2024,7 @@ final class IOSRideService: NSObject, IOSBridgeService, IOSBridgeCancellableServ
             reply(failure("confirmation_unavailable"), nil); return
         }
         let consent = Consent(page: page, scope: scope, method: method, id: id, reply: reply)
+        if method == "ride.begin" { consent.sourceLeaseID = bluetooth.foregroundTelemetrySource()?.leaseID }
         confirmation = consent
         let alert = UIAlertController(title: title, message: message, preferredStyle: .alert)
         confirmationAlert = alert

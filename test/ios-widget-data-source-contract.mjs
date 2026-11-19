@@ -23,7 +23,7 @@ check('load 命中、失败及 loadLocal 共用整份选取', () => {
   assert.equal((local.match(/return preferredLocal\(cached,/g) || []).length, 1);
   assert.doesNotMatch(load + local, /origin: \.cache/);
   assert.match(select, /return host/);
-  assert.match(select, /snapshot: cached, origin: \.cache, reason: reason/);
+  assert.match(select, /WidgetDataSourceResult\(snapshot: (?:SystemSnapshotStore\.applyingDualDisplay\(cached\)|cached), origin: \.cache, reason: reason/);
   assert.doesNotMatch(select, /SystemSnapshot\(|SystemVehicleSnapshot\(|WidgetFetchCache\.write/);
 });
 check('合法同完整 owner 才能比较，cache 补做 schema 校验', () => {

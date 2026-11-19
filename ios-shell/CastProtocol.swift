@@ -12,8 +12,143 @@ enum IOSCastError: Error, LocalizedError {
     var errorDescription: String? { code }
     static func code(_ error: Error) -> String { (error as? IOSCastError)?.code ?? "cast_internal_error" }
     static func network(_ error: NWError) -> String {
-        if case let .posix(code) = error, code == .EACCES || code == .EPERM { return "local_network_permission_denied" }
+        if case let .posix(code) = error {
+            if code == .EACCES || code == .EPERM { return "local_network_permission_denied" }
+            if [.ENETDOWN, .ENETUNREACH, .EHOSTUNREACH, .ENODEV, .EADDRNOTAVAIL].contains(code) { return "cast_route_lost" }
+        }
         return "cast_socket_failed"
+    }
+    // 路由/权限错误不是接收端解码兼容性，不能通过降档或重建另一条出口重试。
+    static func routeFailure(_ code: String) -> Bool {
+        code.hasPrefix("cast_route_") || code.hasPrefix("cast_source_") || code.hasPrefix("cast_interface_")
+            || ["wifi_path_unavailable", "wifi_route_not_exclusive", "ambiguous_wifi_path",
+                "wifi_permission_denied", "local_network_permission_denied"].contains(code)
+    }
+}
+
+// 只读公开的路径/接口证据。utun 的存在不证明这条连接用了 VPN；连接仍须精确绑定并核对源地址。
+// Host/Broadcast 共用这些检查，不向扩展引入账号、SSID、桥或新的系统权限。
+enum IOSWiFiRouteChecks {
+    struct Source {
+        let state: String
+        let address: String?
+    }
+    static func pathStatus(_ path: Network.NWPath) -> String {
+        switch path.status {
+        case .satisfied: return "satisfied"
+        case .unsatisfied: return "unsatisfied"
+        case .requiresConnection: return "requires_connection"
+        @unknown default: return "unknown"
+        }
+    }
+    static func pathError(_ path: Network.NWPath) -> String? {
+        guard path.status == .satisfied else {
+            if path.unsatisfiedReason == .localNetworkDenied { return "local_network_permission_denied" }
+            if path.unsatisfiedReason == .wifiDenied { return "wifi_permission_denied" }
+            return "wifi_path_unavailable"
+        }
+        guard path.usesInterfaceType(.wifi) else { return "wifi_path_unavailable" }
+        guard !path.usesInterfaceType(.cellular), !path.usesInterfaceType(.other),
+              !path.usesInterfaceType(.wiredEthernet), !path.usesInterfaceType(.loopback) else {
+            return "wifi_route_not_exclusive"
+        }
+        guard path.availableInterfaces.filter({ $0.type == .wifi }).count == 1 else { return "ambiguous_wifi_path" }
+        return nil
+    }
+    static func localSource(_ path: Network.NWPath, matches sourceIP: String) -> Bool {
+        guard let endpoint = path.localEndpoint, case let .hostPort(host, port) = endpoint, port != .any,
+              case let .ipv4(address) = host else { return false }
+        return address == IPv4Address(sourceIP)
+    }
+    static func source(interface: String, target: String) -> Source {
+        var targetAddress = in_addr()
+        guard inet_pton(AF_INET, target, &targetAddress) == 1 else { return Source(state: "invalid_target", address: nil) }
+        let targetBits = UInt32(bigEndian: targetAddress.s_addr)
+        var list: UnsafeMutablePointer<ifaddrs>?
+        guard getifaddrs(&list) == 0 else { return Source(state: "interfaces_unreadable", address: nil) }
+        defer { freeifaddrs(list) }
+        var pointer = list, candidates: Set<String> = []
+        var available = false
+        while let node = pointer {
+            let item = node.pointee; pointer = item.ifa_next
+            guard String(cString: item.ifa_name) == interface, item.ifa_flags & UInt32(IFF_UP) != 0,
+                  item.ifa_flags & UInt32(IFF_LOOPBACK) == 0 else { continue }
+            available = true
+            guard let address = item.ifa_addr, let netmask = item.ifa_netmask,
+                  Int32(address.pointee.sa_family) == AF_INET, Int32(netmask.pointee.sa_family) == AF_INET else { continue }
+            let addr = UnsafeRawPointer(address).assumingMemoryBound(to: sockaddr_in.self).pointee.sin_addr
+            let maskAddr = UnsafeRawPointer(netmask).assumingMemoryBound(to: sockaddr_in.self).pointee.sin_addr
+            let bits = UInt32(bigEndian: addr.s_addr), mask = UInt32(bigEndian: maskAddr.s_addr)
+            let prefix = mask.nonzeroBitCount
+            // 只接受唯一、同一直连子网的主机地址；不猜 gateway，不接受自身/网络/广播地址。
+            guard prefix >= 16, prefix <= 30, mask == UInt32.max << (32 - prefix),
+                  bits != targetBits, bits & mask == targetBits & mask,
+                  bits & ~mask != 0, bits & ~mask != ~mask,
+                  targetBits & ~mask != 0, targetBits & ~mask != ~mask else { continue }
+            var copy = addr, chars = [CChar](repeating: 0, count: Int(INET_ADDRSTRLEN))
+            if inet_ntop(AF_INET, &copy, &chars, socklen_t(INET_ADDRSTRLEN)) != nil { candidates.insert(String(cString: chars)) }
+        }
+        guard available else { return Source(state: "interface_unavailable", address: nil) }
+        guard candidates.count == 1 else { return Source(state: candidates.isEmpty ? "unavailable" : "ambiguous", address: nil) }
+        return Source(state: "verified", address: candidates.first)
+    }
+}
+
+// 匿名会话的不可换出口约束。NWInterface 不能跨进程编码，扩展必须按 name+index 重新解析真实接口。
+struct IOSCastRoute: Codable, Equatable {
+    let interfaceName: String
+    let interfaceIndex: Int
+    let sourceIP: String
+    let targetIP: String
+
+    var valid: Bool {
+        interfaceIndex > 0 && interfaceIndex <= Int(UInt32.max) && !interfaceName.isEmpty && interfaceName.utf8.count <= 64
+            && interfaceName.utf8.allSatisfy { byte in
+                (byte >= 0x41 && byte <= 0x5A) || (byte >= 0x61 && byte <= 0x7A)
+                    || (byte >= 0x30 && byte <= 0x39) || byte == 0x2D || byte == 0x2E || byte == 0x5F
+            }
+            && IPv4Address(sourceIP) != nil && sourceIP != targetIP && (try? IOSCastTarget.validate(targetIP)) != nil
+    }
+    static func capture(_ path: Network.NWPath, targetIP: String) throws -> IOSCastRoute {
+        if let error = IOSWiFiRouteChecks.pathError(path) { throw IOSCastError.reason(error) }
+        guard let interface = path.availableInterfaces.first(where: { $0.type == .wifi }),
+              let source = IOSWiFiRouteChecks.source(interface: interface.name, target: targetIP).address else {
+            throw IOSCastError.reason("cast_source_unverified")
+        }
+        let route = IOSCastRoute(interfaceName: interface.name, interfaceIndex: interface.index, sourceIP: source, targetIP: targetIP)
+        guard route.valid, route.sourceError() == nil else { throw IOSCastError.reason("cast_route_unverified") }
+        return route
+    }
+    func interface(in path: Network.NWPath) -> Network.NWInterface? {
+        path.availableInterfaces.first { $0.type == .wifi && $0.name == interfaceName && $0.index == interfaceIndex }
+    }
+    func sourceError() -> String? {
+        guard valid else { return "cast_route_invalid" }
+        guard if_nametoindex(interfaceName) == UInt32(interfaceIndex) else { return "cast_interface_changed" }
+        let source = IOSWiFiRouteChecks.source(interface: interfaceName, target: targetIP)
+        guard let address = source.address else { return "cast_source_unverified" }
+        return address == sourceIP ? nil : "cast_source_changed"
+    }
+    func pathError(_ path: Network.NWPath, connection: Bool = false) -> String? {
+        if let error = IOSWiFiRouteChecks.pathError(path) { return error }
+        guard interface(in: path) != nil else { return "cast_interface_changed" }
+        if let error = sourceError() { return error }
+        if connection && !IOSWiFiRouteChecks.localSource(path, matches: sourceIP) { return "cast_route_local_endpoint_unverified" }
+        return nil
+    }
+    func parameters(interface: Network.NWInterface, port: Network.NWEndpoint.Port = .any) throws -> Network.NWParameters {
+        guard interface.type == .wifi, interface.name == interfaceName, interface.index == interfaceIndex else {
+            throw IOSCastError.reason("cast_interface_changed")
+        }
+        if let error = sourceError() { throw IOSCastError.reason(error) }
+        let tcp = Network.NWProtocolTCP.Options(); tcp.noDelay = true
+        let params = Network.NWParameters(tls: nil, tcp: tcp)
+        params.requiredInterfaceType = .wifi; params.requiredInterface = interface
+        params.prohibitedInterfaceTypes = [.cellular, .wiredEthernet, .loopback, .other]
+        params.requiredLocalEndpoint = .hostPort(host: .ipv4(IPv4Address(sourceIP)!), port: port)
+        params.includePeerToPeer = false
+        params.allowLocalEndpointReuse = true
+        return params
     }
 }
 
@@ -434,16 +569,6 @@ enum IOSCastTarget {
               bytes[3] != 0, bytes[3] != 255, IPv4Address(text) != nil else { throw IOSCastError.reason("cast_target_invalid") }
         return text
     }
-    static func wifiParameters() -> NWParameters {
-        let tcp = NWProtocolTCP.Options()
-        tcp.noDelay = true
-        let params = NWParameters(tls: nil, tcp: tcp)
-        params.requiredInterfaceType = .wifi
-        params.prohibitedInterfaceTypes = [.cellular, .loopback]
-        params.includePeerToPeer = false // 不把 AWDL / AirPlay 当 EasyConn，也不假装有 WifiP2pManager。
-        params.allowLocalEndpointReuse = true
-        return params
-    }
 }
 
 // 随机会话 RSA，未抄 Android 内置秘密。RawSign 的 PKCS1 type-1 padding 对应 Java
@@ -492,6 +617,7 @@ struct IOSCastGrant: Codable {
     let id: String
     let extensionID: String? // 旧票据缺此键仍可被 host 撤销；新扩展启动时必须精确匹配。
     let targetIP: String
+    let route: IOSCastRoute? // 旧票据仍可撤销，但扩展不再消费缺少路由约束的票据。
     let issuedAt: TimeInterval
     let selectBefore: TimeInterval
     let endBefore: TimeInterval
@@ -502,6 +628,7 @@ struct IOSCastGrant: Codable {
     var valid: Bool {
         version == 1 && UUID(uuidString: id) != nil && (extensionID.map { IOSCastMailbox.validExtensionID($0) } ?? true)
             && (try? IOSCastTarget.validate(targetIP)) != nil && settings.valid
+            && (route.map { $0.valid && $0.targetIP == targetIP } ?? true)
             && (try? recipe.validate()) != nil && recipe.tiers.contains(where: { $0.id == settings.tier })
             && issuedAt.isFinite && selectBefore.isFinite && endBefore.isFinite
             && selectBefore >= issuedAt && selectBefore - issuedAt <= 120
@@ -690,9 +817,16 @@ final class IOSCastSocket {
     var onMedia: ((IOSCastWire.Media, @escaping () -> Void) -> Void)?
     private var identity: IOSCastIdentity?
     private var receivedEOF = false
+    private let route: IOSCastRoute
+    private var ready = false
 
-    init(_ connection: NWConnection, queue: DispatchQueue, control: Bool) {
-        self.connection = connection; self.queue = queue; self.control = control
+    init(_ connection: NWConnection, queue: DispatchQueue, control: Bool, route: IOSCastRoute) {
+        self.connection = connection; self.queue = queue; self.control = control; self.route = route
+    }
+    @discardableResult private func verifyRoute() -> Bool {
+        guard !closed, let path = connection.currentPath else { close("cast_route_lost"); return false }
+        if let error = route.pathError(path, connection: true) { close(error); return false }
+        return true
     }
     func replies(_ rule: IOSCastRecipe.Rule, body: Data, recipe: IOSCastRecipe) throws -> [Data] {
         let input: [String: Any]
@@ -712,19 +846,28 @@ final class IOSCastSocket {
         }
     }
     func start(expectedIP: String, ready: @escaping () -> Void) {
+        connection.pathUpdateHandler = { [weak self] path in
+            guard let self = self, !self.closed else { return }
+            if let error = self.route.pathError(path, connection: self.ready) { self.close(error) }
+        }
+        connection.viabilityUpdateHandler = { [weak self] viable in
+            if !viable { self?.close("cast_route_lost") }
+        }
         connection.stateUpdateHandler = { [weak self] state in
             guard let self = self, !self.closed else { return }
             switch state {
             case .ready:
-                guard self.connection.currentPath?.usesInterfaceType(.wifi) == true,
+                guard expectedIP == self.route.targetIP,
                       case let .hostPort(host, _) = self.connection.endpoint,
                       case let .ipv4(address) = host, address == IPv4Address(expectedIP) else {
                     self.close("cast_peer_rejected"); return
                 }
-                ready(); self.readFrame()
+                guard self.verifyRoute() else { return }
+                self.ready = true; ready(); self.readFrame()
             case let .failed(error): self.close(IOSCastError.network(error))
             case let .waiting(error):
-                if IOSCastError.network(error) == "local_network_permission_denied" { self.close("local_network_permission_denied") }
+                let code = IOSCastError.network(error)
+                self.close(IOSCastError.routeFailure(code) ? code : "cast_route_lost")
             case .cancelled: self.close("cast_socket_cancelled")
             default: break
             }
@@ -732,11 +875,11 @@ final class IOSCastSocket {
         connection.start(queue: queue)
     }
     private func readExactly(_ count: Int, frameBoundary: Bool = false, collected: Data = Data(), completion: @escaping (Data) -> Void) {
-        guard !closed else { return }
+        guard !closed, verifyRoute() else { return }
         if count == 0 { completion(collected); return }
         if receivedEOF { close(frameBoundary && collected.isEmpty ? "peer_closed" : "cast_frame_truncated"); return }
         connection.receive(minimumIncompleteLength: 1, maximumLength: count) { [weak self] data, _, complete, error in
-            guard let self = self, !self.closed else { return }
+            guard let self = self, !self.closed, self.verifyRoute() else { return }
             let data = data ?? Data()
             var joined = collected; joined.append(data)
             // Network 可把有效末包与 FIN 同一次交付；先消费 bytes，再判断不足 EOF。
@@ -770,13 +913,13 @@ final class IOSCastSocket {
         }
     }
     func send(_ bytes: Data, completion: @escaping () -> Void) {
-        guard !closed else { return }
+        guard !closed, verifyRoute() else { return }
         guard writeSince == nil else { close("cast_backpressure_violation"); return }
         writeSince = ProcessInfo.processInfo.systemUptime
         connection.send(content: bytes, completion: .contentProcessed { [weak self] error in
             guard let self = self, !self.closed else { return }
             self.writeSince = nil
-            if error != nil { self.close("cast_write_failed"); return }
+            if let error = error { self.close(IOSCastError.network(error)); return }
             completion()
         })
     }
@@ -788,7 +931,8 @@ final class IOSCastSocket {
     }
     func close(_ reason: String) {
         guard !closed else { return }
-        closed = true; connection.stateUpdateHandler = nil; connection.cancel(); identity = nil
+        closed = true; connection.stateUpdateHandler = nil; connection.pathUpdateHandler = nil
+        connection.viabilityUpdateHandler = nil; connection.cancel(); identity = nil
         let callback = onClosed
         onClosed = nil; onControl = nil; onMedia = nil
         callback?(reason)

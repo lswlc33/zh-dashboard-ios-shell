@@ -46,14 +46,13 @@ final class AppDelegate: UIResponder, UIApplicationDelegate {
 final class RootRouter: UIViewController {
     private var panel: PanelController?
     private var recovery: RecoveryViewController?
-    private var settled = false
+    private var routeGeneration = 0
 
     override func viewDidLoad() {
         super.viewDidLoad()
         view.backgroundColor = .systemBackground
         // 在 viewDidLoad 就把内容装上：viewDidAppear 期间窗口是空白的，
         // 冷启动会先闪一帧黑屏。约束布局不依赖 bounds，提前装没有副作用。
-        settled = true
         // 持久化的线路要在任何导航之前应用，否则白名单与起始地址会不一致。
         IOSPanelLine.applyPersisted()
         route()
@@ -64,15 +63,27 @@ final class RootRouter: UIViewController {
     }
 
     private func route() {
-        // 上次启动失败过就一定要给恢复页，让用户能看到原因并手动重试。
+        routeGeneration &+= 1
+        let ticket = routeGeneration
+        // unfinished 只是上一进程没来得及记成功（强退/系统回收也会留下），
+        // 不是明确失败。有好快照仍直接进；首次/升级欢迎和真实失败不能跳过。
         let reason = BootHealth.pendingReason()
-        if !reason.isEmpty {
+        if !reason.isEmpty && reason != "unfinished" {
             showRecovery(reason: reason)
             return
         }
         IOSPanelCache.shared.refresh { [weak self] state in
-            guard let self = self else { return }
-            if state.ready && !BootHealth.needsWelcome() {
+            guard let self = self, self.routeGeneration == ticket,
+                  self.panel == nil, self.recovery == nil else { return }
+            // 预检期间可能记下了明确失败，不能用旧的无错误快照覆盖它。
+            let currentReason = BootHealth.pendingReason()
+            if !currentReason.isEmpty && currentReason != "unfinished" {
+                self.showRecovery(reason: currentReason)
+                return
+            }
+            let needsWelcome = BootHealth.needsWelcome()
+            if state.ready && !needsWelcome {
+                BootHealth.clear()
                 BootHealth.markWelcomeShown()
                 self.showPanel()
                 // 快照过期（超过 24 小时或换过线路）就后台补一份新的，
@@ -84,34 +95,47 @@ final class RootRouter: UIViewController {
                 }
             } else {
                 BootHealth.markWelcomeShown()
-                self.showRecovery(reason: "")
+                self.showRecovery(reason: needsWelcome ? "" : currentReason)
             }
         }
     }
 
     private func showPanel() {
+        guard panel == nil, recovery == nil else { return }
+        routeGeneration &+= 1
+        let ticket = routeGeneration
         let controller = PanelController()
         panel = controller
+        // 先接好回调再触发 viewDidLoad；旧控制器的迟到失败不能拆掉新面板。
+        controller.onBootFailure = { [weak self, weak controller] reason in
+            guard let self = self, let controller = controller, self.routeGeneration == ticket,
+                  self.panel === controller else { return }
+            self.switchToRecovery(reason: reason)
+        }
+        controller.onWelcome = { [weak self, weak controller] in
+            guard let self = self, let controller = controller, self.routeGeneration == ticket,
+                  self.panel === controller else { return }
+            self.openWelcome()
+        }
         addChild(controller)
         // 用约束而不是 frame：RootRouter 是 window 的 rootViewController，
         // route() 触发时 view.bounds 可能还是 zero，写死 frame 会让子视图永远 0×0，
         // 表现就是「只有 toolbar 可见、所有按钮点不动」。
+        controller.loadViewIfNeeded()
+        guard panel === controller, routeGeneration == ticket else { return }
         attach(controller.view)
         controller.didMove(toParent: self)
-        controller.onBootFailure = { [weak self] reason in
-            self?.switchToRecovery(reason: reason)
-        }
-        controller.onWelcome = { [weak self, weak controller] in
-            guard let self = self, let controller = controller, self.panel === controller else { return }
-            self.openWelcome()
-        }
     }
 
     private func showRecovery(reason: String) {
+        guard panel == nil, recovery == nil else { return }
+        routeGeneration &+= 1
+        let ticket = routeGeneration
         let controller = RecoveryViewController(reason: reason)
         recovery = controller
-        controller.onEnter = { [weak self] in
-            guard let self = self else { return }
+        controller.onEnter = { [weak self, weak controller] in
+            guard let self = self, let controller = controller, self.routeGeneration == ticket,
+                  self.recovery === controller else { return }
             self.dismissRecovery()
             BootHealth.clear()
             self.showPanel()
@@ -135,19 +159,24 @@ final class RootRouter: UIViewController {
 
     private func dismissRecovery() {
         guard let controller = recovery else { return }
+        routeGeneration &+= 1
+        recovery = nil
+        controller.onEnter = nil
         controller.willMove(toParent: nil)
         controller.view.removeFromSuperview()
         controller.removeFromParent()
-        recovery = nil
     }
 
     private func removePanel() {
         guard let controller = panel else { return }
+        routeGeneration &+= 1
+        panel = nil
+        controller.onBootFailure = nil
+        controller.onWelcome = nil
         controller.stopForRecovery()
         controller.willMove(toParent: nil)
         controller.view.removeFromSuperview()
         controller.removeFromParent()
-        panel = nil
     }
 
     private func openWelcome() {
@@ -168,7 +197,7 @@ final class RootRouter: UIViewController {
 }
 
 // 启动健康状态：等价安卓 BootHealth。
-// 只记「上次是否正常进入面板」，用来决定下次冷启动是否强制走恢复页。
+// 明确失败会强制恢复；unfinished 只是未确认成功，有好快照的普通冷启动可忽略。
 enum BootHealth {
     private static let defaults = UserDefaults.standard
     private static let reasonKey = "io.github.lswlc33.dashboard.ios.boot.reason"
@@ -234,9 +263,18 @@ final class PanelController: UIViewController, WKNavigationDelegate, WKUIDelegat
     /// 最终栈溢出闪退。`usingLocalSnapshot = false` 挡不住，因为 preparePanel
     /// 进门就又把它置回 true。回退后必须真的落到 https。
     private var localFallbackUsed = false
+    /// 主线程上的启动世代；stopLoading 之前先撤旧票据，取消/迟到回调就不会碰新导航。
+    private var startupGeneration = 0
+    private var currentNavigation: WKNavigation?
+    private var currentNavigationID: String?
+    private var navigationTerminal = true
     private var bootWatchTimer: Timer?
     private var bootWatchTick = 0
-    private var bootWatchStartedAt: TimeInterval = 0
+    private var bootWatchActive = false
+    private var bootWatchForegroundElapsed: TimeInterval = 0
+    private var bootWatchForegroundStartedAt: TimeInterval?
+    /// 暂停/恢复也换票据：后台前发出的 JS 探测不能在回来后误判超时。
+    private var bootWatchGeneration = 0
     private var documentFinished = false
     /// 白屏诊断页只弹一次，别在每次看门狗探测时都弹。
     private var diagnosticsShown = false
@@ -264,6 +302,17 @@ final class PanelController: UIViewController, WKNavigationDelegate, WKUIDelegat
             }
             updateNotificationTokens.append(token)
         }
+        for name in [UIApplication.willResignActiveNotification, UIApplication.didEnterBackgroundNotification] {
+            let token = NotificationCenter.default.addObserver(forName: name, object: nil, queue: .main) { [weak self] _ in
+                self?.pauseBootWatch()
+            }
+            updateNotificationTokens.append(token)
+        }
+        let activeToken = NotificationCenter.default.addObserver(forName: UIApplication.didBecomeActiveNotification,
+                                                                 object: nil, queue: .main) { [weak self] _ in
+            self?.resumeBootWatch()
+        }
+        updateNotificationTokens.append(activeToken)
         web.allowsBackForwardNavigationGestures = true
         // 页面自己按原生给出的 safeArea 留白，不需要 WebView 再叠一层 inset。
         web.scrollView.contentInsetAdjustmentBehavior = .never
@@ -295,7 +344,7 @@ final class PanelController: UIViewController, WKNavigationDelegate, WKUIDelegat
     }
 
     private func startLaunchUpdateChecks() {
-        guard documentFinished, view.window != nil, !checkedOnLaunch, !returningToWelcome else { return }
+        guard documentFinished, !navigationTerminal, view.window != nil, !checkedOnLaunch, !returningToWelcome else { return }
         checkedOnLaunch = true
         checkUpdate(manual: false)
         checkPanelAutomatically()
@@ -449,20 +498,24 @@ final class PanelController: UIViewController, WKNavigationDelegate, WKUIDelegat
     }
 
     private func checkPanelAutomatically() {
-        guard let core = bridge, let navigation = core.currentNavigationID() else { return }
+        guard !navigationTerminal, let core = bridge, let navigation = core.currentNavigationID() else { return }
+        let ticket = startupGeneration
         let line = IOSPanelLine.current
         panelCheckTask?.cancel()
         web.evaluateJavaScript("document.querySelector('meta[name=build]')?.content || ''") { [weak self, weak core] value, _ in
             guard let self = self, let core = core, self.bridge === core,
+                  self.isCurrentStartup(ticket, navigationID: navigation),
                   core.currentNavigationID() == navigation, IOSPanelLine.current == line,
                   !self.returningToWelcome, UIApplication.shared.applicationState == .active else { return }
             let current = (value as? String ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
             guard current.utf8.count <= 32 else { return }
             self.panelCheckTask = Task { @MainActor [weak self, weak core] in
                 guard !Task.isCancelled, let self = self, let core = core,
+                      self.isCurrentStartup(ticket, navigationID: navigation),
                       core.currentNavigationID() == navigation, IOSPanelLine.current == line else { return }
                 _ = try? await IOSUpdateCenter.shared.checkPanel(current: current, line: line, force: false)
-                guard !Task.isCancelled, core.currentNavigationID() == navigation else { return }
+                guard !Task.isCancelled, self.isCurrentStartup(ticket, navigationID: navigation),
+                      core.currentNavigationID() == navigation else { return }
                 self.panelCheckTask = nil
             }
         }
@@ -473,9 +526,12 @@ final class PanelController: UIViewController, WKNavigationDelegate, WKUIDelegat
               UIApplication.shared.applicationState == .active, presentedViewController == nil,
               !IOSPanelCache.shared.snapshot().busy else { return false }
         returningToWelcome = true
+        let ticket = startupGeneration
+        let navigationID = currentNavigationID
         // 当前 RPC 先交回网页，下一主队列才拆桥；回欢迎页不会清除账号或当成启动失败。
         DispatchQueue.main.async { [weak self] in
-            guard let self = self, self.returningToWelcome else { return }
+            guard let self = self, self.returningToWelcome, self.startupGeneration == ticket,
+                  self.currentNavigationID == navigationID else { return }
             guard UIApplication.shared.applicationState == .active else { self.returningToWelcome = false; return }
             self.onWelcome?()
         }
@@ -489,6 +545,10 @@ final class PanelController: UIViewController, WKNavigationDelegate, WKUIDelegat
 
     func stopForRecovery() {
         returningToWelcome = true
+        startupGeneration &+= 1
+        navigationTerminal = true
+        currentNavigation = nil
+        currentNavigationID = nil
         cancelUpdateChecks()
         updateNotificationTokens.forEach { NotificationCenter.default.removeObserver($0) }
         updateNotificationTokens.removeAll()
@@ -509,6 +569,7 @@ final class PanelController: UIViewController, WKNavigationDelegate, WKUIDelegat
     }
 
     private func loadPanel() {
+        guard !returningToWelcome else { return }
         // 显式重载（诊断页「重试」、更新后重启）视为新一轮启动：
         // 必须复位所有一次性闸门。否则重试后仍失败时 diagnosticsShown 已经是 true，
         // 诊断页/横幅都不会再出现，用户只能看到永久静默白屏；
@@ -541,10 +602,20 @@ final class PanelController: UIViewController, WKNavigationDelegate, WKUIDelegat
     }
 
     private func preparePanel(_ url: URL) {
+        guard !returningToWelcome else { return }
+        startupGeneration &+= 1
+        let ticket = startupGeneration
+        navigationTerminal = false
+        currentNavigation = nil
+        currentNavigationID = nil
+        documentFinished = false
+        stopBootWatch()
         cancelUpdateChecks()
+        // 必须先撤掉旧导航的身份，再 stopLoading；它触发的取消回调不能结束新一轮。
         web.stopLoading()
         guard let bridge = bridge else {
             IOSDiagnostics.shared.log("preparePanel: bridge 未就绪")
+            navigationTerminal = true
             return
         }
         // 有本地快照就把主文档改写到 zeeho-panel://，弱网/离线也能进；
@@ -557,12 +628,17 @@ final class PanelController: UIViewController, WKNavigationDelegate, WKUIDelegat
         // 全部落在阈值以下，唯一的「卡在哪」取证通道就失效了。
         lastLoggedProgress = -10
         IOSDiagnostics.shared.log("preparePanel: url=\(url.absoluteString) target=\(target.absoluteString) local=\(usingLocalSnapshot) snapshotBuild=\(IOSPanelCache.shared.snapshotBuild())")
-        bridge.prepareNavigation(to: target) { [weak self] result in
-            guard let self = self else { return }
+        bridge.prepareNavigation(to: target) { [weak self, weak bridge] result in
+            guard let self = self, let bridge = bridge, self.bridge === bridge,
+                  self.startupGeneration == ticket, !self.navigationTerminal,
+                  !self.returningToWelcome else { return }
             switch result {
             case let .success(target):
+                let navigationID = PanelNavigation.navigationID(in: target)
+                guard !navigationID.isEmpty, bridge.currentNavigationID() == navigationID else { return }
+                self.currentNavigationID = navigationID
                 IOSDiagnostics.shared.log("prepareNavigation OK -> \(target.absoluteString)")
-                self.web.load(URLRequest(url: target, cachePolicy: .reloadIgnoringLocalCacheData, timeoutInterval: 30))
+                self.currentNavigation = self.web.load(URLRequest(url: target, cachePolicy: .reloadIgnoringLocalCacheData, timeoutInterval: 30))
             case let .failure(error):
                 IOSDiagnostics.shared.log("prepareNavigation FAILED: \(error)")
                 self.showError(error)
@@ -577,7 +653,7 @@ final class PanelController: UIViewController, WKNavigationDelegate, WKUIDelegat
     /// `preparePanel` 一律走 https。持久性失败（快照文件被清、Data Protection
     /// 未解锁）本来也不会因为重试本地而好转，再回退只会无限自旋。
     private func fallbackToNetwork() -> Bool {
-        guard usingLocalSnapshot, !localFallbackUsed else { return false }
+        guard !returningToWelcome, !navigationTerminal, usingLocalSnapshot, !localFallbackUsed else { return false }
         localFallbackUsed = true
         usingLocalSnapshot = false
         BootHealth.failed(reason: "resources")
@@ -585,13 +661,30 @@ final class PanelController: UIViewController, WKNavigationDelegate, WKUIDelegat
         return true
     }
 
+    /// WKNavigation 对象比 web.url 更早能区分新旧；旧失败回调里 web.url 可能已是新页。
+    private func isCurrentNavigation(_ webView: WKWebView, _ navigation: WKNavigation?) -> Bool {
+        guard webView === web, !returningToWelcome, !navigationTerminal,
+              let navigation = navigation, let current = currentNavigation,
+              navigation === current, let id = currentNavigationID,
+              bridge?.currentNavigationID() == id else { return false }
+        return true
+    }
+
+    private func isCurrentStartup(_ ticket: Int, navigationID: String) -> Bool {
+        !returningToWelcome && !navigationTerminal && startupGeneration == ticket
+            && currentNavigation != nil && currentNavigationID == navigationID
+            && bridge?.currentNavigationID() == navigationID
+    }
+
     func webView(_ webView: WKWebView, didStartProvisionalNavigation navigation: WKNavigation!) {
+        guard isCurrentNavigation(webView, navigation) else { return }
         cancelUpdateChecks()
         IOSDiagnostics.shared.log("didStartProvisionalNavigation: \(webView.url?.absoluteString ?? "nil")")
         beginBootWatch()
     }
 
     func webView(_ webView: WKWebView, didCommit navigation: WKNavigation!) {
+        guard isCurrentNavigation(webView, navigation) else { return }
         IOSDiagnostics.shared.log("didCommit: \(webView.url?.absoluteString ?? "nil")")
         // 兜底补注入：自定义 scheme 下 atDocumentStart 的 user script 可能不执行
         // （WKWebView 对非 http(s) 来源的限制），那 ios-bridge.js 执行时
@@ -601,6 +694,7 @@ final class PanelController: UIViewController, WKNavigationDelegate, WKUIDelegat
     }
 
     func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
+        guard isCurrentNavigation(webView, navigation), !documentFinished else { return }
         IOSDiagnostics.shared.log("didFinish: \(webView.url?.absoluteString ?? "nil")")
         // 文档下载完不等于业务就绪，先探测；仍卡骨架时保留有界诊断计时器。
         documentFinished = true
@@ -609,59 +703,117 @@ final class PanelController: UIViewController, WKNavigationDelegate, WKUIDelegat
     }
 
     func webView(_ webView: WKWebView, didFailProvisionalNavigation navigation: WKNavigation!, withError error: Error) {
+        guard isCurrentNavigation(webView, navigation) else { return }
         IOSDiagnostics.shared.log("didFailProvisionalNavigation: \(error.localizedDescription) (\((error as NSError).code))")
-        stopBootWatch()
         showError(error)
     }
 
     func webView(_ webView: WKWebView, didFail navigation: WKNavigation!, withError error: Error) {
+        guard isCurrentNavigation(webView, navigation) else { return }
         IOSDiagnostics.shared.log("didFail: \(error.localizedDescription) (\((error as NSError).code))")
-        stopBootWatch()
         showError(error)
     }
 
     // MARK: - 启动看门狗
 
-    /// 导航开始后每 2 秒探一次，文档完成但业务未就绪时继续，最多 40 秒。
-    ///
-    /// 为什么不能只靠 didFinish：真机上出现过 didCommit 成功、didFinish 永不触发
-    /// 的情况（页面一直没进 load 完成态），那时所有挂在 didFinish 上的诊断都不会跑，
-    /// 用户只看到一片可缩放拖动的白屏。看门狗不依赖任何 delegate 回调。
+    /// 导航开始后每 2 秒探一次，文档完成但业务未就绪时继续，最多 40 秒前台时间。
+    /// 退后台/系统授权暂失焦时暂停，不把用户在设置里的停留算成启动超时。
+    /// didFinish 可能永不触发，所以计时不能依赖文档完成回调。
     private func beginBootWatch() {
+        guard !returningToWelcome, !navigationTerminal, !bootWatchActive else { return }
         stopBootWatch()
         bootWatchTick = 0
-        bootWatchStartedAt = ProcessInfo.processInfo.systemUptime
+        bootWatchForegroundElapsed = 0
         documentFinished = false
-        scheduleBootWatch()
+        bootWatchActive = true
+        resumeBootWatch()
     }
 
-    private func scheduleBootWatch() {
-        guard bootWatchTick < 20 else {
-            IOSDiagnostics.shared.log("bootWatch: 40 秒内业务尚未就绪，停止探测")
-            return
+    private func pauseBootWatch(invalidateProbes: Bool = true) {
+        if let started = bootWatchForegroundStartedAt {
+            bootWatchForegroundElapsed += max(0, ProcessInfo.processInfo.systemUptime - started)
         }
-        bootWatchTick += 1
-        bootWatchTimer = Timer.scheduledTimer(withTimeInterval: 2.0, repeats: false) { [weak self] _ in
-            guard let self = self else { return }
-            self.diagnoseIfBlank(tag: "bootWatch#\(self.bootWatchTick)")
-            self.scheduleBootWatch()
-        }
-    }
-
-    private func stopBootWatch() {
+        bootWatchForegroundStartedAt = nil
+        if invalidateProbes { bootWatchGeneration &+= 1 }
         bootWatchTimer?.invalidate()
         bootWatchTimer = nil
     }
 
+    private func resumeBootWatch() {
+        guard !returningToWelcome, !navigationTerminal,
+              UIApplication.shared.applicationState == .active else { return }
+        guard bootWatchActive, bootWatchForegroundStartedAt == nil else { return }
+        // 预算耗尽后不再轮询；若末次探测被退后台丢弃，恢复前台时补发最终探测。
+        if bootWatchAge() >= 40 {
+            diagnoseIfBlank(tag: "bootWatch#final")
+            return
+        }
+        bootWatchForegroundStartedAt = ProcessInfo.processInfo.systemUptime
+        bootWatchGeneration &+= 1
+        scheduleBootWatch()
+    }
+
+    private func bootWatchAge() -> TimeInterval {
+        guard let started = bootWatchForegroundStartedAt else { return bootWatchForegroundElapsed }
+        return bootWatchForegroundElapsed + max(0, ProcessInfo.processInfo.systemUptime - started)
+    }
+
+    private func scheduleBootWatch() {
+        guard bootWatchActive, !returningToWelcome, !navigationTerminal,
+              bootWatchTimer == nil, bootWatchForegroundStartedAt != nil, bootWatchAge() < 40,
+              UIApplication.shared.applicationState == .active,
+              let navigationID = currentNavigationID else { return }
+        let ticket = startupGeneration
+        let watchTicket = bootWatchGeneration
+        bootWatchTimer = Timer.scheduledTimer(withTimeInterval: 2.0, repeats: false) { [weak self] _ in
+            guard let self = self, self.isCurrentStartup(ticket, navigationID: navigationID),
+                  self.bootWatchActive, self.bootWatchGeneration == watchTicket else { return }
+            self.bootWatchTimer = nil
+            guard UIApplication.shared.applicationState == .active else { self.pauseBootWatch(); return }
+            self.bootWatchTick += 1
+            self.diagnoseIfBlank(tag: "bootWatch#\(self.bootWatchTick)")
+            // JS 回调可能同步成功、回退或进终态，不能无条件续上一枚旧计时器。
+            guard self.isCurrentStartup(ticket, navigationID: navigationID),
+                  self.bootWatchActive, self.bootWatchGeneration == watchTicket else { return }
+            if self.bootWatchAge() >= 40 {
+                IOSDiagnostics.shared.log("bootWatch: 40 秒前台时间内业务尚未就绪，停止探测")
+                // 保持看门狗活跃到末次探测回执；若该回执因退后台丢弃，恢复前台会补探。
+                self.pauseBootWatch(invalidateProbes: false)
+            } else {
+                self.scheduleBootWatch()
+            }
+        }
+    }
+
+    private func stopBootWatch() {
+        pauseBootWatch()
+        bootWatchActive = false
+    }
+
     func webViewWebContentProcessDidTerminate(_ webView: WKWebView) {
+        guard webView === web, !returningToWelcome, !navigationTerminal else { return }
         IOSDiagnostics.shared.log("webContentProcessDidTerminate")
+        navigationTerminal = true
+        stopBootWatch()
+        bridge?.navigationFailed()
+        BootHealth.failed(reason: "renderer")
         onBootFailure?("renderer")
     }
 
     private func showError(_ error: Error) {
-        guard (error as NSError).code != NSURLErrorCancelled else { return }
+        guard !returningToWelcome, !navigationTerminal else { return }
+        // 当前导航取消只收尾，不写失败或耗掉本地回退；旧导航已由身份闸门挡住。
+        if (error as NSError).code == NSURLErrorCancelled {
+            navigationTerminal = true
+            stopBootWatch()
+            cancelUpdateChecks()
+            bridge?.navigationFailed()
+            return
+        }
         // 本地快照读不出来（文件被清、权限问题）先自动回退线上，别让用户看白屏。
         if fallbackToNetwork() { return }
+        navigationTerminal = true
+        stopBootWatch()
         bridge?.navigationFailed()
         BootHealth.failed(reason: "load_failed")
         onBootFailure?("load_failed")
@@ -670,6 +822,14 @@ final class PanelController: UIViewController, WKNavigationDelegate, WKUIDelegat
     /// 检查页面是否真的画出了东西；空的话把细节写进日志。
     /// 只读探测，不改页面状态。`tag` 用来区分触发时机（didFinish / bootWatch#N）。
     private func diagnoseIfBlank(tag: String = "didFinish") {
+        guard !returningToWelcome, !navigationTerminal,
+              UIApplication.shared.applicationState == .active,
+              let navigation = currentNavigation, let navigationID = currentNavigationID,
+              let url = web.url, PanelNavigation.navigationID(in: url) == navigationID,
+              bridge?.currentNavigationID() == navigationID else { return }
+        let ticket = startupGeneration
+        let watchTicket = bootWatchGeneration
+        let watchAge = bootWatchAge()
         let probe = """
         (function () {
           try {
@@ -701,6 +861,7 @@ final class PanelController: UIViewController, WKNavigationDelegate, WKUIDelegat
               fatal: !!document.getElementById('__zeeho_ios_fatal'),
               fatalText: (document.getElementById('__zeeho_ios_fatal') || {}).textContent || '',
               origin: location.origin, path: location.pathname,
+              navigationID: window.__zeehoIOS && window.__zeehoIOS.navId || '',
               title: document.title || ''
             };
             return JSON.stringify(info);
@@ -708,7 +869,11 @@ final class PanelController: UIViewController, WKNavigationDelegate, WKUIDelegat
         })()
         """
         web.evaluateJavaScript(probe) { [weak self] value, error in
-            guard let self = self else { return }
+            guard let self = self, self.isCurrentStartup(ticket, navigationID: navigationID),
+                  self.currentNavigation === navigation, self.bootWatchGeneration == watchTicket,
+                  UIApplication.shared.applicationState == .active,
+                  let currentURL = self.web.url,
+                  PanelNavigation.navigationID(in: currentURL) == navigationID else { return }
             if let error = error {
                 IOSDiagnostics.shared.log("[\(tag)] probe FAILED: \(error)")
                 return
@@ -724,21 +889,32 @@ final class PanelController: UIViewController, WKNavigationDelegate, WKUIDelegat
             let preview = object["preview"] as? Bool ?? false
             let settled = object["bootSettled"] as? Bool ?? false
             let bootVisible = object["bootVisible"] as? Bool ?? false
-            if self.documentFinished, available, !preview, settled || !bootVisible {
+            // 探测确实来自当前文档才可确认成功；没有 bootstrap 的结果仍用于失败诊断。
+            let probeNavigationID = object["navigationID"] as? String ?? ""
+            guard probeNavigationID.isEmpty || probeNavigationID == navigationID else { return }
+            if self.documentFinished, available, !preview, !fatal,
+               probeNavigationID == navigationID, settled || !bootVisible {
                 BootHealth.clear()
                 self.stopBootWatch()
+                return
             }
-            // 真实壳不能把桥失败说成正常演示；30 秒握手期限后把日志直接交给用户。
-            let watchAge = ProcessInfo.processInfo.systemUptime - self.bootWatchStartedAt
+            // 真实壳不能把桥失败说成正常演示；期限只算本次探测发出前的前台时间。
             if watchAge >= 36, !available || preview, !self.diagnosticsShown {
                 self.diagnosticsShown = true
+                self.navigationTerminal = true
                 BootHealth.failed(reason: "ready_timeout")
                 self.stopBootWatch()
+                self.cancelUpdateChecks()
+                self.bridge?.navigationFailed()
                 IOSDiagnostics.shared.log("[\(tag)] iOS 原生服务未就绪，打开诊断日志")
                 self.presentDiagnostics()
                 return
             }
             if fatal, let detail = object["fatalText"] as? String, !detail.isEmpty {
+                self.navigationTerminal = true
+                self.stopBootWatch()
+                self.cancelUpdateChecks()
+                self.bridge?.navigationFailed()
                 self.showDiagnosticBanner(detail)
                 return
             }
@@ -751,17 +927,21 @@ final class PanelController: UIViewController, WKNavigationDelegate, WKUIDelegat
             // 只看 childCount 会把「还在下载」误判成白屏，白白把用户切到更慢的线上。
             let readyState = object["readyState"] as? String ?? ""
             let childCount = object["childCount"] as? Int ?? 0
-            // 文档还在 loading 时不算白屏（还可能画出来）；只有确认解析完
-            // （readyState=complete）或看门狗已经探了很多轮（10 秒多）才判死。
-            let blank = childCount == 0 && (readyState == "complete" || self.bootWatchTick >= 5)
+            // 文档还在 loading 时只按前台累计 10 秒判定；后台停留不占这个预算。
+            let blank = childCount == 0 && (readyState == "complete" || watchAge >= 10)
             if blank, self.usingLocalSnapshot {
                 IOSDiagnostics.shared.log("[\(tag)] body 为空且在用本地快照（readyState=\(readyState)），回退线上")
                 self.fallbackToNetwork()
                 return
             }
-            // 线上也空：这是真白屏，把日志弹给用户，让他能发给我。只弹一次。
-            if blank, !self.diagnosticsShown {
+            // readyState=loading 表示线上主文档仍可能在下载/解析；不要用 10 秒启动预算
+            // 把慢网连接关掉。只有浏览器确认解析完成的空白才是可终止的真白屏。
+            if blank, readyState == "complete", !self.diagnosticsShown {
                 self.diagnosticsShown = true
+                self.navigationTerminal = true
+                self.stopBootWatch()
+                self.cancelUpdateChecks()
+                self.bridge?.navigationFailed()
                 IOSDiagnostics.shared.log("[\(tag)] body 为空且已走线上（readyState=\(readyState)）——真白屏，弹出诊断")
                 self.presentDiagnostics()
                 return
@@ -783,7 +963,11 @@ final class PanelController: UIViewController, WKNavigationDelegate, WKUIDelegat
         let controller = DiagnosticsViewController()
         // 「重试」必须真的重载面板：以前诊断页里那个按钮只 dismiss，
         // 用户点完还是白屏，等于没有出口。
-        controller.onRetry = { [weak self] in self?.loadPanel() }
+        let ticket = startupGeneration
+        controller.onRetry = { [weak self] in
+            guard let self = self, !self.returningToWelcome, self.startupGeneration == ticket else { return }
+            self.loadPanel()
+        }
         controller.modalPresentationStyle = .pageSheet
         present(controller, animated: true)
     }
@@ -794,8 +978,10 @@ final class PanelController: UIViewController, WKNavigationDelegate, WKUIDelegat
         let alert = UIAlertController(title: "面板加载异常",
                                       message: String(detail.prefix(1200)),
                                       preferredStyle: .alert)
+        let ticket = startupGeneration
         alert.addAction(UIAlertAction(title: "重试", style: .default) { [weak self] _ in
-            self?.loadPanel()
+            guard let self = self, !self.returningToWelcome, self.startupGeneration == ticket else { return }
+            self.loadPanel()
         })
         alert.addAction(UIAlertAction(title: "好", style: .cancel))
         present(alert, animated: true)
@@ -804,10 +990,12 @@ final class PanelController: UIViewController, WKNavigationDelegate, WKUIDelegat
 
     func webView(_ webView: WKWebView, decidePolicyFor action: WKNavigationAction,
                  decisionHandler: @escaping (WKNavigationActionPolicy) -> Void) {
+        guard webView === web, !returningToWelcome else { decisionHandler(.cancel); return }
         guard let url = action.request.url else { decisionHandler(.cancel); return }
         // 子资源请求仍由 WebKit 的同源/CORS 策略处理，只限制主框架与新窗口导航。
         if action.targetFrame?.isMainFrame == false { decisionHandler(.allow); return }
         if PanelNavigation.isPanel(url) {
+            guard !navigationTerminal else { decisionHandler(.cancel); return }
             // 每次真实文档导航先拿可信快照；back/forward/reload 不复用旧 nonce。
             if action.targetFrame != nil, action.navigationType == .other,
                bridge?.consumeNavigationPermit(url) == true {
@@ -859,7 +1047,8 @@ final class PanelController: UIViewController, WKNavigationDelegate, WKUIDelegat
 
     func webView(_ webView: WKWebView, createWebViewWith configuration: WKWebViewConfiguration,
                  for navigationAction: WKNavigationAction, windowFeatures: WKWindowFeatures) -> WKWebView? {
-        guard navigationAction.navigationType == .linkActivated,
+        guard webView === web, !returningToWelcome, !navigationTerminal,
+              navigationAction.navigationType == .linkActivated,
               let url = navigationAction.request.url else { return nil }
         if PanelNavigation.isPanel(url) { preparePanel(url) }
         else if PanelNavigation.isExternal(url) { UIApplication.shared.open(url) }
