@@ -88,6 +88,9 @@ enum SystemSnapshotStore {
         guard let active = active, let host = host else { return nil }
         return try host.validated(expectedOwner: active, now: now)
     }
+    // 固定单电（false）：本测试只校验择新/授权，倍率投影另有 Widget 契约覆盖。
+    static func dualDisplay(expectedOwner: SystemSnapshotOwner) -> Bool { false }
+    static func applyingDualDisplay(_ snapshot: SystemSnapshot?) -> SystemSnapshot? { snapshot }
     static func ownerIdentifier(_ id: String) -> SystemSnapshotOwner? {
         let parts = id.split(separator: ".")
         guard parts.count == 2 else { return nil }
