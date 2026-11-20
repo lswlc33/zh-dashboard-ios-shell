@@ -51,6 +51,23 @@ typealias IOSBLEPipeAuthorizationProvider = (IOSBLEPipeAuthorizationInput,
     @escaping (Result<IOSBLEPipeAuthorization, IOSBLEPipeFailure>) -> Void) -> (() -> Void)?
 typealias IOSBLEPipeConsentProvider = (IOSBLEPipeConsentInput, @escaping (Bool) -> Void) -> (() -> Void)?
 
+// AE4 专用原始命令：只接车型与两个索引，不接网页 HEX/UUID，也不经过普通协议编帧。
+enum IOSAE4ControllerFrame {
+    static func model(_ value: Any?) -> String? {
+        guard let text = value as? String, text.utf8.count <= 128 else { return nil }
+        let normalized = text.components(separatedBy: .whitespacesAndNewlines).joined().uppercased()
+        return ["AE4MAX2+", "AE4SE+"].contains(normalized) ? normalized : nil
+    }
+
+    static func build(voltageIndex: Any?, currentIndex: Any?) -> Data? {
+        guard let voltage = IOSBridgePolicy.integer(voltageIndex), (0...2).contains(voltage),
+              let current = IOSBridgePolicy.integer(currentIndex), (0...8).contains(current) else { return nil }
+        // 6AA5007057457776656E + 01/02/03 + 01...08/0F + 39，固定 13 bytes，不是 ASCII。
+        return Data([0x6A, 0xA5, 0x00, 0x70, 0x57, 0x45, 0x77, 0x76, 0x65, 0x6E,
+                     UInt8(voltage + 1), current == 8 ? 0x0F : UInt8(current + 1), 0x39])
+    }
+}
+
 final class IOSBluetoothService: NSObject, IOSBridgeService, IOSBridgeCancellableService, CBCentralManagerDelegate, CBPeripheralDelegate {
     static let shared = IOSBluetoothService()
     static let restorationIdentifier = "io.github.lswlc33.dashboard.ble.read.v1"
@@ -64,17 +81,76 @@ final class IOSBluetoothService: NSObject, IOSBridgeService, IOSBridgeCancellabl
     private static let notifyFailureLimit = 3
     // 系统断开/取消连接的回调可能丢失；超过这个时长就让 UUID 允许重新连接。
     private static let retiringStaleAfter: TimeInterval = 5
+    private static let nearbyScanDuration: TimeInterval = 8
+    private static let nearbyServices = [serviceUUID, diagnosticServiceUUID]
 
     let methods = ["ble.status", "ble.scan", "ble.stopScan", "ble.connect", "ble.disconnect",
+                   "ble.nearby", "ble.nearby.cancel", "ble.nearby.permission",
                    "ble.services", "ble.read", "ble.subscribe", "ble.write", "ble.poll",
                    "ble.open", "ble.exchange", "ble.close", "ble.identity", "ble.systemPairing",
-                   "ble.diagnostic.open", "ble.diagnostic.poll", "ble.diagnostic.close", "ble.renew.prepare"]
+                   "ble.diagnostic.open", "ble.diagnostic.poll", "ble.diagnostic.close", "ble.renew.prepare",
+                   "ble.controller.begin", "ble.controller.poll", "ble.controller.select", "ble.controller.cancel"]
+
+    private enum ControllerState: String {
+        case initializing, scanning, selecting, connecting, discovering, writing, done, error, cancelled, busy
+        case staleSession = "stale_session"
+
+        var isTerminal: Bool {
+            switch self {
+            case .done, .error, .cancelled, .busy, .staleSession: return true
+            default: return false
+            }
+        }
+    }
+
+    private struct ControllerCandidate {
+        let peripheral: CBPeripheral
+        let name: String
+        let rssi: Int?
+
+        var projection: [String: Any] {
+            ["id": peripheral.identifier.uuidString.lowercased(), "name": name, "rssi": rssi as Any? ?? NSNull()]
+        }
+    }
+
+    private final class ControllerRun {
+        let ticket = UUID().uuidString.lowercased()
+        let page: UInt64
+        let scope: IOSRideScope
+        let metadata: [String: Any]
+        let deadline = ProcessInfo.processInfo.systemUptime + 60
+        var command: Data
+        var connectionGeneration: UUID?
+        var state: ControllerState = .initializing
+        var reason = ""
+        var candidates: [UUID: ControllerCandidate] = [:]
+        var scanTimer: DispatchWorkItem?
+        var timeout: DispatchWorkItem?
+
+        init(page: UInt64, scope: IOSRideScope, metadata: [String: Any], command: Data) {
+            self.page = page; self.scope = scope; self.metadata = metadata; self.command = command
+        }
+    }
 
     private final class Call {
         let page: UInt64
         var reply: ((Any?, String?) -> Void)?
         var timeout: DispatchWorkItem?
         init(page: UInt64, reply: @escaping (Any?, String?) -> Void) { self.page = page; self.reply = reply }
+    }
+
+    private final class NearbyRun {
+        let call: Call
+        let scope: IOSRideScope
+        let frame: String
+        let name: String
+        let requestID: AnyHashable
+        let deadline = ProcessInfo.processInfo.systemUptime + IOSBluetoothService.nearbyScanDuration
+        var scanning = false
+
+        init(call: Call, scope: IOSRideScope, frame: String, name: String, requestID: AnyHashable) {
+            self.call = call; self.scope = scope; self.frame = frame; self.name = name; self.requestID = requestID
+        }
     }
 
     private struct Seen {
@@ -113,9 +189,11 @@ final class IOSBluetoothService: NSObject, IOSBridgeService, IOSBridgeCancellabl
         var renewalCapability: UUID?
         var onRenewalReply: ((Bool) -> Void)?
         var timeout: DispatchWorkItem?
-        init(kind: Kind, call: Call, characteristic: CBCharacteristic, enabled: Bool = false, data: Data = Data()) {
+        let controllerTicket: String?
+        init(kind: Kind, call: Call, characteristic: CBCharacteristic, enabled: Bool = false, data: Data = Data(),
+             controllerTicket: String? = nil) {
             self.kind = kind; self.call = call; self.characteristic = characteristic
-            self.enabled = enabled; self.data = data
+            self.enabled = enabled; self.data = data; self.controllerTicket = controllerTicket
         }
     }
 
@@ -133,8 +211,22 @@ final class IOSBluetoothService: NSObject, IOSBridgeService, IOSBridgeCancellabl
     private var central: CBCentralManager?
     private let protocolCodec = SharedProtocol()
     private var scopeProvider: (() -> IOSRideScope?)?
+    private var metadataProvider: (() -> [String: Any]?)?
+    private var controllerRun: ControllerRun?
+    private var activeController: ControllerRun? {
+        guard let run = controllerRun, !run.state.isTerminal else { return nil }
+        return run
+    }
+    private var controllerConnection: ControllerRun? {
+        guard let run = activeController, run.connectionGeneration == epoch else { return nil }
+        return run
+    }
+    private var writeQueueConnected: Bool {
+        connected || (controllerConnection?.state == .writing && peripheral?.state == .connected)
+    }
     private var presenterProvider: (() -> UIViewController?)?
     private var foregroundObserver: NSObjectProtocol?
+    private var inactiveObserver: NSObjectProtocol?
     private var observers: [UUID: Observer] = [:]
     private var page: UInt64 = 0
     private var epoch = UUID()
@@ -144,6 +236,8 @@ final class IOSBluetoothService: NSObject, IOSBridgeService, IOSBridgeCancellabl
     private var restoredIdentifiers = Set<UUID>()
     private var retiring: [UUID: Retiring] = [:]
     private var scanCall: Call?
+    private var nearbyRun: NearbyRun?
+    private var nearbyPermissionCall: Call?
     private var scanRequested = false
     private var scanDeadline: TimeInterval = 0
     private var connectCall: Call?
@@ -567,6 +661,7 @@ final class IOSBluetoothService: NSObject, IOSBridgeService, IOSBridgeCancellabl
 
     private func openPipe(_ options: [String: Any], diagnostic: Bool = false, reply: @escaping (Any?, String?) -> Void) {
         guard UIApplication.shared.applicationState == .active else { reply(failure("foreground_required"), nil); return }
+        finishNearby()
         // 扫描确认/授权仍在途时不能开连接，避免 scan 收尾覆盖连接状态。
         guard scanCall == nil, !scanRequested, central?.isScanning != true else { reply(failure("scan_busy"), nil); return }
         guard pipeOpenCall == nil, pipePairCall == nil, pipeExchange == nil, operation == nil,
@@ -825,6 +920,222 @@ final class IOSBluetoothService: NSObject, IOSBridgeService, IOSBridgeCancellabl
         }
     }
 
+    private func controllerResult(_ state: ControllerState, reason: String = "", ticket: String = "") -> [String: Any] {
+        ["ok": !state.isTerminal || state == .done, "ticket": ticket, "state": state.rawValue, "reason": reason,
+         "done": state.isTerminal, "acknowledgement": "gatt_only", "vehicleActionConfirmed": false]
+    }
+
+    private func controllerSnapshot(_ run: ControllerRun) -> [String: Any] {
+        var result = controllerResult(run.state, reason: run.reason, ticket: run.ticket)
+        if run.state == .selecting {
+            result["devices"] = run.candidates.values.sorted {
+                $0.peripheral.identifier.uuidString < $1.peripheral.identifier.uuidString
+            }.map(\.projection)
+        }
+        return result
+    }
+
+    private func controllerOptions(_ supplied: [String: Any]) -> [String: Any] {
+        guard let frame = IOSBridgePolicy.integer(supplied["frame"]) else { return supplied }
+        var options = supplied
+        options["frame"] = String(frame)
+        return options
+    }
+
+    private func controllerContextCurrent(_ run: ControllerRun) -> Bool {
+        guard run.page == page, scopeProvider?() == run.scope, let metadata = metadataProvider?() else { return false }
+        return IOSNativeUtilityService.matches(run.metadata, metadata)
+    }
+
+    private func revokeStaleController() {
+        if let run = activeController, !controllerContextCurrent(run) {
+            finishController(run, state: .staleSession, reason: "stale_session")
+        }
+    }
+
+    private func controllerTicket(_ options: [String: Any]) -> ControllerRun? {
+        guard let run = controllerRun, options["ticket"] as? String == run.ticket,
+              IOSNativeUtilityService.matches(options, run.metadata), controllerContextCurrent(run) else { return nil }
+        return run
+    }
+
+    // 每个异步阶段和实际 GATT 写入前都重新校验，不把网页提交时的会话当作永久授权。
+    private func checkController(_ run: ControllerRun) -> Bool {
+        guard activeController === run else { return false }
+        guard controllerContextCurrent(run) else {
+            finishController(run, state: .staleSession, reason: "stale_session"); return false
+        }
+        guard UIApplication.shared.applicationState == .active else {
+            finishController(run, state: .cancelled, reason: "foreground_required"); return false
+        }
+        guard ProcessInfo.processInfo.systemUptime < run.deadline else {
+            finishController(run, state: .error, reason: "operation_timeout"); return false
+        }
+        return true
+    }
+
+    private func finishController(_ run: ControllerRun, state terminal: ControllerState, reason: String, disconnect: Bool = true) {
+        guard activeController === run else { return }
+        if run.state == .scanning, central?.isScanning == true { central?.stopScan() }
+        run.state = terminal
+        run.reason = reason
+        run.scanTimer?.cancel(); run.scanTimer = nil
+        run.timeout?.cancel(); run.timeout = nil
+        run.candidates.removeAll()
+        run.command.removeAll()
+        // 只退役该票据借用的连接，绝不关闭普通 RPC 或下一代连接。
+        if disconnect && run.connectionGeneration == epoch, peripheral != nil {
+            closeConnection(reason.isEmpty ? "controller_write_complete" : reason)
+        }
+    }
+
+    private func beginController(_ options: [String: Any]) -> [String: Any] {
+        guard let scope = scopeProvider?(), scope.valid, let metadata = metadataProvider?(),
+              scope.accountID == metadata["accountId"] as? String, scope.vin == metadata["vin"] as? String,
+              IOSNativeUtilityService.matches(options, metadata) else {
+            return controllerResult(.staleSession, reason: "stale_session")
+        }
+        guard UIApplication.shared.applicationState == .active else {
+            return controllerResult(.error, reason: "foreground_required")
+        }
+        finishNearby()
+        guard activeController == nil, recordingID == nil, pipeLease == nil, pipeOpenCall == nil, scanCall == nil,
+              !scanRequested, central?.isScanning != true, peripheral == nil, connectCall == nil, operation == nil,
+              confirmationCall == nil, currentRequest == nil, requests.isEmpty else {
+            return controllerResult(.busy, reason: "transport_busy")
+        }
+        guard Set(options.keys).isSubset(of: ["navId", "vin", "frame", "epoch", "generation", "accountId",
+                                             "model", "voltageIndex", "currentIndex"]) else {
+            return controllerResult(.error, reason: "invalid_options")
+        }
+        guard IOSAE4ControllerFrame.model(options["model"]) != nil else {
+            return controllerResult(.error, reason: "unsupported_model")
+        }
+        guard let command = IOSAE4ControllerFrame.build(voltageIndex: options["voltageIndex"], currentIndex: options["currentIndex"]) else {
+            return controllerResult(.error, reason: "invalid_settings")
+        }
+
+        let run = ControllerRun(page: page, scope: scope, metadata: metadata, command: command)
+        controllerRun = run
+        let timeout = DispatchWorkItem { [weak self, weak run] in
+            guard let self = self, let run = run else { return }
+            self.finishController(run, state: .error, reason: "operation_timeout")
+        }
+        run.timeout = timeout
+        DispatchQueue.main.asyncAfter(deadline: .now() + 60, execute: timeout)
+        DispatchQueue.main.async { [weak self, weak run] in
+            guard let self = self, let run = run, self.checkController(run) else { return }
+            _ = self.manager()
+            self.startControllerScan()
+        }
+        return controllerSnapshot(run)
+    }
+
+    private func handleController(_ method: String, _ options: [String: Any]) -> [String: Any] {
+        if method == "ble.controller.begin" { return beginController(options) }
+        guard let run = controllerTicket(options) else { return controllerResult(.staleSession, reason: "stale_ticket") }
+        guard !run.state.isTerminal else { return controllerSnapshot(run) }
+        switch method {
+        case "ble.controller.cancel": finishController(run, state: .cancelled, reason: "cancelled")
+        case "ble.controller.select":
+            guard checkController(run), run.state == .selecting else { return controllerSnapshot(run) }
+            guard let text = options["id"] as? String, let id = UUID(uuidString: text), let candidate = run.candidates[id] else {
+                var result = controllerSnapshot(run)
+                result["ok"] = false
+                result["reason"] = "invalid_selection"
+                return result
+            }
+            connectController(run, candidate: candidate)
+        default:
+            // poll 不驱动重试。系统授权提示临时 inactive 时，初始化只等待，不持有连接。
+            if run.state != .initializing { _ = checkController(run) }
+        }
+        return controllerSnapshot(run)
+    }
+
+    private func startControllerScan() {
+        guard let run = activeController, run.state == .initializing, let central = central else { return }
+        switch central.state {
+        case .poweredOn:
+            // 首次系统蓝牙权限弹窗会暂时 inactive；不连接，恢复前台后再开始本轮扫描。
+            guard UIApplication.shared.applicationState == .active, checkController(run) else { return }
+            guard !central.isScanning else { finishController(run, state: .error, reason: "scan_busy"); return }
+            run.state = .scanning
+            central.scanForPeripherals(withServices: [Self.serviceUUID], options: [CBCentralManagerScanOptionAllowDuplicatesKey: false])
+            let timer = DispatchWorkItem { [weak self, weak run] in
+                guard let self = self, let run = run else { return }
+                self.finishControllerScan(run)
+            }
+            run.scanTimer = timer
+            DispatchQueue.main.asyncAfter(deadline: .now() + 8, execute: timer)
+        case .unauthorized, .unsupported, .poweredOff:
+            finishController(run, state: .error, reason: powerName)
+        case .unknown, .resetting: break
+        @unknown default: finishController(run, state: .error, reason: "bluetooth_unavailable")
+        }
+    }
+
+    private func finishControllerScan(_ run: ControllerRun) {
+        guard run.state == .scanning, checkController(run) else { return }
+        central?.stopScan()
+        run.scanTimer = nil
+        if run.candidates.isEmpty {
+            finishController(run, state: .error, reason: "device_not_found")
+        } else if run.candidates.count == 1, let candidate = run.candidates.values.first {
+            connectController(run, candidate: candidate)
+        } else {
+            run.state = .selecting
+        }
+    }
+
+    private func connectController(_ run: ControllerRun, candidate: ControllerCandidate) {
+        guard checkController(run) else { return }
+        guard let central = central, central.state == .poweredOn else {
+            finishController(run, state: .error, reason: powerName); return
+        }
+        pruneRetiring()
+        let target = candidate.peripheral
+        guard peripheral == nil, operation == nil, target.state == .disconnected, retiring[target.identifier] == nil else {
+            finishController(run, state: .error, reason: "connection_busy"); return
+        }
+        run.state = .connecting
+        run.candidates.removeAll()
+        epoch = UUID()
+        run.connectionGeneration = epoch
+        peripheral = target
+        connectionScope = run.scope
+        connectionRole = 1
+        selectedServiceUUID = Self.serviceUUID
+        selectedWriteUUID = Self.writeUUID
+        writeCharacteristic = nil
+        notifyCharacteristic = nil
+        target.delegate = self
+        beginOperation(.connect, seconds: 15)
+        central.connect(target, options: nil)
+    }
+
+    private func enqueueControllerWrite(_ run: ControllerRun, service: CBService, error: Error?) {
+        guard run.state == .discovering, checkController(run) else { return }
+        guard error == nil, let write = service.characteristics?.first(where: { $0.uuid == Self.writeUUID }) else {
+            closeConnection(error == nil ? "missing_characteristic" : "characteristic_discovery_failed"); return
+        }
+        // 无响应写不能报告 GATT ACK；该模式不尝试通知、加密探测或重试。
+        guard write.properties.contains(.write) else { closeConnection("unsupported_write_type"); return }
+        clearOperation()
+        run.state = .writing
+        let call = Call(page: page) { [weak self, weak run] value, _ in
+            guard let self = self, let run = run, self.checkController(run) else { return }
+            if let result = value as? [String: Any], result["ok"] as? Bool == true, result["acknowledgement"] as? String == "gatt_only" {
+                self.finishController(run, state: .done, reason: "")
+            } else {
+                self.finishController(run, state: .error, reason: "write_failed")
+            }
+        }
+        let bytes = run.command
+        run.command.removeAll()
+        enqueue(Request(kind: .write, call: call, characteristic: write, data: bytes, controllerTicket: run.ticket))
+    }
+
     private func retirePipe(_ code: String, disconnect: Bool) {
         pipeWatch?.cancel(); pipeWatch = nil; pipeOpenID = UUID(); pipeOpenPhase = "idle"
         let opened = pipeOpenCall; pipeOpenCall = nil
@@ -854,12 +1165,24 @@ final class IOSBluetoothService: NSObject, IOSBridgeService, IOSBridgeCancellabl
             // 蓝牙授权框期间系统会先变 .inactive：那时 startScan 主动放弃，回到前台必须补扫，
             // 否则首次扫描整段空转到 deadline。didBecomeActive 时 applicationState 已是 .active。
             self.startScan()
+            self.startControllerScan()
+            self.checkNearbyPermission()
             self.publish()
+        }
+        inactiveObserver = NotificationCenter.default.addObserver(
+            forName: UIApplication.willResignActiveNotification, object: nil, queue: .main
+        ) { [weak self] _ in
+            guard let self = self else { return }
+            self.finishNearby()
+            // 首次系统授权仅可在初始化时等待；扫描、选择、连接或写入不跨前台中断。
+            guard let run = self.activeController, run.state != .initializing else { return }
+            self.finishController(run, state: .cancelled, reason: "foreground_required")
         }
     }
 
     deinit {
         if let observer = foregroundObserver { NotificationCenter.default.removeObserver(observer) }
+        if let observer = inactiveObserver { NotificationCenter.default.removeObserver(observer) }
         central?.stopScan()
         if let value = peripheral { central?.cancelPeripheralConnection(value) }
         central?.delegate = nil
@@ -869,6 +1192,12 @@ final class IOSBluetoothService: NSObject, IOSBridgeService, IOSBridgeCancellabl
         precondition(Thread.isMainThread)
         scopeProvider = provider
         scopeChanged()
+    }
+
+    func configureMetadataProvider(_ provider: @escaping () -> [String: Any]?) {
+        precondition(Thread.isMainThread)
+        metadataProvider = provider
+        revokeStaleController()
     }
 
     func configurePresenter(_ provider: @escaping () -> UIViewController?) {
@@ -885,6 +1214,8 @@ final class IOSBluetoothService: NSObject, IOSBridgeService, IOSBridgeCancellabl
 
     func scopeChanged() {
         precondition(Thread.isMainThread)
+        finishNearby()
+        revokeStaleController()
         checkScope()
     }
 
@@ -909,6 +1240,10 @@ final class IOSBluetoothService: NSObject, IOSBridgeService, IOSBridgeCancellabl
     }
     func setRecordingContext(id: UUID?, background: Bool, scope: IOSRideScope?) {
         precondition(Thread.isMainThread)
+        if id != nil {
+            finishNearby()
+            if let run = activeController { finishController(run, state: .cancelled, reason: "recording_started") }
+        }
         let wasRecording = recordingID != nil
         if recordingID != id || recordingScope != scope {
             detachRecordingAuthorization(); renewalBoundRecordingID = nil
@@ -952,11 +1287,28 @@ final class IOSBluetoothService: NSObject, IOSBridgeService, IOSBridgeCancellabl
             DispatchQueue.main.async { [weak self] in self?.handle(method: method, args: args, reply: reply) }
             return
         }
+        switch method {
+        case "ble.nearby":
+            beginNearby(args, reply: reply); return
+        case "ble.nearby.cancel":
+            let requestID = nearbyRequestID((args.first as? [String: Any])?["requestId"])
+            reply(["ok": args.count == 1 && cancelNearby(requestID)], nil); return
+        case "ble.nearby.permission":
+            nearbyPermission(args, reply: reply); return
+        default: break
+        }
+        revokeStaleController()
+        let options = args.first as? [String: Any] ?? [:]
+        if method.hasPrefix("ble.controller.") {
+            reply(handleController(method, controllerOptions(options)), nil); return
+        }
+        guard activeController == nil || method == "ble.status" else {
+            reply(failure("transport_busy"), nil); return
+        }
         checkScope()
         if recordingID != nil && ["ble.write", "ble.exchange", "ble.subscribe", "ble.disconnect", "ble.close"].contains(method) {
             reply(failure("recording_read_only_lease"), nil); return
         }
-        let options = args.first as? [String: Any] ?? [:]
         if pipeLease?.purpose == "diagnostic" {
             guard ["ble.status", "ble.diagnostic.open", "ble.diagnostic.poll", "ble.diagnostic.close"].contains(method) else {
                 reply(failure("diagnostic_read_only"), nil); return
@@ -1079,6 +1431,17 @@ final class IOSBluetoothService: NSObject, IOSBridgeService, IOSBridgeCancellabl
         guard Thread.isMainThread else {
             DispatchQueue.main.async { [weak self] in self?.cancel(method: method, args: args) }; return
         }
+        if method == "ble.nearby" {
+            _ = cancelNearby(nearbyRequestID((args.first as? [String: Any])?["requestId"]))
+            return
+        }
+        if method == "ble.nearby.permission" {
+            finishNearbyPermission(ok: false)
+            return
+        }
+        if method == "ble.nearby.cancel" { return }
+        // 控制器 RPC 同步回复，票据任务仅由专用 cancel 取消。
+        guard activeController == nil, !method.hasPrefix("ble.controller.") else { return }
         if ["ble.open", "ble.exchange", "ble.close", "ble.identity", "ble.systemPairing",
             "ble.diagnostic.open", "ble.diagnostic.poll", "ble.diagnostic.close"].contains(method) || pipeLease != nil {
             retirePipe("operation_cancelled", disconnect: recordingID == nil); return
@@ -1094,8 +1457,11 @@ final class IOSBluetoothService: NSObject, IOSBridgeService, IOSBridgeCancellabl
 
     func navigationChanged() {
         precondition(Thread.isMainThread)
+        if let run = activeController { finishController(run, state: .staleSession, reason: "stale_navigation") }
         if recordingOwnerLease == nil { retirePipe("stale_navigation", disconnect: false) }
         page &+= 1
+        finishNearby()
+        finishNearbyPermission(ok: false)
         finishScan(reason: "stale_navigation", validPage: false)
         cancelConfirmation("stale_navigation")
         // 新页面没有旧 IO 票据。仅已明确录制的现存只读订阅可保留，不能保留任何待发 write。
@@ -1110,6 +1476,9 @@ final class IOSBluetoothService: NSObject, IOSBridgeService, IOSBridgeCancellabl
 
     func applicationBackgrounded() {
         precondition(Thread.isMainThread)
+        finishNearby()
+        finishNearbyPermission(ok: false)
+        if let run = activeController { finishController(run, state: .cancelled, reason: "background_interrupted") }
         if recordingOwnerLease == nil { retirePipe("background_interrupted", disconnect: false) }
         // 后台打断不等于扫到 deadline：ok:false，网页才能把「中途中止」和正常收尾区分开。
         finishScan(reason: "background_interrupted", ok: false)
@@ -1140,7 +1509,8 @@ final class IOSBluetoothService: NSObject, IOSBridgeService, IOSBridgeCancellabl
         }
         return [
             "ok": true, "state": state, "reason": reason, "authorization": authorizationName,
-            "power": powerName, "initialized": central != nil, "scanning": central?.isScanning ?? false,
+            "power": powerName, "initialized": central != nil,
+            "scanning": nearbyRun == nil && central?.isScanning == true,
             "connected": connected, "id": peripheral?.identifier.uuidString.lowercased() as Any? ?? NSNull(),
             "identifierKind": "corebluetooth_uuid", "authenticated": false,
             "authenticationState": "not_evaluated_by_transport", "registrationVerified": false,
@@ -1148,7 +1518,7 @@ final class IOSBluetoothService: NSObject, IOSBridgeService, IOSBridgeCancellabl
             "systemBondState": "unknown_os_managed", "supportedRoles": [1, 2], "supported2": false,
             "role2ReadOnly": true, "diagnosticReady": pipeAuthorizationProvider != nil && pipeConsentProvider != nil,
             "diagnosticAvailable": pipeAuthorizationProvider != nil && pipeConsentProvider != nil && recordingID == nil
-                && pipeLease == nil && pipeOpenCall == nil && peripheral == nil && operation == nil && central?.state == .poweredOn,
+                && activeController == nil && pipeLease == nil && pipeOpenCall == nil && peripheral == nil && operation == nil && central?.state == .poweredOn,
             "role": connectionRole, "role2": "read_only_service_diagnostic",
             "protocol": "captured_ble1_small_frames", "iosVehicleVerification": "not_performed",
             "maxWriteBytes": peripheral.map { $0.maximumWriteValueLength(for: .withResponse) as Any } ?? NSNull(),
@@ -1214,8 +1584,109 @@ final class IOSBluetoothService: NSObject, IOSBridgeService, IOSBridgeCancellabl
         options["confirmed"] as? Bool == true && UIApplication.shared.applicationState == .active
     }
 
+    private func nearbyPermission(_ args: [Any], reply: @escaping (Any?, String?) -> Void) {
+        guard args.isEmpty, nearbyPermissionCall == nil, UIApplication.shared.applicationState == .active else {
+            reply(["ok": false], nil); return
+        }
+        switch CBCentralManager.authorization {
+        case .notDetermined:
+            // 设置按钮才走这条路径。等待记录由桥的 RPC 超时清理，不在系统弹窗打开时让网页重扫。
+            nearbyPermissionCall = Call(page: page, reply: reply)
+            _ = manager()
+            checkNearbyPermission()
+        case .allowedAlways: reply(["ok": true], nil)
+        case .denied: reply(["ok": false, "reason": "permission_denied"], nil)
+        case .restricted: reply(["ok": false, "reason": "permission_restricted"], nil)
+        @unknown default: reply(["ok": false], nil)
+        }
+    }
+
+    private func checkNearbyPermission() {
+        guard nearbyPermissionCall != nil, UIApplication.shared.applicationState == .active else { return }
+        let authorization = CBCentralManager.authorization
+        guard authorization != .notDetermined || central?.state == .unsupported else { return }
+        finishNearbyPermission(ok: authorization == .allowedAlways)
+    }
+
+    private func finishNearbyPermission(ok: Bool) {
+        guard let call = nearbyPermissionCall else { return }
+        nearbyPermissionCall = nil
+        finish(call, ["ok": ok])
+    }
+
+    private func nearbyRequestID(_ value: Any?) -> AnyHashable? {
+        if let id = IOSBridgePolicy.integer(value), id > 0 { return AnyHashable(id) }
+        if let id = value as? String, IOSBridgePolicy.identifier(id) { return AnyHashable(id) }
+        return nil
+    }
+
+    private func beginNearby(_ args: [Any], reply: @escaping (Any?, String?) -> Void) {
+        // 未授权时不能初始化 manager：CoreBluetooth 会因此弹出系统授权框。
+        guard UIApplication.shared.applicationState == .active, CBCentralManager.authorization == .allowedAlways,
+              nearbyRun == nil, activeController == nil, recordingID == nil, pipeLease == nil, pipeOpenCall == nil,
+              scanCall == nil, !scanRequested, central?.isScanning != true, peripheral == nil, connectCall == nil, operation == nil,
+              args.count == 1, let options = args.first as? [String: Any],
+              let requestID = nearbyRequestID(options["requestId"]),
+              let name = options["name"] as? String, name.utf8.count <= 38,
+              name.range(of: "^(?i:ZEEHO)-[A-Za-z0-9]{4,32}$", options: .regularExpression)
+                == (name.startIndex..<name.endIndex),
+              let vin = options["vin"] as? String, let frame = options["frame"] as? String,
+              let scope = scopeProvider?(), scope.valid, scope.vin == vin,
+              let metadata = metadataProvider?(), metadata["frame"] as? String == frame else {
+            reply(["ok": false], nil); return
+        }
+        let call = Call(page: page, reply: reply)
+        let run = NearbyRun(call: call, scope: scope, frame: frame, name: name, requestID: requestID)
+        nearbyRun = run
+        let timer = DispatchWorkItem { [weak self, weak run] in
+            guard let self = self, let run = run, self.nearbyRun === run else { return }
+            self.finishNearby()
+        }
+        call.timeout = timer
+        DispatchQueue.main.asyncAfter(deadline: .now() + Self.nearbyScanDuration, execute: timer)
+        _ = manager()
+        startNearbyScan()
+    }
+
+    private func nearbyContextCurrent(_ run: NearbyRun) -> Bool {
+        guard run.call.page == page, UIApplication.shared.applicationState == .active,
+              CBCentralManager.authorization == .allowedAlways, ProcessInfo.processInfo.systemUptime < run.deadline,
+              scopeProvider?() == run.scope, let metadata = metadataProvider?() else { return false }
+        return metadata["frame"] as? String == run.frame
+    }
+
+    private func startNearbyScan() {
+        guard let run = nearbyRun, let central = central else { return }
+        guard nearbyContextCurrent(run) else { finishNearby(); return }
+        switch central.state {
+        case .unknown where !run.scanning: break // 首次初始化等待真实电源状态，计入同一超时。
+        case .poweredOn:
+            guard !run.scanning else { return }
+            guard !central.isScanning else { finishNearby(); return }
+            run.scanning = true
+            central.scanForPeripherals(withServices: Self.nearbyServices, options: [CBCentralManagerScanOptionAllowDuplicatesKey: false])
+        default: finishNearby()
+        }
+    }
+
+    @discardableResult
+    private func cancelNearby(_ requestID: AnyHashable?) -> Bool {
+        guard let run = nearbyRun, run.call.page == page, let requestID = requestID, run.requestID == requestID else { return false }
+        finishNearby()
+        return true
+    }
+
+    private func finishNearby(rssi: Int? = nil) {
+        guard let run = nearbyRun else { return }
+        nearbyRun = nil
+        if run.scanning, central?.isScanning == true { central?.stopScan() }
+        if let rssi = rssi { finish(run.call, ["ok": true, "rssi": rssi]) }
+        else { finish(run.call, ["ok": false]) }
+    }
+
     private func scan(_ options: [String: Any], reply: @escaping (Any?, String?) -> Void) {
         guard userAction(options) else { reply(failure("user_action_required"), nil); return }
+        finishNearby()
         guard scanCall == nil, !scanRequested, central?.isScanning != true else { reply(failure("scan_busy"), nil); return }
         guard pipeOpenCall == nil, connectCall == nil, peripheral == nil, operation == nil,
               currentRequest == nil, requests.isEmpty else { reply(failure("operation_busy"), nil); return }
@@ -1251,7 +1722,7 @@ final class IOSBluetoothService: NSObject, IOSBridgeService, IOSBridgeCancellabl
     }
 
     private func startScan() {
-        guard scanRequested, scanCall != nil, central?.state == .poweredOn,
+        guard activeController == nil, scanRequested, scanCall != nil, central?.state == .poweredOn,
               pipeOpenCall == nil, connectCall == nil, peripheral == nil, operation == nil,
               UIApplication.shared.applicationState == .active,
               ProcessInfo.processInfo.systemUptime < scanDeadline else { return }
@@ -1265,9 +1736,9 @@ final class IOSBluetoothService: NSObject, IOSBridgeService, IOSBridgeCancellabl
 
     private func finishScan(reason code: String, ok: Bool = true, validPage: Bool = true) {
         scanRequested = false
-        central?.stopScan()
         guard let call = scanCall else { return }
         scanCall = nil
+        central?.stopScan()
         if !connected { state = central == nil ? "uninitialized" : "disconnected"; reason = code }
         finish(call, ["ok": ok, "state": ok ? "scan_completed" : "scan_failed", "reason": code, "devices": devices()], validPage: validPage)
         publish()
@@ -1275,6 +1746,7 @@ final class IOSBluetoothService: NSObject, IOSBridgeService, IOSBridgeCancellabl
 
     private func connect(_ options: [String: Any], reply: @escaping (Any?, String?) -> Void) {
         guard userAction(options) else { reply(failure("user_action_required"), nil); return }
+        finishNearby()
         guard scanCall == nil, !scanRequested, central?.isScanning != true else { reply(failure("scan_busy"), nil); return }
         guard let scope = scopeProvider?(), scope.valid else { reply(failure("authorized_vehicle_required"), nil); return }
         guard let text = options["id"] as? String, let id = UUID(uuidString: text) else {
@@ -1376,7 +1848,8 @@ final class IOSBluetoothService: NSObject, IOSBridgeService, IOSBridgeCancellabl
             if let callback = request.onRenewalReply { request.onRenewalReply = nil; callback(false) }
             else { finish(request.call, failure(code)) }
         }
-        guard connected, checkScope(), UIApplication.shared.applicationState == .active || internalRenewal else {
+        guard request.controllerTicket == controllerConnection?.ticket, writeQueueConnected, checkScope(),
+              UIApplication.shared.applicationState == .active || internalRenewal else {
             rejected("not_connected"); return
         }
         guard requests.count + (currentRequest == nil ? 0 : 1) < 16 else {
@@ -1410,7 +1883,7 @@ final class IOSBluetoothService: NSObject, IOSBridgeService, IOSBridgeCancellabl
     }
 
     private func pump() {
-        guard connected, checkScope(), operation == nil, let value = peripheral else { return }
+        guard writeQueueConnected, checkScope(), operation == nil, let value = peripheral else { return }
         // 排队为空时不触发前台闸门；录制的后台 notify 不能被空 pump 误断开。
         guard currentRequest != nil || !requests.isEmpty else { return }
         let candidate = currentRequest ?? requests.first
@@ -1422,7 +1895,7 @@ final class IOSBluetoothService: NSObject, IOSBridgeService, IOSBridgeCancellabl
             let next = requests.removeFirst()
             currentRequest = next
             let started = next.onStart; next.onStart = nil; started?()
-            guard currentRequest === next, connected else { return }
+            guard currentRequest === next, writeQueueConnected else { return }
             armRequestTimeout(next)
         }
         guard let request = currentRequest else { return }
@@ -1442,6 +1915,15 @@ final class IOSBluetoothService: NSObject, IOSBridgeService, IOSBridgeCancellabl
             let maxValue = value.maximumWriteValueLength(for: .withResponse)
             guard maxValue > 0, maxValue <= 512, request.offset < request.data.count else {
                 closeConnection("invalid_write_length"); return
+            }
+            if let ticket = request.controllerTicket {
+                guard let run = controllerConnection, run.ticket == ticket else { closeConnection("stale_session"); return }
+                guard checkController(run) else { return }
+                guard central?.state == .poweredOn else { closeConnection(powerName); return }
+                // 专用命令必须是一次完整 ATT 写；宁可拒绝也不能让通用分块改变报文。
+                guard request.offset == 0, request.data.count == 13, maxValue >= request.data.count else {
+                    closeConnection("invalid_write_length"); return
+                }
             }
             let bytes = min(maxValue, request.data.count - request.offset)
             request.chunkBytes = bytes
@@ -1503,6 +1985,11 @@ final class IOSBluetoothService: NSObject, IOSBridgeService, IOSBridgeCancellabl
     }
 
     private func closeConnection(_ code: String) {
+        if let run = controllerConnection {
+            let terminal: ControllerState = code == "stale_session" ? .staleSession
+                : code == "foreground_required" ? .cancelled : .error
+            finishController(run, state: terminal, reason: code, disconnect: false)
+        }
         let old = peripheral
         let connect = connectCall
         let current = currentRequest
@@ -1711,16 +2198,21 @@ final class IOSBluetoothService: NSObject, IOSBridgeService, IOSBridgeCancellabl
 
     func centralManagerDidUpdateState(_ central: CBCentralManager) {
         guard central === self.central else { return }
+        checkNearbyPermission()
+        startNearbyScan()
         switch central.state {
         case .poweredOn:
             if peripheral == nil && !scanRequested { state = "disconnected"; reason = "" }
             startScan()
+            startControllerScan()
         case .unauthorized, .unsupported, .poweredOff:
+            if let run = activeController { finishController(run, state: .error, reason: powerName, disconnect: false) }
             finishScan(reason: powerName, ok: false)
             closeConnection(powerName)
             state = powerName
             reason = powerName
         case .resetting:
+            if let run = activeController { finishController(run, state: .error, reason: "bluetooth_resetting", disconnect: false) }
             closeConnection("bluetooth_resetting")
             state = "resetting"
         case .unknown: state = "initializing"
@@ -1753,10 +2245,31 @@ final class IOSBluetoothService: NSObject, IOSBridgeService, IOSBridgeCancellabl
 
     func centralManager(_ central: CBCentralManager, didDiscover value: CBPeripheral,
                         advertisementData: [String: Any], rssi RSSI: NSNumber) {
-        guard central === self.central, scanRequested, central.isScanning,
-              ProcessInfo.processInfo.systemUptime <= scanDeadline else { return }
+        guard central === self.central, central.isScanning else { return }
         let rssi = RSSI.intValue == 127 ? nil : RSSI.intValue
+        if let run = nearbyRun {
+            // 只认同一次广播的完整 local name，不回退到系统缓存的 peripheral.name。
+            guard run.scanning, let rssi = rssi, (-127...20).contains(rssi),
+                  let name = advertisementData[CBAdvertisementDataLocalNameKey] as? String,
+                  name.utf8.elementsEqual(run.name.utf8) else { return }
+            let services = advertisementData[CBAdvertisementDataServiceUUIDsKey] as? [CBUUID] ?? []
+            let overflow = advertisementData[CBAdvertisementDataOverflowServiceUUIDsKey] as? [CBUUID] ?? []
+            guard (services + overflow).contains(where: { Self.nearbyServices.contains($0) }) else { return }
+            guard nearbyContextCurrent(run) else { finishNearby(); return }
+            finishNearby(rssi: rssi)
+            return
+        }
         let advertisedName = advertisementData[CBAdvertisementDataLocalNameKey] as? String ?? value.name
+        if let run = activeController {
+            // 候选只来自当前 B354 过滤扫描，不读普通 seen / restored 缓存。
+            guard run.state == .scanning, checkController(run), let name = advertisedName,
+                  name.lowercased().hasPrefix("cfmoto"),
+                  (advertisementData[CBAdvertisementDataIsConnectable] as? NSNumber)?.boolValue != false,
+                  run.candidates.count < 64 || run.candidates[value.identifier] != nil else { return }
+            run.candidates[value.identifier] = ControllerCandidate(peripheral: value, name: String(name.prefix(80)), rssi: rssi)
+            return
+        }
+        guard scanRequested, ProcessInfo.processInfo.systemUptime <= scanDeadline else { return }
         if let prefix = scanNamePrefix, advertisedName?.hasPrefix(prefix) != true { return }
         let connectable = (advertisementData[CBAdvertisementDataIsConnectable] as? NSNumber)?.boolValue
         if seen.count >= 64 && seen[value.identifier] == nil { return }
@@ -1777,6 +2290,10 @@ final class IOSBluetoothService: NSObject, IOSBridgeService, IOSBridgeCancellabl
         guard central === self.central else { return }
         if retiring[value.identifier] != nil { central.cancelPeripheralConnection(value); return }
         guard value === peripheral, operation?.kind == .connect, checkScope() else { central.cancelPeripheralConnection(value); return }
+        if let run = controllerConnection {
+            guard checkController(run) else { return }
+            run.state = .discovering
+        }
         clearOperation()
         state = "discovering"
         beginOperation(.services, seconds: 10)
@@ -1806,11 +2323,16 @@ final class IOSBluetoothService: NSObject, IOSBridgeService, IOSBridgeCancellabl
             return
         }
         guard operation?.kind == .services else { return }
+        if let run = controllerConnection, !checkController(run) { return }
         guard error == nil, let service = peripheral.services?.first(where: { $0.uuid == activeServiceUUID }) else {
             closeConnection(error == nil ? "missing_service" : "service_discovery_failed"); return
         }
         clearOperation()
         beginOperation(.characteristics, seconds: 10)
+        if controllerConnection != nil {
+            peripheral.discoverCharacteristics([Self.writeUUID], for: service)
+            return
+        }
         // BLE2 只读发现属性，不猜复用 BLE1 特征、不订阅未知通道。
         peripheral.discoverCharacteristics(connectionRole == 2 ? nil : [selectedWriteUUID, selectedNotifyUUID], for: service)
     }
@@ -1827,6 +2349,10 @@ final class IOSBluetoothService: NSObject, IOSBridgeService, IOSBridgeCancellabl
             return
         }
         guard service.uuid == activeServiceUUID, operation?.kind == .characteristics else { return }
+        if let run = controllerConnection {
+            enqueueControllerWrite(run, service: service, error: error)
+            return
+        }
         if connectionRole == 2 {
             guard error == nil else { closeConnection("characteristic_discovery_failed"); return }
             clearOperation(); state = "connected"; reason = "ble2_diagnostic_only"

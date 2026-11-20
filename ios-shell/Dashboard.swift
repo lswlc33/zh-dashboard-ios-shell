@@ -491,6 +491,7 @@ final class PanelController: UIViewController, WKNavigationDelegate, WKUIDelegat
         }
         ride.configureScopeProvider(scope)
         bluetooth.configureScopeProvider(scope)
+        bluetooth.configureMetadataProvider(metadata)
         history.configureScopeProvider(scope)
         surfaces.configureScopeProvider(scope)
         ride.configureSystemSurfacePublisher(surfaces)
