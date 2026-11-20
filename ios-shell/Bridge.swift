@@ -131,9 +131,10 @@ final class IOSBridge {
     init(webView: WKWebView, services: [IOSBridgeService]) {
         precondition(Thread.isMainThread)
         self.webView = webView
-        self.services = services
+        let allServices = services + [IOSCacheManagementService(dataStore: webView.configuration.websiteDataStore)]
+        self.services = allServices
         let reserved: Set<String> = ["hello", "store.commit", "txn.request", "txn.cancel", "sync.session"]
-        for service in services {
+        for service in allServices {
             for method in service.methods where IOSBridgePolicy.methodName(method)
                 && !reserved.contains(method) && routes[method] == nil {
                 routes[method] = service

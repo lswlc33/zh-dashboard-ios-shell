@@ -360,6 +360,93 @@ final class IOSPanelCache {
         try? data.write(to: file, options: [.atomic])
     }
 
+    // MARK: - 缓存管理
+
+    private func managementTargets() throws -> (URL, [URL]) {
+        let manager = FileManager.default
+        // 统计不创建目录，也不调用会把 .old-* 改回 current 的自愈入口。
+        let support = try manager.url(for: .applicationSupportDirectory, in: .userDomainMask,
+                                      appropriateFor: nil, create: false)
+        let root = support.appendingPathComponent("ZeehoPanel", isDirectory: true)
+        let current = root.appendingPathComponent("current", isDirectory: true)
+        let keys: Set<URLResourceKey> = [.isDirectoryKey, .isSymbolicLinkKey]
+        guard manager.fileExists(atPath: root.path) else { return (current, []) }
+        let rootValues = try root.resourceValues(forKeys: keys)
+        guard rootValues.isDirectory == true, rootValues.isSymbolicLink == false else { throw Failure.reason("unsafe_path") }
+        guard !state.busy, stagingDirectory == nil else { return (current, []) }
+        // 旧快照可能用于自愈，手动清理只处理未提交的 staging。
+        let prefix = ".staging-"
+        let targets = try manager.contentsOfDirectory(at: root, includingPropertiesForKeys: Array(keys), options: [])
+            .filter { url in
+                let name = url.lastPathComponent
+                guard name.hasPrefix(prefix), UUID(uuidString: String(name.dropFirst(prefix.count))) != nil else { return false }
+                let values = try url.resourceValues(forKeys: keys)
+                guard values.isDirectory == true, values.isSymbolicLink == false else { throw Failure.reason("unsafe_path") }
+                return true
+            }
+        return (current, targets)
+    }
+
+    /// 与下载共用串行队列，统计与清理使用同一白名单。取消、提交以及在途下载不受影响。
+    func managementStats(completion: @escaping ([[String: Any]], [String]) -> Void) {
+        queue.async {
+            var rows: [[String: Any]] = []
+            var errors: [String] = []
+            do {
+                let (current, targets) = try self.managementTargets()
+                if FileManager.default.fileExists(atPath: current.path) {
+                    do {
+                        let size = try Self.measureManagement([current])
+                        rows.append(["id": "activePanel", "bytes": size.bytes, "count": size.files, "clearable": false])
+                    } catch { errors.append("activePanel: stats_incomplete") }
+                }
+                if self.state.busy { errors.append("panelLeftovers: cache_busy") }
+                else {
+                    let size = try Self.measureManagement(targets)
+                    rows.append(["id": "panelLeftovers", "bytes": size.bytes, "count": targets.count,
+                                 "clearable": !targets.isEmpty,
+                                 "note": "只移除未提交的更新文件。当前离线页面及用于恢复的旧版备份不受影响。"])
+                }
+            } catch { errors.append("panelLeftovers: stats_incomplete") }
+            completion(rows, errors)
+        }
+    }
+
+    func clearManagement(completion: @escaping (String?) -> Void) {
+        queue.async {
+            guard !self.state.busy else { completion("cache_busy"); return }
+            do {
+                let (_, targets) = try self.managementTargets()
+                _ = try Self.measureManagement(targets) // 在首次删除前验证整批，拒绝符号链接和异常树。
+                for target in targets { try FileManager.default.removeItem(at: target) }
+                completion(nil)
+            } catch { completion("panel_leftovers_clear_failed") }
+        }
+    }
+
+    private static func measureManagement(_ urls: [URL]) throws -> (bytes: Int64, files: Int) {
+        let keys: Set<URLResourceKey> = [.isDirectoryKey, .isRegularFileKey, .isSymbolicLinkKey, .fileSizeKey]
+        var bytes: Int64 = 0
+        var files = 0
+        var visited = 0
+        func visit(_ url: URL, depth: Int) throws {
+            visited += 1
+            guard depth <= 16, visited <= 4096 else { throw Failure.reason("stats_limit") }
+            let values = try url.resourceValues(forKeys: keys)
+            guard values.isSymbolicLink == false else { throw Failure.reason("unsafe_path") }
+            if values.isRegularFile == true, let size = values.fileSize, size >= 0 {
+                bytes += Int64(size)
+                files += 1
+            } else if values.isDirectory == true {
+                for child in try FileManager.default.contentsOfDirectory(at: url, includingPropertiesForKeys: Array(keys), options: []) {
+                    try visit(child, depth: depth + 1)
+                }
+            } else { throw Failure.reason("unsafe_path") }
+        }
+        for url in urls { try visit(url, depth: 0) }
+        return (bytes, files)
+    }
+
     // MARK: - 状态
 
     func snapshot() -> State {

@@ -896,8 +896,15 @@ def main():
     for name in ('RecoveryView.swift', 'PanelCache.swift', 'PanelCachePolicy.swift', 'PanelSchemeHandler.swift',
                  'PanelLine.swift', 'PanelLineService.swift', 'Dashboard.swift', 'BridgeBudget.swift',
                  'Diagnostics.swift', 'DiagnosticsViewController.swift', 'UpdatePanelViewController.swift',
-                 'AccountBackup.swift', 'BackupPanelViewController.swift'):
+                 'AccountBackup.swift', 'BackupPanelViewController.swift', 'CacheManagement.swift'):
         assert f'ios-shell/{name}' in listed, name
+    cache_service = (root / 'CacheManagement.swift').read_text(encoding='utf-8')
+    assert '"cache.stats"' in cache_service and '"cache.clear"' in cache_service
+    assert 'WKWebsiteDataTypeCookies' not in cache_service and 'WKWebsiteDataTypeLocalStorage' not in cache_service
+    assert 'private static let clearable: Set<String> = ["webHttp", "panelLeftovers", "iosLogs"]' in cache_service
+    assert 'IOSCacheManagementService(dataStore: webView.configuration.websiteDataStore)' in (root / 'Bridge.swift').read_text(encoding='utf-8')
+    panel_cache = (root / 'PanelCache.swift').read_text(encoding='utf-8')
+    assert '"activePanel"' in panel_cache and '"clearable": false' in panel_cache
     # 纯逻辑单测也要接进 build.sh，否则等于没跑。
     assert 'account-backup-test.swift' in (root / 'build.sh').read_text(encoding='utf-8'), \
         'AccountBackup 的单测必须接进 build.sh'

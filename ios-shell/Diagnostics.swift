@@ -38,6 +38,40 @@ final class IOSDiagnostics {
     /// 公开路径，供界面显示。
     var path: String { fileURL?.path ?? "(unavailable)" }
 
+    private func existingLogs() throws -> [(URL, Int)] {
+        guard let fileURL, let rotatedURL else { throw CocoaError(.fileReadNoSuchFile) }
+        return try [fileURL, rotatedURL].compactMap { url in
+            do {
+                let values = try url.resourceValues(forKeys: [.isRegularFileKey, .isSymbolicLinkKey, .fileSizeKey])
+                guard values.isRegularFile == true, values.isSymbolicLink == false,
+                      let size = values.fileSize, size >= 0 else { throw CocoaError(.fileReadCorruptFile) }
+                return (url, size)
+            } catch let error as NSError where error.domain == NSCocoaErrorDomain
+                && [NSFileNoSuchFileError, NSFileReadNoSuchFileError].contains(error.code) { return nil }
+        }
+    }
+
+    /// 统计与删除只处理两个固定日志文件，不读取正文或触碰导出副本。
+    func storageStats(completion: @escaping (_ bytes: Int, _ files: Int, _ error: String?) -> Void) {
+        queue.async {
+            do {
+                let files = try self.existingLogs().filter { $0.1 > 0 }
+                completion(files.reduce(0) { $0 + $1.1 }, files.count, nil)
+            } catch { completion(0, 0, "ios_logs_stats_failed") }
+        }
+    }
+
+    /// 在日志队列处理，后续正常写入会重建主文件。
+    func clearStorage(completion: @escaping (String?) -> Void) {
+        queue.async {
+            do {
+                let files = try self.existingLogs()
+                for (url, _) in files { try FileManager.default.removeItem(at: url) }
+                completion(nil)
+            } catch { completion("ios_logs_clear_failed") }
+        }
+    }
+
     func log(_ message: String) {
         write(message)
     }
