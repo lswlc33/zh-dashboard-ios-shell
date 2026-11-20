@@ -47,22 +47,33 @@ final class RootRouter: UIViewController {
     private var panel: PanelController?
     private var recovery: RecoveryViewController?
     private var routeGeneration = 0
+    private var routeInFlight = false
+    private var activeToken: NSObjectProtocol?
+
+    deinit {
+        if let activeToken { NotificationCenter.default.removeObserver(activeToken) }
+    }
 
     override func viewDidLoad() {
         super.viewDidLoad()
         view.backgroundColor = .systemBackground
-        // 在 viewDidLoad 就把内容装上：viewDidAppear 期间窗口是空白的，
-        // 冷启动会先闪一帧黑屏。约束布局不依赖 bounds，提前装没有副作用。
-        // 持久化的线路要在任何导航之前应用，否则白名单与起始地址会不一致。
+        // 快捷指令可在后台冷启动进程；先注册恢复通知，再判前台，避免网页 hello 被拒后锁入预览。
+        activeToken = NotificationCenter.default.addObserver(
+            forName: UIApplication.didBecomeActiveNotification, object: nil, queue: .main
+        ) { [weak self] _ in self?.route() }
         IOSPanelLine.applyPersisted()
         route()
     }
 
     override func viewDidAppear(_ animated: Bool) {
         super.viewDidAppear(animated)
+        route()
     }
 
     private func route() {
+        guard UIApplication.shared.applicationState == .active,
+              panel == nil, recovery == nil, !routeInFlight else { return }
+        routeInFlight = true
         routeGeneration &+= 1
         let ticket = routeGeneration
         // unfinished 只是上一进程没来得及记成功（强退/系统回收也会留下），
@@ -75,6 +86,8 @@ final class RootRouter: UIViewController {
         IOSPanelCache.shared.refresh { [weak self] state in
             guard let self = self, self.routeGeneration == ticket,
                   self.panel == nil, self.recovery == nil else { return }
+            self.routeInFlight = false
+            guard UIApplication.shared.applicationState == .active else { return }
             // 预检期间可能记下了明确失败，不能用旧的无错误快照覆盖它。
             let currentReason = BootHealth.pendingReason()
             if !currentReason.isEmpty && currentReason != "unfinished" {
@@ -276,6 +289,7 @@ final class PanelController: UIViewController, WKNavigationDelegate, WKUIDelegat
     /// 暂停/恢复也换票据：后台前发出的 JS 探测不能在回来后误判超时。
     private var bootWatchGeneration = 0
     private var documentFinished = false
+    private var foregroundPanelURL: URL?
     /// 白屏诊断页只弹一次，别在每次看门狗探测时都弹。
     private var diagnosticsShown = false
     private var progressToken: NSKeyValueObservation?
@@ -310,7 +324,11 @@ final class PanelController: UIViewController, WKNavigationDelegate, WKUIDelegat
         }
         let activeToken = NotificationCenter.default.addObserver(forName: UIApplication.didBecomeActiveNotification,
                                                                  object: nil, queue: .main) { [weak self] _ in
-            self?.resumeBootWatch()
+            guard let self else { return }
+            if let url = self.foregroundPanelURL {
+                self.foregroundPanelURL = nil
+                self.preparePanel(url)
+            } else { self.resumeBootWatch() }
         }
         updateNotificationTokens.append(activeToken)
         web.allowsBackForwardNavigationGestures = true
@@ -603,6 +621,10 @@ final class PanelController: UIViewController, WKNavigationDelegate, WKUIDelegat
 
     private func preparePanel(_ url: URL) {
         guard !returningToWelcome else { return }
+        guard UIApplication.shared.applicationState == .active else {
+            foregroundPanelURL = url
+            return
+        }
         startupGeneration &+= 1
         let ticket = startupGeneration
         navigationTerminal = false
@@ -634,6 +656,10 @@ final class PanelController: UIViewController, WKNavigationDelegate, WKUIDelegat
                   !self.returningToWelcome else { return }
             switch result {
             case let .success(target):
+                guard UIApplication.shared.applicationState == .active else {
+                    self.foregroundPanelURL = url
+                    return
+                }
                 let navigationID = PanelNavigation.navigationID(in: target)
                 guard !navigationID.isEmpty, bridge.currentNavigationID() == navigationID else { return }
                 self.currentNavigationID = navigationID

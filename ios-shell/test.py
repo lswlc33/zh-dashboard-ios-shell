@@ -510,33 +510,21 @@ def main():
     assert 'gaugeInterval: TimeInterval = 5' in surfaces_src, \
         '车速 Live Activity 节流应为 5 秒（对齐 iOS 18 的本地更新限制）'
 
-    # AppIntent 只能用 openAppWhenRun 表达前后台：`supportedModes` / `IntentModes`
-    # 是 iOS 26 的 API，在 17/18 的 SDK 里根本不存在（CI 实测
-    # "cannot find type 'IntentModes' in scope"）。这条断言防它再被加回来。
+    # 目录和类型必须同时收敛：四个独立 Intent 避免预设参数在元数据中丢失。
     intents = strip_comments((root / 'BackgroundIntents.swift').read_text(encoding='utf-8'))
-    assert 'IntentModes' not in intents, \
-        'AppIntent 不能用 supportedModes/IntentModes（iOS 26 API，CI 编不过）'
-    assert 'openAppWhenRun' in intents, '前后台行为要用 openAppWhenRun 表达'
-    # 不注册 AppShortcutsProvider 的话，快捷指令里根本看不到这些 intent。
-    assert 'AppShortcutsProvider' in intents and 'appShortcuts' in intents, \
-        '必须提供 AppShortcutsProvider 才能出现在快捷指令里'
-
-    # 车况查询类 intent（VehicleIntents.swift）：只读快照，绝不联网。
-    # 这些规则不靠注释维持——谁给它加上网络请求/写盘，下面立刻失败。
-    vehicle_intents = strip_comments((root / 'VehicleIntents.swift').read_text(encoding='utf-8'))
-    assert 'IntentModes' not in vehicle_intents, \
-        '车况 intent 也不能用 IntentModes（iOS 26 API，CI 编不过）'
-    for name in ('ZeehoVehicleStatusIntent', 'ZeehoBatteryIntent',
-                 'ZeehoChargingStatusIntent', 'ZeehoLockStateIntent'):
-        assert f'struct {name}: AppIntent' in vehicle_intents, f'缺少车况查询 intent：{name}'
-        assert f'intent: {name}()' in intents, f'{name} 没注册进 AppShortcutsProvider，快捷指令里看不到'
-    assert 'openAppWhenRun: Bool = false' in vehicle_intents, \
-        '车况查询是只读 intent，必须 openAppWhenRun = false（不该拉起 App）'
-    # 硬约束：只读快照。出现网络/蓝牙字眼说明有人把「查询」实现成了「现拉接口」——
-    # 那会让 Siri 等网络往返，而且扩展进程根本没有凭据。
-    for forbidden in ('URLSession', 'URLRequest', 'dataTask(', 'CoreBluetooth', 'CBCentralManager'):
-        assert forbidden not in vehicle_intents, \
-            f'车况 intent 必须只读快照，不能出现 {forbidden}（扩展进程无凭据，也不能联网）'
+    names = ('ZeehoRunBackgroundTaskIntent', 'ZeehoUnlockVehicleIntent',
+             'ZeehoLockVehicleIntent', 'ZeehoOpenSeatIntent')
+    assert set(re.findall(r'struct (\w+): AppIntent', intents)) == set(names)
+    assert intents.count('AppShortcut(') == 4
+    assert 'AppShortcutsProvider' in intents and 'IntentModes' not in intents
+    assert 'openAppWhenRun: Bool = false' in intents and 'openAppWhenRun: Bool = true' in intents
+    assert 'async let signIn' in intents and 'async let daily' in intents
+    assert 'withRun(source: .shortcut, budget: 25)' in intents
+    for name in names:
+        assert f'intent: {name}()' in intents
+    assert not (root / 'VehicleIntents.swift').exists()
+    support = strip_comments((root / 'BackgroundIntentSupport.swift').read_text(encoding='utf-8'))
+    assert 'AppIntent' not in support
     # 短语必须带 applicationName，否则系统不会把它收进「App 快捷指令」面板。
     phrase_blocks = re.findall(r'phrases:\s*\[([^\]]*)\]', intents)
     assert phrase_blocks, 'AppShortcutsProvider 必须声明 phrases'
@@ -546,7 +534,7 @@ def main():
     # "'X' is ambiguous for type lookup in this context"。
     declarations = {}
     for name in ('BackgroundTasks.swift', 'BackgroundSigning.swift', 'BackgroundRunner.swift',
-                 'BackgroundService.swift', 'BackgroundIntents.swift', 'VehicleIntents.swift'):
+                 'BackgroundService.swift', 'BackgroundIntents.swift', 'BackgroundIntentSupport.swift', 'DailyTasksLogic.swift'):
         source = strip_comments((root / name).read_text(encoding='utf-8'))
         for declared in re.findall(r'^(?:public )?(?:struct|enum|final class|class) (\w+)', source, re.M):
             declarations.setdefault(declared, []).append(name)

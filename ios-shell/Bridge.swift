@@ -112,6 +112,9 @@ final class IOSBridge {
     private var bootstrapAttempts: [String: Int] = [:]
     private static let maxBootstrapAttempts = 3
     private var prepared = false
+    private var confirmedCommandNavigation = ""
+    private var commandPoll: Timer?
+    private var commandPollUntil: TimeInterval = 0
     private var navigationPermit: String?
     private var closed = false
     private var foreground = UIApplication.shared.applicationState != .background
@@ -140,6 +143,9 @@ final class IOSBridge {
         webView.configuration.userContentController.addScriptMessageHandler(proxy, contentWorld: .page,
                                                                             name: IOSBridgePolicy.handlerName)
         let center = NotificationCenter.default
+        notificationTokens.append(center.addObserver(forName: Notification.Name("io.github.lswlc33.dashboard.vehicle-command-posted"),
+                                                      object: nil, queue: .main) { [weak self] _ in self?.drainWidgetCommands() })
+        startCommandPoll()
         notificationTokens.append(center.addObserver(forName: UIApplication.didEnterBackgroundNotification,
                                                       object: nil, queue: .main) { [weak self] _ in self?.backgrounded() })
         notificationTokens.append(center.addObserver(forName: UIApplication.didBecomeActiveNotification,
@@ -147,6 +153,7 @@ final class IOSBridge {
     }
 
     deinit {
+        commandPoll?.invalidate()
         notificationTokens.forEach { NotificationCenter.default.removeObserver($0) }
         transport.close()
         resourceRequests.values.forEach { $0.cancel() }
@@ -216,6 +223,7 @@ final class IOSBridge {
         preparation += 1
         loggedFailures = 0
         prepared = false
+        confirmedCommandNavigation = ""
         navigationPermit = nil
         // 新一轮导航：清掉上一轮的重试计数与源码，避免旧导航的计数继续生效。
         bootstrapAttempts.removeAll()
@@ -299,6 +307,7 @@ final class IOSBridge {
     func navigationFailed() {
         precondition(Thread.isMainThread)
         prepared = false
+        confirmedCommandNavigation = ""
         preparation += 1
         cancelAll(code: "navigation_failed")
         services.forEach { $0.navigationChanged() }
@@ -363,6 +372,7 @@ final class IOSBridge {
         precondition(Thread.isMainThread)
         guard !closed else { return }
         emitLifecycle("closed")
+        commandPoll?.invalidate(); commandPoll = nil
         closed = true; prepared = false
         cancelAll(code: "bridge_closed")
         services.compactMap { $0 as? IOSSystemSurfacesService }.forEach { $0.bridgeClosed() }
@@ -671,6 +681,8 @@ final class IOSBridge {
         finish(reply, ["ok": true, "frame": session?.frame ?? "", "generation": generation, "epoch": epoch,
                        "navId": navigationID, "accountId": session?.accountID ?? "", "vin": session?.vin ?? "",
                        "widgetOwnerID": ownerID])
+        confirmedCommandNavigation = navigationID
+        startCommandPoll()
         emitLifecycle("session")
         DispatchQueue.main.async { [weak self] in self?.drainWidgetCommands() }
     }
@@ -784,6 +796,7 @@ final class IOSBridge {
     private func backgrounded() {
         guard !closed, foreground else { return }
         foreground = false
+        commandPoll?.invalidate(); commandPoll = nil
         generation += 1
         for reply in pending.values {
             reply.backgroundHandoff = (reply.service as? IOSBridgeBackgroundHandoffService)?
@@ -804,6 +817,7 @@ final class IOSBridge {
         foreground = true
         generation += 1
         emitLifecycle("foreground")
+        startCommandPoll()
         drainWidgetCommands()
     }
 
@@ -814,7 +828,10 @@ final class IOSBridge {
     /// 交给网页的车控逻辑执行（iOS 壳原生没有车控 API，安卓也走网页 car_cmd）。
     /// 只投递一次、失败不重试：车控是显式动作，重复执行比不执行更危险。
     private func drainWidgetCommands() {
-        guard foreground, nativeSessionScope() != nil, let session = session, !navigationID.isEmpty,
+        guard !closed, prepared, navigationPermit == nil, foreground,
+              UIApplication.shared.applicationState == .active,
+              confirmedCommandNavigation == navigationID,
+              nativeSessionScope() != nil, let session = session, !navigationID.isEmpty,
               let owner = IOSSystemSurfacesService.widgetOwner(accountID: session.accountID, vin: session.vin),
               let command = ZeehoWidgetCommandMailbox.consume(ownerID: owner.ownerIdentifierString),
               let web = webView else { return }
@@ -825,6 +842,21 @@ final class IOSBridge {
         guard let json = try? IOSBridgePolicy.scriptJSON(event) else { return }
         web.evaluateJavaScript("window.__zeehoWidgetCommand && window.__zeehoWidgetCommand(" + json + ");",
                                completionHandler: nil)
+    }
+
+    /// 覆盖 Intent 晚于 didBecomeActive/session 到达的情况，也覆盖跨进程投递。
+    /// 每次激活最多观察 60 秒；不消费未确认会话的邮箱，不在后台轮询。
+    private func startCommandPoll() {
+        guard !closed, UIApplication.shared.applicationState == .active else { return }
+        guard commandPoll == nil else { return }
+        commandPollUntil = ProcessInfo.processInfo.systemUptime + 60
+        commandPoll = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { [weak self] timer in
+            guard let self, !self.closed, UIApplication.shared.applicationState == .active,
+                  ProcessInfo.processInfo.systemUptime < self.commandPollUntil else {
+                timer.invalidate(); self?.commandPoll = nil; return
+            }
+            self.drainWidgetCommands()
+        }
     }
 
     private func emitLifecycle(_ kind: String) {

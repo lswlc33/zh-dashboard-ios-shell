@@ -161,6 +161,8 @@ if [[ -f "$script_dir/background-credential-test.swift" ]]; then
 else
     printf '%s\n' 'note: background-credential-test 已跳过（缺 ios-shell/background-credential-test.swift）'
 fi
+# 编译生产社交状态机，URLProtocol 拦截全部请求，逐项验证真实写入与回查。
+python3 -I "$script_dir/daily-tasks-flow-test.py" --require-swift
 
 # 直接编译生产完成闸门与取数策略，验证超时/并发和同车快照择新。
 python3 -I "$script_dir/widget-delivery-test.py" --require-swift

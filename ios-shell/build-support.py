@@ -78,6 +78,7 @@ FIXED_INPUTS = {
     # 移交闸门与构建脚本同为可信代码：公开 CI 用它决定是否覆盖线上产物，
     # 必须进指纹白名单，否则「门禁代码被改过」不会被 sourceTreeSha256 发现。
     'ios-shell/publish-artifacts.py',
+    'ios-shell/daily-tasks-flow-test.py',
     'ios-shell/test.py', 'ios-shell/widget-delivery-test.py', 'ios-shell/bridge-bootstrap.js', 'test/ios-parity-build-contract.mjs',
     'test/ios-widget-data-source-contract.mjs',
     'ios-shell/Entitlements/App.entitlements', 'ios-shell/Entitlements/Widgets.entitlements',
@@ -279,7 +280,7 @@ def inventory(root, expected=None):
     require(header.startswith(b'\x89PNG\r\n\x1a\n') and struct.unpack_from('>II', header, 16) == (1024, 1024),
             IOS_ICON + ' must be a 1024x1024 PNG (full-bleed, radius=0)')
     swift = sorted(n for n in names if n.startswith('ios-shell/') and n.endswith('.swift')
-                   and len(n.split('/')) == 2 and n != CAST_ENCODER_SOURCE)
+                   and len(n.split('/')) == 2 and n != CAST_ENCODER_SOURCE and not n.endswith('-test.swift'))
     shared = sorted(n for n in names if n.startswith('ios-shell/Shared/') and n.endswith('.swift'))
     widgets = sorted(n for n in names if n.startswith('ios-shell/Widgets/') and n.endswith('.swift'))
     broadcast = sorted({CAST_SHARED_SOURCE, CAST_ENCODER_SOURCE} |

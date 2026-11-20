@@ -51,6 +51,7 @@ public enum ZeehoWidgetCommandMailbox {
                 let data = try JSONEncoder().encode(payload)
                 try data.write(to: directory.appendingPathComponent(fileName), options: [.atomic])
             }
+            NotificationCenter.default.post(name: Notification.Name("io.github.lswlc33.dashboard.vehicle-command-posted"), object: nil)
             return true
         } catch { return false }
     }

@@ -104,8 +104,8 @@ private enum IOSDailyPostAttemptStore {
         let action: String
     }
 
-    private static func file(ownerHash: String, day: String) throws -> URL {
-        let root = try FileManager.default.url(for: .applicationSupportDirectory,
+    private static func file(ownerHash: String, day: String, directory: URL?) throws -> URL {
+        let root = try directory ?? FileManager.default.url(for: .applicationSupportDirectory,
             in: .userDomainMask, appropriateFor: nil, create: true)
             .appendingPathComponent("BackgroundPostAttempts", isDirectory: true)
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
@@ -113,9 +113,9 @@ private enum IOSDailyPostAttemptStore {
     }
 
     /// false 表示本日已尝试：结果未知也只复核，绝不重发。
-    static func reserve(ownerHash: String, day: String) throws -> Bool {
+    static func reserve(ownerHash: String, day: String, directory: URL? = nil) throws -> Bool {
         do {
-            let url = try file(ownerHash: ownerHash, day: day)
+            let url = try file(ownerHash: ownerHash, day: day, directory: directory)
             let expected = Attempt(ownerHash: ownerHash, day: day, action: IOSDailyTaskKind.post.rawValue)
             if FileManager.default.fileExists(atPath: url.path) {
                 let data = try Data(contentsOf: url)
@@ -130,14 +130,29 @@ private enum IOSDailyPostAttemptStore {
             return true
         } catch { throw IOSDailyTasksError("attempt_persist_failed") }
     }
+
+    /// 只有明确业务拒绝才撤销防重；丢回包、5xx、解码失败都不能证明未创建。
+    static func releaseRejected(ownerHash: String, day: String, directory: URL?) throws {
+        let url = try file(ownerHash: ownerHash, day: day, directory: directory)
+        let data = try Data(contentsOf: url)
+        let expected = Attempt(ownerHash: ownerHash, day: day, action: IOSDailyTaskKind.post.rawValue)
+        guard data.count <= 1024, try JSONDecoder().decode(Attempt.self, from: data) == expected else {
+            throw IOSDailyTasksError("attempt_persist_failed")
+        }
+        try FileManager.default.removeItem(at: url)
+    }
+
 }
 
 actor IOSDailyTasksClient {
     static let shared = IOSDailyTasksClient()
 
     private let session: URLSession
+    private let attemptDirectory: URL?
 
-    private init() {
+    init(session: URLSession? = nil, attemptDirectory: URL? = nil) {
+        self.attemptDirectory = attemptDirectory
+        if let session { self.session = session; return }
         let config = URLSessionConfiguration.ephemeral
         // 整轮只有 25 秒：单个请求不能拿固定 12 秒，否则deadline末尾才发起的请求仍会越过总预算。
         config.timeoutIntervalForRequest = 12
@@ -146,7 +161,7 @@ actor IOSDailyTasksClient {
         config.requestCachePolicy = .reloadIgnoringLocalCacheData
         config.httpShouldSetCookies = false
         config.httpCookieAcceptPolicy = .never
-        session = URLSession(configuration: config)
+        self.session = URLSession(configuration: config)
     }
 
     // MARK: - 对外入口
@@ -165,7 +180,7 @@ actor IOSDailyTasksClient {
         // 固定顺序：发帖→点赞→分享；列表已校验每个动作恰好一项。
         for kind in IOSDailyTaskKind.allCases {
             guard let item = initial.first(where: { Self.text($0["code"]) == kind.rawValue }),
-                  !Self.isComplete(item) else { continue }
+                  IOSDailyTasksLogic.isPending(item) else { continue }
             let name = Self.text(item["name"]) ?? kind.rawValue
             do {
                 try context.check()
@@ -178,7 +193,7 @@ actor IOSDailyTasksClient {
                 report.completed.append(name)
             } catch {
                 let reason = Self.code(of: error)
-                if reason == "cancelled" { report.result = reason; return report }
+                if ["cancelled", "http_401", "http_429"].contains(reason) { report.result = reason; return report }
                 if reason == "budget_exhausted" || context.remaining <= 0 {
                     report.skipped.append(name); report.budgetExhausted = true
                     report.result = "budget_exhausted"; return report
@@ -220,13 +235,22 @@ actor IOSDailyTasksClient {
         let content = Self.defaultPostContent()
         let startedAt = Date().timeIntervalSince1970 * 1000
         try context.check()
-        guard try IOSDailyPostAttemptStore.reserve(ownerHash: credential.ownerHash, day: context.day) else {
+        guard try IOSDailyPostAttemptStore.reserve(ownerHash: credential.ownerHash, day: context.day, directory: attemptDirectory) else {
             // 前次可能已被服务端接收，只允许本轮末尾复核任务列表，不能补发或猜删。
             throw IOSDailyTasksError("post_attempt_unknown")
         }
         try context.check()
         let payload: [String: Any] = ["postSubInfo": ["topicList": [Any]()], "topicid": "", "postcontent": content]
-        _ = try await post(credential: credential, path: "/v1.0/social/cfmotoserversocial/commonArticle", body: payload, context: context)
+        do {
+            _ = try await post(credential: credential, path: "/v1.0/social/cfmotoserversocial/commonArticle", body: payload, context: context)
+        } catch {
+            let reason = Self.code(of: error)
+            if reason.hasPrefix("rejected:"), reason != "rejected:unknown" {
+                try IOSDailyPostAttemptStore.releaseRejected(ownerHash: credential.ownerHash,
+                    day: context.day, directory: attemptDirectory)
+            }
+            throw error
+        }
         let endedAt = Date().timeIntervalSince1970 * 1000
         var created: String?
         for attempt in 0..<2 {
@@ -294,11 +318,7 @@ actor IOSDailyTasksClient {
               let rows = object["ps0003_01_002_VOList"] as? [[String: Any]], !rows.isEmpty else {
             throw IOSDailyTasksError("task_list_unusable")
         }
-        let actionable = rows.filter { IOSDailyTaskKind.from(code: Self.text($0["code"]) ?? "") != nil }
-        let codes = actionable.compactMap { Self.text($0["code"]) }
-        guard actionable.count == IOSDailyTaskKind.allCases.count,
-              Set(codes) == Set(IOSDailyTaskKind.allCases.map { $0.rawValue }),
-              actionable.allSatisfy({ ["0", "1"].contains(Self.text($0["completeFlag"]) ?? "") }) else {
+        guard let actionable = IOSDailyTasksLogic.actionableRows(rows) else {
             throw IOSDailyTasksError("task_list_unusable")
         }
         return actionable
@@ -418,7 +438,7 @@ actor IOSDailyTasksClient {
 
     /// `completeFlag == 0` 才算已完成（tasks.js:1319 的口径）。
     private static func isComplete(_ row: [String: Any]) -> Bool {
-        text(row["completeFlag"]) == "0"
+        IOSDailyTasksLogic.isComplete(row)
     }
 
     private static func text(_ value: Any?) -> String? {
