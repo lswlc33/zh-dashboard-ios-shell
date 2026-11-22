@@ -50,6 +50,13 @@ private struct LiveActivityPresentation {
         isGauge ? snapshot?.gauge?.speedKph : ride?.speedKph
     }
     var elapsedText: String { WidgetValueText.elapsed(ride?.elapsedSeconds) }
+    /// 充电段起点（ContentState.chargeStartedAt）：视图用系统计时器
+    /// （Text(timerInterval:)）让「已充电」时长在锁屏/灵动岛自动走表，
+    /// 不依赖 App 进程存活；未充电或字段缺失（旧版本写入的活动）时不显示。
+    var chargeStarted: Date? {
+        guard kind == .charging, vehicle.charging == true, let ms = context.state.chargeStartedAt else { return nil }
+        return Date(timeIntervalSince1970: ms / 1000)
+    }
     var primaryText: String {
         speedDisplay ? WidgetValueText.speed(speed) : WidgetValueText.percent(vehicle.soc)
     }
@@ -132,6 +139,14 @@ private struct LiveActivityBanner: View {
                           systemImage: WidgetValueText.chargingSymbol(presentation.vehicle.charging))
                         .font(.subheadline)
                 }
+                if let started = presentation.chargeStarted {
+                    // 系统计时器自动走表：App 挂起时「已充电」仍逐秒推进，无需后台执行权。
+                    HStack(spacing: 6) {
+                        Text(WidgetStrings.chargeElapsed).font(.caption).foregroundColor(.secondary)
+                        Text(timerInterval: started...started.addingTimeInterval(86_400), countsDown: false)
+                            .font(.caption.monospacedDigit())
+                    }
+                }
                 if let progress = presentation.vehicle.chargeProgress {
                     HStack(spacing: 8) {
                         Text(WidgetStrings.chargeProgress).font(.caption)
@@ -198,6 +213,14 @@ private struct LiveActivityExpandedBottom: View {
                     Text(WidgetStrings.chargeProgress).font(.caption)
                     ProgressView(value: progress, total: 100)
                     Text(WidgetValueText.percent(progress)).font(.caption.monospacedDigit())
+                }
+            }
+            if let started = presentation.chargeStarted {
+                HStack {
+                    Text(WidgetStrings.chargeElapsed).font(.caption)
+                    Spacer(minLength: 0)
+                    Text(timerInterval: started...started.addingTimeInterval(86_400), countsDown: false)
+                        .font(.headline.monospacedDigit())
                 }
             }
             // annotatesStale: false —— 实时活动不出现「数据已过期/可能已过期」，

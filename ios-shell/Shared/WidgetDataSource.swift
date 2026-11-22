@@ -34,7 +34,12 @@ public struct WidgetDataSourceResult: Sendable, Equatable {
 }
 
 public enum WidgetDataSource {
-    /// 自己拉的缓存有效期为 30 分钟；合法宿主快照保留最后值，由视图标注过期。
+    /// 主路径自取缓存的窗口，与小组件 5 分钟刷新档对齐：
+    /// 否则 getTimeline 醒来时缓存还年轻，直接命中旧值、整轮都不联网，
+    /// 刷新节奏调得再短也读不到新数据。
+    public static let fetchCacheSeconds: TimeInterval = 5 * 60
+    /// 失败回退与图库预览（loadLocal）沿用 30 分钟口径：
+    /// 接口失败时宁可展示 30 分钟内的旧缓存，也不显示占位。
     public static let cacheMaxAgeSeconds = SystemSnapshotFreshness.widgetStatsMaxAgeSeconds
 
     /// 取一次数据。`force` 为 true 时（刷新按钮）跳过缓存直接打接口。
@@ -55,7 +60,7 @@ public enum WidgetDataSource {
         var liveReason = "no_credential"
         if let credential = credential {
             if !force, let cached = WidgetFetchCache.read(ownerID: credential.ownerID, at: date,
-                                                          maxAgeSeconds: cacheMaxAgeSeconds) {
+                                                          maxAgeSeconds: fetchCacheSeconds) {
                 // 车辆切换可能与文件读取并发；命中缓存后也必须复核完整身份，
                 // 与网络返回和 loadLocal 的分支保持同一条 fail-closed 规则。
                 guard let currentOwner = try? SystemSnapshotStore.currentOwner(),

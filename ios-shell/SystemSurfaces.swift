@@ -228,7 +228,9 @@ private actor IOSLiveActivityManager {
         }
         let attributes = ZeehoActivityAttributes(owner: snapshot.owner, kind: kind)
         let initial = presentation(snapshot, previous: nil, kind: kind)
-        let state = ZeehoActivityAttributes.ContentState(snapshot: initial)
+        let state = ZeehoActivityAttributes.ContentState(
+            snapshot: initial,
+            chargeStartedAt: Self.chargeStartedAt(kind: kind, snapshot: initial, previous: nil))
         let activity: Activity<ZeehoActivityAttributes>
         if #available(iOS 16.2, *) {
             activity = try Activity.request(attributes: attributes,
@@ -264,11 +266,17 @@ private actor IOSLiveActivityManager {
             guard !updating.contains(activity.id), now - (lastUpdates[activity.id] ?? -.infinity) >= 5 else { continue }
             updating.insert(activity.id)
             let previous: SystemSnapshot?
+            let previousChargeStarted: Double?
             if let cached = lastContents[activity.id] { previous = cached }
             else if #available(iOS 16.2, *) { previous = activity.content.state.snapshot }
             else { previous = activity.contentState.snapshot }
+            if #available(iOS 16.2, *) { previousChargeStarted = activity.content.state.chargeStartedAt }
+            else { previousChargeStarted = activity.contentState.chargeStartedAt }
             let value = presentation(snapshot, previous: previous, kind: activity.attributes.kind)
-            let state = ZeehoActivityAttributes.ContentState(snapshot: value)
+            let state = ZeehoActivityAttributes.ContentState(
+                snapshot: value,
+                chargeStartedAt: Self.chargeStartedAt(kind: activity.attributes.kind, snapshot: value,
+                                                      previous: previousChargeStarted))
             if #available(iOS 16.2, *) {
                 await activity.update(ActivityContent(state: state, staleDate: staleDate(value, kind: activity.attributes.kind)))
             } else { await activity.update(using: state) }
@@ -319,7 +327,16 @@ private actor IOSLiveActivityManager {
             vehicle: value.vehicle, ride: ride, gauge: gauge)
     }
 
-    private func staleDate(_ snapshot: SystemSnapshot, kind: ZeehoActivityKind) -> Date {
+    /// 充电段的起点（epoch ms）：沿用活动上一帧的起点，保持同一段充电计时连续；
+    /// 新段从充电状态首次确认时刻起算；未充电/非充电活动置空。
+    /// 视图用系统计时器渲染该值，进程挂起时「已充电」时长仍在锁屏上自动走表。
+    private static func chargeStartedAt(kind: ZeehoActivityKind, snapshot: SystemSnapshot,
+                                        previous: Double?) -> Double? {
+        guard kind == .charging, snapshot.vehicle?.charging == true else { return nil }
+        return previous ?? Double(snapshot.vehicle?.chargingUpdatedAt ?? snapshot.capturedAt)
+    }
+
+    private static func staleDate(_ snapshot: SystemSnapshot, kind: ZeehoActivityKind) -> Date {
         var deadlines = [snapshot.expiresAt]
         if kind == .gauge, let gauge = snapshot.gauge {
             deadlines.append(gauge.updatedAt + 10_000)
@@ -409,8 +426,12 @@ final class IOSSystemSurfacesService: NSObject, IOSBridgeService, IOSBridgeCance
         let context: IOSBackgroundRunContext
     }
 
+    /// 存活的面板服务实例：冷启动被 BGTask 唤醒时为 nil，样本改走静态活动更新。
+    private static weak var activeInstance: IOSSystemSurfacesService?
+
     override init() {
         super.init()
+        Self.activeInstance = self
         nativeObservers.append(NotificationCenter.default.addObserver(forName: Self.sampleAccepted,
             object: nil, queue: .main) { [weak self] notification in
             guard let event = notification.object as? AcceptedSample else { return }
@@ -432,8 +453,76 @@ final class IOSSystemSurfacesService: NSObject, IOSBridgeService, IOSBridgeCance
         precondition(Thread.isMainThread)
         guard context.canDeliver, loadApproved(for: credential.ownerHash) else { return }
         recordCharging(sample.charging, at: sample.capturedAt, hash: credential.ownerHash)
+        if activeInstance == nil {
+            // 冷启动被 BGTask 唤醒时没有面板服务实例，下面的通知无人接收、LA 永远不更新；
+            // 直接按凭据 owner 把样本写进运行中的实时活动，保证充电中的锁屏/灵动岛
+            // 在 App 完全不打开时也能跟进最新电量（对齐参考实现 jihe-drive-ios）。
+            updateRunningActivities(sample: sample, credential: credential)
+        }
         NotificationCenter.default.post(name: sampleAccepted,
             object: AcceptedSample(sample: sample, credential: credential, context: context))
+    }
+
+    /// 把后台采样的电量/充电态并进活动上一帧的车况：其他字段沿用原值和原时间，
+    /// 不能把仍有效的统计清空或续鲜（与实例路径 acceptBackgroundSample 同一口径）。
+    private static func mergedBackgroundVehicle(_ previous: SystemVehicleSnapshot,
+        sample: IOSBackgroundClient.VehicleSample) -> SystemVehicleSnapshot {
+        SystemVehicleSnapshot(name: previous.name,
+            vinDisplaySuffix: previous.vinDisplaySuffix,
+            socPercent: sample.socPercent ?? previous.socPercent,
+            socUpdatedAt: sample.socPercent == nil ? previous.socUpdatedAt : sample.capturedAt,
+            charging: sample.charging ?? previous.charging,
+            chargingUpdatedAt: sample.charging == nil ? previous.chargingUpdatedAt : sample.capturedAt,
+            chargeProgressPercent: previous.chargeProgressPercent,
+            chargeProgressUpdatedAt: previous.chargeProgressUpdatedAt,
+            updatedAt: sample.capturedAt,
+            voltage: previous.voltage, current: previous.current, power: previous.power,
+            lockState: previous.lockState, seatState: previous.seatState, online: previous.online,
+            todayMileKm: previous.todayMileKm, lastMileKm: previous.lastMileKm,
+            lastRideMinutes: previous.lastRideMinutes, totalMileKm: previous.totalMileKm,
+            rangeKm: previous.rangeKm, integral: previous.integral, unread: previous.unread,
+            tireFrontBar: previous.tireFrontBar, tireRearBar: previous.tireRearBar,
+            tireFrontTemp: previous.tireFrontTemp, tireRearTemp: previous.tireRearTemp,
+            statsUpdatedAt: previous.statsUpdatedAt, dualDisplay: previous.dualDisplay == true)
+    }
+
+    /// 冷启动（无面板服务实例）时把后台样本直接写进运行中的实时活动。
+    /// 只处理同 owner 的 charging/vehicle：ride/gauge 是本会话输入，没有服务实例时
+    /// nativeRide/nativeGauge 均为空，绝不能用云端样本伪造（契约要求）。
+    private static func updateRunningActivities(sample: IOSBackgroundClient.VehicleSample,
+        credential: IOSBackgroundCredential) {
+        guard #available(iOS 16.1, *) else { return }
+        for activity in Activity<ZeehoActivityAttributes>.activities {
+            guard activity.attributes.owner.accountVINHash == credential.ownerHash,
+                  Self.isLive(activity.activityState),
+                  activity.attributes.kind == .charging || activity.attributes.kind == .vehicle else { continue }
+            let previous: SystemSnapshot?
+            if #available(iOS 16.2, *) { previous = activity.content.state.snapshot }
+            else { previous = activity.contentState.snapshot }
+            guard let previous = previous,
+                  previous.owner.accountVINHash == credential.ownerHash,
+                  let vehicle = previous.vehicle,
+                  sample.capturedAt >= vehicle.updatedAt else { continue }
+            let merged = Self.mergedBackgroundVehicle(vehicle, sample: sample)
+            let captured = sample.capturedAt
+            // vehicle 口径与 candidate 一致（180 秒），受快照 15 分钟寿命上限约束。
+            let expiresAt = min(max(captured + 1, captured + 180_000), captured + SystemSnapshot.maxLifetimeMs)
+            guard let value = try? SystemSnapshot(owner: previous.owner, capturedAt: captured,
+                expiresAt: expiresAt, vehicle: merged, ride: previous.ride, gauge: previous.gauge) else { continue }
+            let previousStarted: Double?
+            if #available(iOS 16.2, *) { previousStarted = activity.content.state.chargeStartedAt }
+            else { previousStarted = activity.contentState.chargeStartedAt }
+            let state = ZeehoActivityAttributes.ContentState(
+                snapshot: value,
+                chargeStartedAt: Self.chargeStartedAt(kind: activity.attributes.kind, snapshot: value,
+                                                      previous: previousStarted))
+            if #available(iOS 16.2, *) {
+                Task { await activity.update(ActivityContent(state: state,
+                    staleDate: Self.staleDate(value, kind: activity.attributes.kind))) }
+            } else {
+                Task { await activity.update(using: state) }
+            }
+        }
     }
 
     private static func chargingKey(_ hash: String, _ field: String) -> String {
@@ -1450,6 +1539,9 @@ final class IOSSystemSurfacesService: NSObject, IOSBridgeService, IOSBridgeCance
                 guard let self = self, lease.valid, self.epoch == ticket, self.owner == value.owner else { return }
                 Self.defaults.removeObject(forKey: Self.chargingKey(hash, "pending"))
                 self.observeActivities(); self.ensureChargingPoll()
+                // 活动已起：确保后台至少有一轮 BGAppRefresh 在队，App 挂起后
+                // 靠它补采样并经静态路径更新活动（冷启动无实例时也覆盖）。
+                IOSBackgroundScheduler.shared.scheduleAll()
             } catch { if let self = self, self.epoch == ticket { self.lastError = Self.code(error) } }
         }
     }
@@ -1638,7 +1730,10 @@ final class IOSSystemSurfacesService: NSObject, IOSBridgeService, IOSBridgeCance
             "\($0.vehicle?.charging.map(String.init) ?? "unknown"):\($0.ride?.state.rawValue ?? "none"):\($0.ride?.gapCount ?? 0)"
         } ?? "cleared"
         let now = ProcessInfo.processInfo.systemUptime
-        guard force || edge != lastWidgetEdge || now - lastWidgetReload >= 300 else { return false }
+        // 节流 60 秒，与扩展 5 分钟刷新档同量级：扩展每轮醒来都会自己拉数据，
+        // 宿主 reload 只负责让刚落盘的前台快照尽快被读出来，压到 300 秒会让
+        // compat 层的非 force refreshWidget 长期被吞，看起来「刷新没反应」。
+        guard force || edge != lastWidgetEdge || now - lastWidgetReload >= 60 else { return false }
         // 撤掉可编辑版后只剩一个 kind；仍走 `ZeehoWidgetKind.all` 的等价写法，
         // 以后再加 kind 时只要改扩展那边的 `all` 即可。
         WidgetCenter.shared.reloadTimelines(ofKind: Self.widgetKind)

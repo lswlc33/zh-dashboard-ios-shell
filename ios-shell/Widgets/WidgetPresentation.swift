@@ -20,6 +20,7 @@ enum WidgetStrings {
     static let notCharging = "未充电"
     static let chargingState = "充电状态"
     static let chargeProgress = "充电进度"
+    static let chargeElapsed = "已充电"
     static let stale = "数据已过期"
     static let mayBeStale = "可能已过期"
     static let lastUpdated = "最后更新"

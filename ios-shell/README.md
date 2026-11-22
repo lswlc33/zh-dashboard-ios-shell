@@ -4,7 +4,7 @@ Swift UIKit + WKWebView 面板壳，默认从 `https://lswlc33.github.io/zeeho-3
 
 账号与 `Store` 数据经 AES-GCM 私有文件及本机 Keychain 保存；轻量网页偏好使用持久 WKWebsiteDataStore，不与 Safari 或 Android 互通。WebView 铺满页面，原生安全区交给网页留白；无可用快照时先显示欢迎 / 恢复页。资产沿用网页自身发布机制，没有 Android 原生签名快照更新器。
 
-构建目标仍是 arm64 iPhone / iPad、**iOS 15.4**。网页检查真实 `HTMLElement.inert`，参考基线为 **iOS / Safari 15.5**；只补确定性的 `findLast`，不伪造 `inert`，不能保证 15.4 可用。Live Activities 另需 **iOS 16.1+**；Widget 每实例车辆选择使用 **iOS 17+** 的 AppIntentConfiguration，旧系统沿用默认 StaticConfiguration。更高系统版本、方法存在或合成回执均不是设备验收证明。
+构建目标仍是 arm64 iPhone / iPad、**iOS 15.4**。网页不再以 `HTMLElement.inert` 或其他浏览器能力设置全页进入门槛；不支持的局部 API / 样式按具体功能降级，不能因此拦住壳内用户进入。Live Activities 另需 **iOS 16.1+**；Widget 每实例车辆选择使用 **iOS 17+** 的 AppIntentConfiguration，旧系统沿用默认 StaticConfiguration。更高系统版本、方法存在或合成回执均不是设备验收证明。
 
 新网页等待真实 `WKScriptMessageHandlerWithReply` 的 `hello`，按逐方法 capability 与 `NativeShell.has(method)` 启用业务，不注入同步 `ZeehoShell`。普通浏览器 / PWA 转下载页；本地回环预览、旧壳或桥自检失败进入隔离合成 UI，不保存真实账号、不请求官方 API / H5 或发送车控，原生动作显示 `unavailable`。产品平台只有 Android / iOS，平台归属只作内部渲染/执行判据、界面不展示平台标签；[功能环境标记](../docs/功能环境标记.md) 中旧归属需结合本轮[迁移验收](../docs/iOS原生兼容迁移验收.md) 阅读。
 

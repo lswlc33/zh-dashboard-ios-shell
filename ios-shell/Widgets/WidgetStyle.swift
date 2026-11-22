@@ -9,17 +9,20 @@ import ZeehoSystemShared
 // 深浅色按实例偏好（dark = -1 跟随系统 / 0 浅色 / 1 深色）选一套，不依赖 values-night。
 /// 小组件刷新节奏。
 ///
-/// Apple 的 24 小时预算对常看的小组件约 40–70 次（约 15–60 分钟一次），
-/// 申请 15 分钟会被系统静默压到更慢，反而更容易看到「可能已过期」。
-/// 这里按预算中位申请 30 分钟，并给每台车加 0–9 分钟抖动，
-/// 避免同一时刻大量设备一起打接口。
+/// Apple 的预算对常看的小组件实际投放约 15 分钟一次，policy 只表达「尽早来」。
+/// 旧策略申请 30 分钟时系统就真的隔半小时才唤醒一次，卡片长期停在旧值；
+/// 现在按参考实现（每轮 timeline 只排一条、5 分钟后再来）申请 5 分钟档，
+/// 让系统在预算内尽量密集唤醒。扩展每次被唤醒都会自己拉接口写回共享区，
+/// 并在拿到新数据后请求一次 reload，所以短间隔不会放大接口压力。
+/// 仍给每台车加 0–59 秒抖动，避免同一时刻大量设备一起打接口。
 enum WidgetRefreshPolicy {
-    static let timelineIntervalSeconds: TimeInterval = 30 * 60
+    static let timelineIntervalSeconds: TimeInterval = 5 * 60
     /// 展示窗口必须比刷新间隔略长：正好等于间隔时，刚刷到就会卡在「可能已过期」。
     static let displayMaxAgeSeconds: Double = 45 * 60
     /// 宿主快照还算新鲜时直接渲染，省掉一次网络等待；
     /// 超过这个年龄就说明它已经不代表当前车况，应让扩展自取先试。
-    static let freshSnapshotSeconds: Double = 15 * 60
+    /// 与刷新节奏对齐：最多展示 5 分钟前的快照，之后每轮都等网络拿最新值。
+    static let freshSnapshotSeconds: Double = 5 * 60
     /// 快照不新鲜时的自取宽限：到点仍没取到就回落到旧快照，不能变成空提示。
     static let staleSnapshotGraceSeconds: Double = 2.5
 }

@@ -12,7 +12,14 @@ import ActivityKit
 public struct ZeehoActivityAttributes: ActivityAttributes, Sendable {
     public struct ContentState: Codable, Hashable, Sendable {
         public let snapshot: SystemSnapshot
-        public init(snapshot: SystemSnapshot) { self.snapshot = snapshot }
+        /// 充电段的开始时刻（epoch ms）。视图用系统计时器（Text(timerInterval:)）
+        /// 让「已充电」时长在锁屏/灵动岛上自动走表，不依赖 App 进程存活。
+        /// optional 保证旧版本写入的活动内容 decode 时缺字段落 nil，向后兼容。
+        public let chargeStartedAt: Double?
+        public init(snapshot: SystemSnapshot, chargeStartedAt: Double? = nil) {
+            self.snapshot = snapshot
+            self.chargeStartedAt = chargeStartedAt
+        }
     }
     public let owner: SystemSnapshotOwner
     public let kind: ZeehoActivityKind

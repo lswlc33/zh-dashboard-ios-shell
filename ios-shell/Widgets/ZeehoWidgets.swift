@@ -156,7 +156,9 @@ struct ZeehoVehicleProvider: TimelineProvider {
             }
         }
         // 先武装纯内存兜底，再开始诊断、共享容器和网络操作；无数据也交付可读提示。
-        gate.scheduleFallback(seconds: 3.5, value: Timeline(entries: [empty], policy: .after(now.addingTimeInterval(60))))
+        // 兜底窗口对齐扩展自取的超时（WidgetVehicleClient 请求 10s）留 2s 余量：
+        // 旧值 3.5s 会把还在路上的 live 结果整轮丢掉，等于没等网络。
+        gate.scheduleFallback(seconds: 12, value: Timeline(entries: [empty], policy: .after(now.addingTimeInterval(60))))
         WidgetDiagnostics.record(.timelineStarted, requestID: requestID, family: family)
         DispatchQueue.global(qos: .userInitiated).async {
             WidgetDiagnostics.record(.localReadStarted, requestID: requestID, family: family)
@@ -185,19 +187,38 @@ struct ZeehoVehicleProvider: TimelineProvider {
             var entry = ZeehoWidgetReader.entry(result, at: Date())
             entry.requestID = requestID
             gate.finish(Self.timeline(entry: entry, now: Date()))
+            // 参考实现（jihe-drive-ios）的「写回后催更」：扩展自取到新数据时，
+            // 若本地快照路径已先交付，新值只能等下一轮 timeline 才能显示；
+            // 主动请求一次 reload 让刚写盘的数据立刻被读出来。
+            // 只有 live 需要催：cache 命中就是刚写过的同一份数据，snapshot/none
+            // 没有新内容，都不催，避免 reload → getTimeline → load 的自我循环。
+            if result.origin == .live { Self.requestPostFetchReload() }
         }
+    }
+
+    /// 自取成功后的一次性催更；多个 family 并发 getTimeline 时按 5 秒节流只发一次。
+    private static let reloadGate = NSLock()
+    private static var lastLiveReload: TimeInterval = 0
+    private static func requestPostFetchReload() {
+        reloadGate.lock()
+        let now = ProcessInfo.processInfo.systemUptime
+        let allowed = now - lastLiveReload >= 5
+        if allowed { lastLiveReload = now }
+        reloadGate.unlock()
+        guard allowed else { return }
+        WidgetCenter.shared.reloadTimelines(ofKind: ZeehoWidgetKind.vehicle)
     }
 
     private static func elapsed(_ start: TimeInterval) -> Int64 {
         Int64(max(0, ProcessInfo.processInfo.systemUptime - start) * 1000)
     }
 
-    /// 每台车固定 0–9 分钟抖动：同一 owner 每次都算同一个值，
-    /// 既不改变可预期性，也避免多台设备在同一分钟一起请求接口。
+    /// 每台车固定 0–59 秒抖动：同一 owner 每次都算同一个值，
+    /// 既不改变可预期性，也避免多台设备在同一秒一起请求接口。
     private static func jitter(_ seed: String?) -> TimeInterval {
         guard let seed = seed, !seed.isEmpty else { return 0 }
         let value = seed.unicodeScalars.reduce(0) { ($0 &* 31 &+ Int($1.value)) & 0xFFFF_FFFF }
-        return TimeInterval(value % 600)
+        return TimeInterval(value % 60)
     }
 
     static func timeline(entry: ZeehoVehicleEntry, now: Date) -> Timeline<ZeehoVehicleEntry> {
@@ -217,7 +238,8 @@ struct ZeehoVehicleProvider: TimelineProvider {
                     stats: entry.stats, statsHidden: entry.statsHidden, origin: entry.origin))
             }
         }
-        // 这是刷新请求，不是系统保证；不调用 WidgetCenter 反复催更。
+        // 这是刷新请求，不是系统保证；扩展自取到新数据时会另外请求一次 reload
+        // （见 getTimeline 的 requestPostFetchReload），这里不做周期性催更。
         return Timeline(entries: entries, policy: .after(refreshAfter))
     }
 }
