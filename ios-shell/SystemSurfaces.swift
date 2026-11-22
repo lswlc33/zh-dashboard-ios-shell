@@ -330,13 +330,13 @@ private actor IOSLiveActivityManager {
     /// 充电段的起点（epoch ms）：沿用活动上一帧的起点，保持同一段充电计时连续；
     /// 新段从充电状态首次确认时刻起算；未充电/非充电活动置空。
     /// 视图用系统计时器渲染该值，进程挂起时「已充电」时长仍在锁屏上自动走表。
-    private static func chargeStartedAt(kind: ZeehoActivityKind, snapshot: SystemSnapshot,
+    fileprivate static func chargeStartedAt(kind: ZeehoActivityKind, snapshot: SystemSnapshot,
                                         previous: Double?) -> Double? {
         guard kind == .charging, snapshot.vehicle?.charging == true else { return nil }
         return previous ?? Double(snapshot.vehicle?.chargingUpdatedAt ?? snapshot.capturedAt)
     }
 
-    private static func staleDate(_ snapshot: SystemSnapshot, kind: ZeehoActivityKind) -> Date {
+    fileprivate static func staleDate(_ snapshot: SystemSnapshot, kind: ZeehoActivityKind) -> Date {
         var deadlines = [snapshot.expiresAt]
         if kind == .gauge, let gauge = snapshot.gauge {
             deadlines.append(gauge.updatedAt + 10_000)

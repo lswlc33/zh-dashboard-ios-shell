@@ -176,7 +176,9 @@ enum IOSCastWire {
         return try JSONSerialization.data(withJSONObject: value, options: [.sortedKeys])
     }
     static func object(_ data: Data) throws -> [String: Any] {
-        guard let object = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+        var payload = data
+        while payload.last == 0 { payload.removeLast() }
+        guard let object = try JSONSerialization.jsonObject(with: payload) as? [String: Any] else {
             throw IOSCastError.reason("cast_bad_json")
         }
         return object
@@ -184,6 +186,7 @@ enum IOSCastWire {
 
     struct Control {
         let type: UInt32
+        let identifier: UInt32
         let body: Data
     }
     struct Media {
@@ -191,20 +194,21 @@ enum IOSCastWire {
         let serial: UInt32 // 按位回填，不能把负序号截成 0。
         let body: Data
     }
-    static func control(_ type: UInt32, body: Data = Data()) throws -> Data {
+    static func control(_ type: UInt32, identifier: UInt32 = 0, body: Data = Data()) throws -> Data {
         let length = body.count + 16
         guard length <= controlMax else { throw IOSCastError.reason("control_frame_invalid") }
         var out = Data()
         append32(type, to: &out); append32(UInt32(length), to: &out)
-        append32(type ^ UInt32(length), to: &out); append32(0, to: &out)
+        append32(type ^ UInt32(length), to: &out); append32(identifier, to: &out)
         out.append(body)
         return out
     }
     static func controlLength(_ header: Data) throws -> Int {
         guard header.count == 16 else { throw IOSCastError.reason("control_frame_truncated") }
         let length = Int(u32(header, 4))
-        guard (16...controlMax).contains(length), u32(header, 8) == (u32(header, 0) ^ UInt32(length)),
-              u32(header, 12) == 0 else { throw IOSCastError.reason("control_frame_invalid") }
+        guard (16...controlMax).contains(length), u32(header, 8) == (u32(header, 0) ^ UInt32(length)) else {
+            throw IOSCastError.reason("control_frame_invalid")
+        }
         return length - 16
     }
     static func media(_ command: UInt16, serial: UInt32, body: Data = Data()) throws -> Data {
@@ -365,10 +369,26 @@ struct IOSCastRecipe: Codable {
         let widthOffset: Int; let heightOffset: Int; let fpsOffset: Int
         let codecOffset: Int; let bitrateOffset: Int; let extendedOffset: Int
         let zeroCodec: UInt32
+        let dimensionsOnly: Bool?
+        let signatureOffset: Int?
+        let dimensionAliases: [DimensionAlias]?
+    }
+    struct DimensionAlias: Codable {
+        let width: Int; let height: Int; let outputHeight: Int
     }
     struct Ack: Codable {
         let size: Int
         let codecOffset: Int; let widthOffset: Int; let heightOffset: Int; let extendedOffset: Int
+    }
+    struct Session: Codable {
+        let request: UInt32
+        let start: [Reply]
+        let stop: Reply
+        let heartbeat: Reply
+        let heartbeatMilliseconds: Int
+        let firstFrameZeroBytes: Int
+        let waitForFrame: Bool
+        let rsaBits: Int
     }
     struct Tier: Codable {
         let id: String
@@ -391,6 +411,7 @@ struct IOSCastRecipe: Codable {
     let fallback: IOSCastCapture
     let tiers: [Tier]
     let pullCommand: UInt16
+    let session: Session?
 
     static func from(_ value: Any?) throws -> IOSCastRecipe {
         guard let value = value, JSONSerialization.isValidJSONObject(value) else { throw IOSCastError.reason("cast_recipe_required") }
@@ -442,17 +463,33 @@ struct IOSCastRecipe: Codable {
             if let base64 = rule.bodyBase64 { try require(base64.utf8.count <= 8192 && (Data(base64Encoded: base64)?.count ?? 65536) <= 4096) }
         }
         try require(media.filter { $0.action == "configure" }.count == 1 && media.filter { $0.action == "start" }.count == 1)
+        if let session = session {
+            try require(control.contains { $0.request == session.request && $0.action == "reply" } && session.start.count <= 8 && !session.start.isEmpty)
+            try require((1000...10000).contains(session.heartbeatMilliseconds) && (0...16).contains(session.firstFrameZeroBytes)
+                        && [1024, 2048].contains(session.rsaBits))
+            for reply in session.start + [session.stop, session.heartbeat] { if let json = reply.json { try require(template(json)) } }
+        }
         func fits(_ offset: Int, _ bytes: Int, _ total: Int) -> Bool { offset >= 0 && offset <= total - bytes }
-        try require((1...256).contains(capture.minBytes) && fits(capture.widthOffset, 2, capture.minBytes) &&
-                    fits(capture.heightOffset, 2, capture.minBytes) && fits(capture.fpsOffset, 4, capture.minBytes) &&
-                    fits(capture.codecOffset, 4, capture.minBytes) && fits(capture.bitrateOffset, 4, capture.minBytes) &&
-                    fits(capture.extendedOffset, 1, capture.minBytes))
-        try require((1...256).contains(captureAck.size) && fits(captureAck.widthOffset, 2, captureAck.size) &&
+        try require((4...256).contains(capture.minBytes) && fits(capture.widthOffset, 2, capture.minBytes) &&
+                    fits(capture.heightOffset, 2, capture.minBytes))
+        if capture.dimensionsOnly != true {
+            try require(fits(capture.fpsOffset, 4, capture.minBytes) && fits(capture.codecOffset, 4, capture.minBytes) &&
+                        fits(capture.bitrateOffset, 4, capture.minBytes) && fits(capture.extendedOffset, 1, capture.minBytes))
+        }
+        if let offset = capture.signatureOffset { try require(offset >= capture.minBytes && offset <= 256) }
+        let aliases = capture.dimensionAliases ?? []
+        try require(aliases.count <= 4 && Set(aliases.map { "\($0.width)x\($0.height)" }).count == aliases.count)
+        for alias in aliases {
+            try require((16...1920).contains(alias.width) && (16...1088).contains(alias.height) &&
+                        (16...alias.height).contains(alias.outputHeight) && alias.outputHeight % 2 == 0)
+        }
+        try require((8...256).contains(captureAck.size) && fits(captureAck.widthOffset, 2, captureAck.size) &&
                     fits(captureAck.heightOffset, 2, captureAck.size) && fits(captureAck.codecOffset, 4, captureAck.size) &&
-                    fits(captureAck.extendedOffset, 1, captureAck.size))
-        let ackRanges = [captureAck.codecOffset..<(captureAck.codecOffset + 4), captureAck.widthOffset..<(captureAck.widthOffset + 2),
-                         captureAck.heightOffset..<(captureAck.heightOffset + 2), captureAck.extendedOffset..<(captureAck.extendedOffset + 1)]
-        try require(Set(ackRanges.flatMap { Array($0) }).count == 9)
+                    (captureAck.extendedOffset == -1 || fits(captureAck.extendedOffset, 1, captureAck.size)))
+        var ackRanges = [captureAck.codecOffset..<(captureAck.codecOffset + 4), captureAck.widthOffset..<(captureAck.widthOffset + 2),
+                         captureAck.heightOffset..<(captureAck.heightOffset + 2)]
+        if captureAck.extendedOffset >= 0 { ackRanges.append(captureAck.extendedOffset..<(captureAck.extendedOffset + 1)) }
+        try require(Set(ackRanges.flatMap { Array($0) }).count == (captureAck.extendedOffset >= 0 ? 9 : 8))
         try require((16...4096).contains(fallback.width) && (16...4096).contains(fallback.height) &&
                     (0...60).contains(fallback.fps) && (256000...8000000).contains(fallback.bitrate))
         try require(!tiers.isEmpty && tiers.count <= 6 && Set(tiers.map { $0.id }).count == tiers.count)
@@ -465,8 +502,13 @@ struct IOSCastRecipe: Codable {
     }
     func parseCapture(_ data: Data) throws -> IOSCastCapture {
         guard data.count >= capture.minBytes else { throw IOSCastError.reason("media_config_invalid") }
-        let width = Int(IOSCastWire.u16(data, capture.widthOffset)), height = Int(IOSCastWire.u16(data, capture.heightOffset))
-        guard width >= 16, height >= 16 else { throw IOSCastError.reason("media_config_invalid") }
+        let width = Int(IOSCastWire.u16(data, capture.widthOffset)), reportedHeight = Int(IOSCastWire.u16(data, capture.heightOffset))
+        let height = capture.dimensionAliases?.first { $0.width == width && $0.height == reportedHeight }?.outputHeight ?? reportedHeight
+        guard (16...4096).contains(width), (16...4096).contains(height) else { throw IOSCastError.reason("media_config_invalid") }
+        if capture.dimensionsOnly == true {
+            return IOSCastCapture(width: width, height: height, fps: fallback.fps, codec: capture.zeroCodec,
+                                  bitrate: fallback.bitrate, extended: false)
+        }
         let codec = IOSCastWire.u32(data, capture.codecOffset)
         return IOSCastCapture(width: width, height: height, fps: Int(Int32(bitPattern: IOSCastWire.u32(data, capture.fpsOffset))),
             codec: codec == 0 ? capture.zeroCodec : codec, bitrate: Int(Int32(bitPattern: IOSCastWire.u32(data, capture.bitrateOffset))),
@@ -480,7 +522,7 @@ struct IOSCastRecipe: Codable {
         out.replaceSubrange(captureAck.codecOffset..<(captureAck.codecOffset + 4), with: codec)
         out.replaceSubrange(captureAck.widthOffset..<(captureAck.widthOffset + 2), with: width)
         out.replaceSubrange(captureAck.heightOffset..<(captureAck.heightOffset + 2), with: height)
-        out[captureAck.extendedOffset] = plan.extended ? 1 : 0
+        if captureAck.extendedOffset >= 0 { out[captureAck.extendedOffset] = plan.extended ? 1 : 0 }
         return out
     }
     func plan(_ config: IOSCastCapture, _ settings: IOSCastSettings) throws -> IOSCastPlan {
@@ -500,11 +542,14 @@ struct IOSCastRecipe: Codable {
     }
     // 替换解析后的 JSON 值，禁止手工字符串插入 HUID/SN（引号会破坏 JSON）。
     func render(_ template: String, input: [String: Any] = [:], defaults: [String: String] = [:], identity: IOSCastIdentity? = nil,
-                signature: String = "") throws -> Data {
+                signature: String = "", screen: [String: Int] = [:]) throws -> Data {
         let object = try IOSCastWire.object(Data(template.utf8))
-        let builtins: [String: String] = ["os": "iOS", "package": "io.github.lswlc33.dashboard.ios", "brand": "Apple",
+        let now = Int64(Date().timeIntervalSince1970 * 1000)
+        let builtins: [String: Any] = ["os": "iOS", "package": "io.github.lswlc33.dashboard.ios", "brand": "Apple",
             "model": "iOS ReplayKit", "osVersion": ProcessInfo.processInfo.operatingSystemVersionString,
-            "uuid": identity?.uuid ?? "", "publicKey": identity?.publicKey ?? "", "signature": signature]
+            "uuid": identity?.uuid ?? "", "publicKey": identity?.publicKey ?? "", "signature": signature,
+            "screenWidth": screen["width"] ?? 0, "screenHeight": screen["height"] ?? 0, "screenRotation": screen["rotation"] ?? 0,
+            "time": now, "localTime": now + Int64(TimeZone.current.secondsFromGMT()) * 1000, "timeZone": TimeZone.current.identifier]
         func replace(_ value: Any) throws -> Any {
             if let dict = value as? [String: Any] {
                 var out: [String: Any] = [:]
@@ -578,9 +623,10 @@ final class IOSCastIdentity {
     private let publicDER: Data
     let uuid = UUID().uuidString
     var publicKey: String { publicDER.base64EncodedString() }
-    init() throws {
+    init(bits: Int = 1024) throws {
+        guard [1024, 2048].contains(bits) else { throw IOSCastError.reason("cast_recipe_invalid") }
         var error: Unmanaged<CFError>?
-        let attrs: [CFString: Any] = [kSecAttrKeyType: kSecAttrKeyTypeRSA, kSecAttrKeySizeInBits: 1024,
+        let attrs: [CFString: Any] = [kSecAttrKeyType: kSecAttrKeyTypeRSA, kSecAttrKeySizeInBits: bits,
                                      kSecPrivateKeyAttrs: [kSecAttrIsPermanent: false]]
         guard let key = SecKeyCreateRandomKey(attrs as CFDictionary, &error),
               let pub = SecKeyCopyPublicKey(key), let external = SecKeyCopyExternalRepresentation(pub, &error) as Data? else {
@@ -599,14 +645,14 @@ final class IOSCastIdentity {
         data.append(body); return data
     }
     func sign(_ input: String) throws -> String {
-        guard !input.isEmpty, input.utf8.count <= 117 else { throw IOSCastError.reason("cast_sign_input_invalid") }
+        guard !input.isEmpty, input.utf8.count <= SecKeyGetBlockSize(privateKey) - 11 else { throw IOSCastError.reason("cast_sign_input_invalid") }
         let input = Data(input.utf8)
         var signature = [UInt8](repeating: 0, count: SecKeyGetBlockSize(privateKey))
         var size = signature.count
         let status = input.withUnsafeBytes { bytes in
             SecKeyRawSign(privateKey, .PKCS1, bytes.bindMemory(to: UInt8.self).baseAddress!, input.count, &signature, &size)
         }
-        guard status == errSecSuccess, size == 128 else { throw IOSCastError.reason("cast_sign_failed") }
+        guard status == errSecSuccess, size == SecKeyGetBlockSize(privateKey) else { throw IOSCastError.reason("cast_sign_failed") }
         return Data(signature.prefix(size)).base64EncodedString()
     }
 }
@@ -816,9 +862,12 @@ final class IOSCastSocket {
     var onControl: ((IOSCastWire.Control, @escaping () -> Void) -> Void)?
     var onMedia: ((IOSCastWire.Media, @escaping () -> Void) -> Void)?
     private var identity: IOSCastIdentity?
+    private(set) var signedIdentity: Data?
     private var receivedEOF = false
     private let route: IOSCastRoute
     private var ready = false
+    private var deferredWrites: [(Data, () -> Void)] = []
+    private var deferredBytes = 0
 
     init(_ connection: NWConnection, queue: DispatchQueue, control: Bool, route: IOSCastRoute) {
         self.connection = connection; self.queue = queue; self.control = control; self.route = route
@@ -828,21 +877,22 @@ final class IOSCastSocket {
         if let error = route.pathError(path, connection: true) { close(error); return false }
         return true
     }
-    func replies(_ rule: IOSCastRecipe.Rule, body: Data, recipe: IOSCastRecipe) throws -> [Data] {
+    func replies(_ rule: IOSCastRecipe.Rule, frame: IOSCastWire.Control, recipe: IOSCastRecipe) throws -> [Data] {
         let input: [String: Any]
-        if rule.action == "rsa" || rule.action == "echo" { input = try IOSCastWire.object(body) }
+        if rule.action == "rsa" || rule.action == "echo" { input = try IOSCastWire.object(frame.body) }
         else { input = [:] }
         var signature = ""
         if rule.action == "rsa" {
-            if identity == nil { identity = try IOSCastIdentity() }
+            if identity == nil { identity = try IOSCastIdentity(bits: recipe.session?.rsaBits ?? 1024) }
             guard let value = (rule.inputKeys ?? []).compactMap({ input[$0] as? String }).first, !value.isEmpty else {
                 throw IOSCastError.reason("cast_sign_input_invalid")
             }
             signature = try identity!.sign(value)
+            signedIdentity = Data(base64Encoded: signature)
         }
         return try rule.replies.map { reply in
             let data = try reply.json.map { try recipe.render($0, input: input, defaults: rule.defaults ?? [:], identity: identity, signature: signature) } ?? Data()
-            return try IOSCastWire.control(reply.type, body: data)
+            return try IOSCastWire.control(reply.type, identifier: frame.identifier, body: data)
         }
     }
     func start(expectedIP: String, ready: @escaping () -> Void) {
@@ -906,7 +956,7 @@ final class IOSCastSocket {
                     guard let self = self, !self.closed else { return }
                     self.partialSince = nil; self.lastFrameAt = ProcessInfo.processInfo.systemUptime
                     let next: () -> Void = { [weak self] in self?.readFrame() }
-                    if self.control { self.onControl?(IOSCastWire.Control(type: IOSCastWire.u32(header, 0), body: body), next) }
+                    if self.control { self.onControl?(IOSCastWire.Control(type: IOSCastWire.u32(header, 0), identifier: IOSCastWire.u32(header, 12), body: body), next) }
                     else { self.onMedia?(IOSCastWire.Media(command: IOSCastWire.u16(header, 0), serial: IOSCastWire.u32(header, 4), body: body), next) }
                 }
             } catch { self.close(IOSCastError.code(error)) }
@@ -914,13 +964,23 @@ final class IOSCastSocket {
     }
     func send(_ bytes: Data, completion: @escaping () -> Void) {
         guard !closed, verifyRoute() else { return }
-        guard writeSince == nil else { close("cast_backpressure_violation"); return }
+        if writeSince != nil {
+            guard control, deferredWrites.count < 8, deferredBytes + bytes.count <= IOSCastWire.controlMax else {
+                close("cast_backpressure_violation"); return
+            }
+            deferredWrites.append((bytes, completion)); deferredBytes += bytes.count
+            return
+        }
         writeSince = ProcessInfo.processInfo.systemUptime
         connection.send(content: bytes, completion: .contentProcessed { [weak self] error in
             guard let self = self, !self.closed else { return }
             self.writeSince = nil
             if let error = error { self.close(IOSCastError.network(error)); return }
             completion()
+            if !self.closed, self.writeSince == nil, !self.deferredWrites.isEmpty {
+                let pending = self.deferredWrites.removeFirst(); self.deferredBytes -= pending.0.count
+                self.send(pending.0, completion: pending.1)
+            }
         })
     }
     func tick(idleLimit: TimeInterval?, ioLimit: TimeInterval) {
@@ -932,7 +992,8 @@ final class IOSCastSocket {
     func close(_ reason: String) {
         guard !closed else { return }
         closed = true; connection.stateUpdateHandler = nil; connection.pathUpdateHandler = nil
-        connection.viabilityUpdateHandler = nil; connection.cancel(); identity = nil
+        connection.viabilityUpdateHandler = nil; connection.cancel(); identity = nil; signedIdentity = nil
+        deferredWrites.removeAll(); deferredBytes = 0
         let callback = onClosed
         onClosed = nil; onControl = nil; onMedia = nil
         callback?(reason)

@@ -47,8 +47,20 @@ final class IOSCastBroadcastEngine {
     private var listeners: [UInt16: NWListener] = [:]
     private var listenerReady: Set<UInt16> = []
     private var sockets: [UInt16: IOSCastSocket] = [:]
+    private var controlSockets: [IOSCastSocket] = []
+    private var sessionControl: IOSCastSocket?
+    private var sessionIdentity: Data?
+    private var sessionStarted = false
+    private var nextControlIdentifier: UInt32 = 1
+    private var nextKeepAlive = Double.infinity
+    private var configured = false
+    private var prefixedVideo = false
+    private var screen: [String: Int] = [:]
+    private let screenLock = NSLock()
+    private var submittedScreen: [String: Int] = [:]
+    private var waitingSessionStart: (() -> Void)?
     private var connected: Set<UInt16> = []
-    private var pending: [UInt16: NWConnection] = [:]
+    private var pending: [UInt16: [NWConnection]] = [:]
     private var probe: IOSCastSocket?
     private var probeDeadline = 0.0
     private var probeAccepted = false
@@ -193,9 +205,11 @@ final class IOSCastBroadcastEngine {
                     guard let self = self, self.active, self.generation == epoch else { connection.cancel(); return }
                     guard case let .hostPort(host, _) = connection.endpoint, case let .ipv4(ip) = host,
                           ip == IPv4Address(grant.targetIP) else { connection.cancel(); return }
-                    // 探测成功之前只保留每口最新的一条，不解析/应答陌生未就绪会话。
+                    // 控制口最多两条（主控/反向状态）；探测前仍不解析，禁止无界待接队列。
                     if !self.probeAccepted {
-                        self.pending.removeValue(forKey: port)?.cancel(); self.pending[port] = connection
+                        let limit = port == self.ports.control ? 2 : 1
+                        guard self.pending[port, default: []].count < limit else { connection.cancel(); return }
+                        self.pending[port, default: []].append(connection)
                     } else { self.accept(connection, port: port, epoch: epoch) }
                 }
                 listener.start(queue: queue)
@@ -231,7 +245,7 @@ final class IOSCastBroadcastEngine {
             self.probe = nil; socket.onClosed = nil; socket.close("probe_complete")
             self.probeAccepted = true; self.phase = "handshaking"; self.reason = "waiting_vehicle_connections"
             let pending = self.pending; self.pending.removeAll()
-            for (port, connection) in pending { self.accept(connection, port: port, epoch: epoch) }
+            for (port, connections) in pending { for connection in connections { self.accept(connection, port: port, epoch: epoch) } }
             self.publish()
         }
         socket.start(expectedIP: target) { [weak self, weak socket] in
@@ -244,41 +258,78 @@ final class IOSCastBroadcastEngine {
             } catch { self.fail(IOSCastError.code(error)) }
         }
     }
+    private func holds(_ socket: IOSCastSocket, port: UInt16) -> Bool {
+        port == ports.control ? controlSockets.contains { $0 === socket } : sockets[port] === socket
+    }
     private func accept(_ connection: NWConnection, port: UInt16, epoch: UInt64) {
         guard let grant = grant, let route = grant.route, active, generation == epoch else { connection.cancel(); return }
-        if let old = sockets.removeValue(forKey: port) { old.onClosed = nil; old.close("replaced") }
-        connected.remove(port)
-        if port == ports.data { frameIndex = 0; encoder.resetDelivery() }
+        if port == ports.control {
+            guard controlSockets.count < 2 else { connection.cancel(); return }
+        } else if let old = sockets.removeValue(forKey: port) { old.onClosed = nil; old.close("replaced") }
+        if port != ports.control { connected.remove(port) }
+        if port == ports.data { frameIndex = 0; prefixedVideo = false; encoder.resetDelivery() }
         let socket = IOSCastSocket(connection, queue: queue, control: port == ports.control, route: route)
-        sockets[port] = socket
+        if port == ports.control { controlSockets.append(socket) } else { sockets[port] = socket }
         socket.onClosed = { [weak self, weak socket] code in
-            guard let self = self, let socket = socket, self.active, self.generation == epoch, self.sockets[port] === socket else { return }
-            self.connected.remove(port); self.sockets.removeValue(forKey: port)
+            guard let self = self, let socket = socket, self.active, self.generation == epoch, self.holds(socket, port: port) else { return }
+            self.connected.remove(port)
+            if port == self.ports.control { self.controlSockets.removeAll { $0 === socket } }
+            else { self.sockets.removeValue(forKey: port) }
             self.channelEnded(port: port, reason: code)
         }
         socket.onControl = { [weak self, weak socket] frame, next in
-            guard let self = self, let socket = socket, self.active, self.generation == epoch, self.sockets[port] === socket,
+            guard let self = self, let socket = socket, self.active, self.generation == epoch, self.holds(socket, port: port),
                   self.checkGrant() else { return }
-            do {
-                guard let rule = self.recipe.control.first(where: { $0.request == frame.type }), rule.action != "ignore" else { next(); return }
-                let replies = try socket.replies(rule, body: frame.body, recipe: self.recipe)
-                if replies.isEmpty { next() }
-                else if replies.count == 1 { socket.send(replies[0], completion: next) }
-                else { socket.send(replies[0]) { socket.send(replies[1], completion: next) } }
-            } catch { self.fail(IOSCastError.code(error)) }
+            self.control(frame, socket: socket, epoch: epoch, next: next)
         }
         socket.onMedia = { [weak self, weak socket] frame, next in
             guard let self = self, let socket = socket, self.active, self.generation == epoch,
-                  self.sockets[port] === socket, self.checkGrant() else { return }
+                  self.holds(socket, port: port), self.checkGrant() else { return }
             if port == self.ports.data { self.pull(frame, socket: socket, epoch: epoch, next: next) }
             else { self.media(frame, socket: socket, next: next) }
         }
         socket.start(expectedIP: grant.targetIP) { [weak self, weak socket] in
-            guard let self = self, let socket = socket, self.active, self.generation == epoch, self.sockets[port] === socket else { return }
+            guard let self = self, let socket = socket, self.active, self.generation == epoch, self.holds(socket, port: port) else { return }
             self.connected.insert(port)
             self.reason = self.connected.count == 3 ? "waiting_vehicle_start" : "waiting_vehicle_connections"
             self.publish()
         }
+    }
+    private func control(_ frame: IOSCastWire.Control, socket: IOSCastSocket, epoch: UInt64, next: @escaping () -> Void) {
+        guard active, generation == epoch, holds(socket, port: ports.control) else { return }
+        screenLock.lock(); screen = submittedScreen; screenLock.unlock()
+        if recipe.session?.request == frame.type, screen.isEmpty {
+            guard waitingSessionStart == nil else { fail("control_frame_invalid"); return }
+            waitingSessionStart = { [weak self, weak socket] in
+                guard let self = self, let socket = socket else { return }
+                self.control(frame, socket: socket, epoch: epoch, next: next)
+            }
+            return
+        }
+        do {
+            guard let rule = recipe.control.first(where: { $0.request == frame.type }), rule.action != "ignore" else { next(); return }
+            let replies = try socket.replies(rule, frame: frame, recipe: recipe)
+            if rule.action == "rsa" { sessionIdentity = socket.signedIdentity }
+            var output = replies.reduce(into: Data()) { $0.append($1) }
+            let starts = recipe.session?.request == frame.type && !sessionStarted
+            if starts, let session = recipe.session {
+                for message in session.start { output.append(try sessionMessage(message)) }
+                sessionControl = socket; sessionStarted = true
+            }
+            let completed = { [weak self] in
+                guard let self = self, self.active, self.generation == epoch else { return }
+                if starts, let session = self.recipe.session {
+                    self.nextKeepAlive = ProcessInfo.processInfo.systemUptime + Double(session.heartbeatMilliseconds) / 1000
+                }
+                next()
+            }
+            if output.isEmpty { completed() } else { socket.send(output, completion: completed) }
+        } catch { fail(IOSCastError.code(error)) }
+    }
+    private func sessionMessage(_ message: IOSCastRecipe.Reply) throws -> Data {
+        let body = try message.json.map { try recipe.render($0, screen: screen) } ?? Data()
+        let identifier = nextControlIdentifier; nextControlIdentifier &+= 1
+        return try IOSCastWire.control(message.type, identifier: identifier, body: body)
     }
     private func media(_ frame: IOSCastWire.Media, socket: IOSCastSocket, next: @escaping () -> Void) {
         do {
@@ -286,11 +337,22 @@ final class IOSCastBroadcastEngine {
             guard let command = rule.reply else { throw IOSCastError.reason("cast_recipe_invalid") }
             switch rule.action {
             case "configure":
+                if let offset = recipe.capture.signatureOffset {
+                    guard frame.body.count > offset, frame.body.count - offset <= 1024,
+                          let expected = sessionIdentity else { throw IOSCastError.reason("media_identity_missing") }
+                    var echo = Data(frame.body.dropFirst(offset))
+                    while echo.last == 0 { echo.removeLast() }
+                    guard let signature = Data(base64Encoded: echo), signature == expected else {
+                        throw IOSCastError.reason("media_identity_mismatch")
+                    }
+                }
                 let config = try recipe.parseCapture(frame.body)
                 if !encoder.running { plan = try recipe.plan(config, settings) }
                 guard let plan = plan else { throw IOSCastError.reason("media_config_invalid") }
+                configured = true
                 socket.send(try IOSCastWire.media(command, serial: frame.serial, body: recipe.acknowledgement(plan)), completion: next)
             case "start":
+                if recipe.capture.signatureOffset != nil, !configured { throw IOSCastError.reason("media_config_required") }
                 if plan == nil { plan = try recipe.plan(recipe.fallback, settings) }
                 guard let plan = plan, probeAccepted else { throw IOSCastError.reason("vehicle_status_unavailable") }
                 if !encoder.running {
@@ -312,6 +374,10 @@ final class IOSCastBroadcastEngine {
     private func pull(_ request: IOSCastWire.Media, socket: IOSCastSocket, epoch: UInt64, next: @escaping () -> Void) {
         guard request.command == recipe.pullCommand else { next(); return }
         guard request.body.isEmpty else { fail("data_frame_invalid"); return }
+        if recipe.session?.waitForFrame == true {
+            waitForVideo(socket: socket, epoch: epoch, deadline: ProcessInfo.processInfo.systemUptime + 5, next: next)
+            return
+        }
         if let frame = paused ? nil : encoder.poll() { deliver(frame, socket: socket, next: next); return }
         // 与 Android 25 ms 等待一致，但不阻塞串行编码队列；这期间不接下一条拉帧。
         queue.asyncAfter(deadline: .now() + .milliseconds(25)) { [weak self, weak socket] in
@@ -320,12 +386,25 @@ final class IOSCastBroadcastEngine {
             self.deliver(self.paused ? nil : self.encoder.poll(), socket: socket, next: next)
         }
     }
+    private func waitForVideo(socket: IOSCastSocket, epoch: UInt64, deadline: TimeInterval, next: @escaping () -> Void) {
+        guard active, generation == epoch, sockets[ports.data] === socket, checkGrant() else { return }
+        if let frame = paused ? nil : encoder.poll() { deliver(frame, socket: socket, next: next); return }
+        guard ProcessInfo.processInfo.systemUptime < deadline else { fail("first_frame_timeout"); return }
+        queue.asyncAfter(deadline: .now() + .milliseconds(25)) { [weak self, weak socket] in
+            guard let self = self, let socket = socket else { return }
+            self.waitForVideo(socket: socket, epoch: epoch, deadline: deadline, next: next)
+        }
+    }
     private func deliver(_ frame: IOSCastEncoder.Frame?, socket: IOSCastSocket, next: @escaping () -> Void) {
         do {
-            let packet = try IOSCastWire.packet(frame?.bytes, index: frameIndex, extended: plan?.extended == true)
+            var packet = try IOSCastWire.packet(frame?.bytes, index: frameIndex, extended: plan?.extended == true)
+            if frame != nil, !prefixedVideo, let session = recipe.session {
+                packet = Data(repeating: 0, count: session.firstFrameZeroBytes) + packet
+            }
             socket.send(packet) { [weak self] in
                 guard let self = self, self.active else { return }
                 if let frame = frame {
+                    self.prefixedVideo = true
                     self.sentFrames &+= 1; self.attemptFrames &+= 1; self.sentBytes &+= UInt64(packet.count)
                     if frame.keyframe { self.keyframes &+= 1 }
                     if self.plan?.extended == true { self.frameIndex &+= 1 }
@@ -358,7 +437,19 @@ final class IOSCastBroadcastEngine {
             }
         } else { fail(reason) }
     }
-    func video(_ sample: CMSampleBuffer) { encoder.submit(sample) }
+    func video(_ sample: CMSampleBuffer) {
+        if let image = CMSampleBufferGetImageBuffer(sample) {
+            let width = CVPixelBufferGetWidth(image), height = CVPixelBufferGetHeight(image)
+            if (16...4096).contains(width), (16...4096).contains(height) {
+                let orientation = (CMGetAttachment(sample, key: RPVideoSampleOrientationKey as CFString, attachmentModeOut: nil) as? NSNumber)?.intValue ?? 1
+                let rotation = [1: 0, 3: 2, 6: 1, 8: 3][orientation] ?? 0
+                screenLock.lock()
+                submittedScreen = ["width": width, "height": height, "rotation": rotation]
+                screenLock.unlock()
+            }
+        }
+        encoder.submit(sample)
+    }
     func pause() { queue.async { [weak self] in
         guard let self = self, self.active else { return }
         self.paused = true; self.phase = "handshaking"; self.reason = "broadcast_paused"; self.encoder.resetDelivery(); self.publish()
@@ -373,6 +464,17 @@ final class IOSCastBroadcastEngine {
         guard active, checkGrant() else { return }
         if let error = grant?.route?.sourceError() { fail(error); return }
         let now = ProcessInfo.processInfo.systemUptime
+        if let resume = waitingSessionStart {
+            screenLock.lock(); let hasScreen = !submittedScreen.isEmpty; screenLock.unlock()
+            if hasScreen { waitingSessionStart = nil; resume() }
+            if !active { return }
+        }
+        if now >= nextKeepAlive, let session = recipe.session, let socket = sessionControl, socket.writeSince == nil {
+            do {
+                nextKeepAlive = now + Double(session.heartbeatMilliseconds) / 1000
+                socket.send(try sessionMessage(session.heartbeat)) {}
+            } catch { fail(IOSCastError.code(error)); return }
+        }
         if probe != nil, now > probeDeadline { fail("vehicle_status_unavailable"); return }
         if castingStarted == 0, now - attemptStarted > 35 { fail("frame_pull_timeout"); return }
         if castingStarted > 0, !paused {
@@ -384,6 +486,10 @@ final class IOSCastBroadcastEngine {
         for (port, socket) in Array(sockets) {
             socket.tick(idleLimit: port == ports.control ? nil : 60,
                         ioLimit: port == ports.data && encoder.running ? 2 : 15)
+            if !active { return }
+        }
+        for socket in Array(controlSockets) {
+            socket.tick(idleLimit: nil, ioLimit: 15)
             if !active { return }
         }
         if now - lastPublishAt >= 1 { publish() }
@@ -402,8 +508,11 @@ final class IOSCastBroadcastEngine {
     private func teardownTransport() {
         probe?.onClosed = nil; probe?.close("stopped"); probe = nil
         for socket in sockets.values { socket.onClosed = nil; socket.close("stopped") }
+        for socket in controlSockets { socket.onClosed = nil; socket.close("stopped") }
+        controlSockets.removeAll(); sessionControl = nil; sessionIdentity = nil; sessionStarted = false
+        nextControlIdentifier = 1; nextKeepAlive = .infinity; configured = false; prefixedVideo = false; waitingSessionStart = nil
         sockets.removeAll(); connected.removeAll()
-        for connection in pending.values { connection.cancel() }; pending.removeAll()
+        for connections in pending.values { connections.forEach { $0.cancel() } }; pending.removeAll()
         for listener in listeners.values { listener.stateUpdateHandler = nil; listener.newConnectionHandler = nil; listener.cancel() }
         listeners.removeAll(); listenerReady.removeAll(); encoder.stop()
     }
@@ -413,6 +522,15 @@ final class IOSCastBroadcastEngine {
     }
     private func end(_ phase: String, reason: String, notifySystem: Bool, publishFinal: Bool = true) {
         guard active || finish != nil else { return }
+        let stopSocket = phase == "idle" && grant?.route?.sourceError() == nil ? sessionControl : nil
+        let stopBytes = grant?.recipe.session.flatMap { try? sessionMessage($0.stop) }
+        // 停止后先隔离所有回调/编码；最多给本已验证的控制连接 250ms 完成停止通知。
+        if let socket = stopSocket, let bytes = stopBytes, !socket.closed, socket.writeSince == nil {
+            controlSockets.removeAll { $0 === socket }
+            socket.onClosed = nil; socket.onControl = nil; socket.onMedia = nil
+            socket.send(bytes) { socket.close("stopped") }
+            queue.asyncAfter(deadline: .now() + .milliseconds(250)) { socket.close("stopped") }
+        }
         active = false; generation &+= 1; self.phase = phase; self.reason = reason
         timer?.cancel(); timer = nil
         routeMonitor?.pathUpdateHandler = nil; routeMonitor?.cancel(); routeMonitor = nil; routePath = nil
