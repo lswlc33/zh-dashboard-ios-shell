@@ -234,7 +234,7 @@ private actor IOSLiveActivityManager {
         let activity: Activity<ZeehoActivityAttributes>
         if #available(iOS 16.2, *) {
             activity = try Activity.request(attributes: attributes,
-                content: ActivityContent(state: state, staleDate: staleDate(snapshot, kind: kind)),
+                content: ActivityContent(state: state, staleDate: Self.staleDate(snapshot, kind: kind)),
                 pushType: nil)
         } else {
             activity = try Activity.request(attributes: attributes, contentState: state, pushType: nil)
@@ -278,7 +278,7 @@ private actor IOSLiveActivityManager {
                 chargeStartedAt: Self.chargeStartedAt(kind: activity.attributes.kind, snapshot: value,
                                                       previous: previousChargeStarted))
             if #available(iOS 16.2, *) {
-                await activity.update(ActivityContent(state: state, staleDate: staleDate(value, kind: activity.attributes.kind)))
+                await activity.update(ActivityContent(state: state, staleDate: Self.staleDate(value, kind: activity.attributes.kind)))
             } else { await activity.update(using: state) }
             updating.remove(activity.id)
             guard Self.isLive(activity.activityState) else {
@@ -494,7 +494,7 @@ final class IOSSystemSurfacesService: NSObject, IOSBridgeService, IOSBridgeCance
         guard #available(iOS 16.1, *) else { return }
         for activity in Activity<ZeehoActivityAttributes>.activities {
             guard activity.attributes.owner.accountVINHash == credential.ownerHash,
-                  Self.isLive(activity.activityState),
+                  IOSLiveActivityManager.isLive(activity.activityState),
                   activity.attributes.kind == .charging || activity.attributes.kind == .vehicle else { continue }
             let previous: SystemSnapshot?
             if #available(iOS 16.2, *) { previous = activity.content.state.snapshot }
@@ -514,11 +514,11 @@ final class IOSSystemSurfacesService: NSObject, IOSBridgeService, IOSBridgeCance
             else { previousStarted = activity.contentState.chargeStartedAt }
             let state = ZeehoActivityAttributes.ContentState(
                 snapshot: value,
-                chargeStartedAt: Self.chargeStartedAt(kind: activity.attributes.kind, snapshot: value,
-                                                      previous: previousStarted))
+                chargeStartedAt: IOSLiveActivityManager.chargeStartedAt(kind: activity.attributes.kind, snapshot: value,
+                                                                        previous: previousStarted))
             if #available(iOS 16.2, *) {
                 Task { await activity.update(ActivityContent(state: state,
-                    staleDate: Self.staleDate(value, kind: activity.attributes.kind))) }
+                    staleDate: IOSLiveActivityManager.staleDate(value, kind: activity.attributes.kind))) }
             } else {
                 Task { await activity.update(using: state) }
             }
