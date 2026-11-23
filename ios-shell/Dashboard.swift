@@ -1,5 +1,6 @@
 import UIKit
 import WebKit
+import ZeehoSystemShared
 
 
 @main
@@ -18,6 +19,9 @@ final class AppDelegate: UIResponder, UIApplicationDelegate {
         // 系统虽然可以回收 Caches/tmp，但没有任何上界保证；启动时做一次有界清扫。
         // 放在后台队列，不阻塞首帧。
         DispatchQueue.global(qos: .utility).async { IOSTemporaryFileSweeper.sweepAtLaunch() }
+        // 卸载重装不会清 App Group：把上一次安装留下的快照/凭据清掉，
+        // 否则小组件会继续显示上一台车（含账号相关的匿名摘要）。同样放后台。
+        DispatchQueue.global(qos: .utility).async { BootHealth.resetStaleSharedStateIfFirstLaunch() }
         if let identifiers = launchOptions?[.bluetoothCentrals] as? [String] {
             IOSBluetoothService.shared.restoreIfRequested(identifiers)
         }
@@ -216,6 +220,31 @@ enum BootHealth {
     private static let reasonKey = "io.github.lswlc33.dashboard.ios.boot.reason"
     private static let welcomeKey = "io.github.lswlc33.dashboard.ios.boot.welcome"
     private static let buildKey = "io.github.lswlc33.dashboard.ios.boot.build"
+    /// 共享区已被「首次安装」逻辑清过一次的标记。与 buildKey 分开：
+    /// buildKey 覆盖升级，这里只认「这台设备上第一次启动本 App」。
+    private static let sharedResetKey = "io.github.lswlc33.dashboard.ios.shared.reset"
+
+    /// 清理 App Group 里早已失效的历史残留。
+    ///
+    /// **iOS 不会随 App 卸载删除 App Group 容器**，所以「删了重装」之后
+    /// `ZeehoSystemSnapshots-v1/` 里仍是上一次安装留下的快照与凭据，桌面小组件
+    /// 会继续显示上一台车——用户看到的就是「卸载重装还有上次的记录」。
+    ///
+    /// 判据只看数据本身多旧（`hasStaleSharedState`）：快照自身的有效期最长 15 分钟、
+    /// 展示窗口 45 分钟，超过 24 小时的快照在任何安装状态下都不可能再被正常展示。
+    /// 这样升级时不会误删用户刚产生的正常数据，卸载重装的旧数据则必然被清掉。
+    ///
+    /// 返回值仅用于诊断日志。
+    @discardableResult
+    static func resetStaleSharedStateIfFirstLaunch() -> Bool {
+        guard !defaults.bool(forKey: sharedResetKey) else { return false }
+        // 先落标记：无论下面判定成什么，都不该在每次启动重复执行。
+        defaults.set(true, forKey: sharedResetKey)
+        guard SystemSnapshotStore.hasStaleSharedState() else { return false }
+        SystemSnapshotStore.resetAll()
+        IOSDiagnostics.shared.log("boot: 共享区存在过期残留，已清空快照与小组件凭据")
+        return true
+    }
 
     /// 首次安装或 App 版本变化后需要看一次欢迎页。
     static func needsWelcome() -> Bool {

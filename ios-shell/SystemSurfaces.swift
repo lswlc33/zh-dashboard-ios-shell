@@ -365,7 +365,9 @@ private actor IOSLiveActivityManager {
 
 final class IOSSystemSurfacesService: NSObject, IOSBridgeService, IOSBridgeCancellableService,
                                       IOSSystemSurfacePublisher {
-    let methods = ["system.surfaces.status", "system.snapshot", "system.displayPreference", "liveActivity.start", "liveActivity.update", "liveActivity.end", "widgets.reload"]
+    let methods = ["system.surfaces.status", "system.snapshot", "system.displayPreference",
+                   "system.resetSharedState", "liveActivity.start", "liveActivity.update",
+                   "liveActivity.end", "widgets.reload"]
     // 与扩展里的 `ZeehoWidgetKind.vehicle` 必须是同一个字符串（扩展在 Widgets 模块，
     // Host 不链接它，所以只能各写一份常量）。test.py 会断言两边一致。
     // **这个字符串是已发布的对外契约，永远不要改**：WidgetKit 按 kind 归档已放置实例，
@@ -756,7 +758,8 @@ final class IOSSystemSurfacesService: NSObject, IOSBridgeService, IOSBridgeCance
             // 注册」无关，只要 App Group 可用就该放行。若沿用 supported（= embedded && group），
             // 侧载后扩展探测一旦误判，快照就永远不写，桌面小组件表现为「车况暂无数据」，
             // 连「打开 App 同步一次」这条兜底都失效——这是比探测本身更严重的失败放大。
-            let requiresVerifiedExtension = method != "system.snapshot"
+            // 清理接口只写 App Group，和扩展注册与否无关；扩展探测误判时它正是唯一的救命入口。
+            let requiresVerifiedExtension = method != "system.snapshot" && method != "system.resetSharedState"
             if requiresVerifiedExtension {
                 guard availability["supported"] as? Bool == true else {
                     throw SystemSnapshotError(availability["reason"] as? String ?? "system_surfaces_unavailable")
@@ -779,6 +782,16 @@ final class IOSSystemSurfacesService: NSObject, IOSBridgeService, IOSBridgeCance
                 try SystemSnapshotStore.writeDualDisplay(enabled, expectedOwner: selected)
                 _ = reloadWidgets(force: true, snapshot: latest)
                 finish(job, ["ok": true, "stored": true, "dualDisplay": enabled])
+            case "system.resetSharedState":
+                // 显式清空共享区：给「换过账号/卸载重装后小组件还显示上一台车」这种
+                // 已经乱掉的状态一个确定的恢复入口。不依赖 owner（正是为了处理
+                // 「owner 都已经对不上」的情况），因此也只允许无参数调用。
+                guard options.isEmpty else { throw SystemSnapshotError("invalid_args") }
+                latest = nil
+                persistedSnapshot = nil
+                SystemSnapshotStore.resetAll()
+                _ = reloadWidgets(force: true, snapshot: nil)
+                finish(job, ["ok": true, "cleared": true])
             case "system.snapshot":
                 if try optionalBoolean(options["enable"]) == false {
                     try validateSnapshotKeys(options)

@@ -355,6 +355,96 @@ public enum SystemSnapshotStore {
         }
     }
 
+    /// 共享区里是否有「早已过期、不可能还有效」的残留数据。
+    ///
+    /// 用于卸载重装后的自愈：iOS 保留 App Group 容器，重装后旧快照仍在，
+    /// 小组件会继续显示上一台车。
+    ///
+    /// **判据只看「数据本身多旧」，不看「这是不是第一次启动」**——
+    /// 首装与升级在 didFinishLaunching 时无法可靠区分（安装标记要到欢迎页流程
+    /// 才写入），用安装标记当判据会在升级时误删用户正常的数据。
+    ///
+    /// 而「快照存在时间远超它自己的有效期」是**任何安装状态下都成立**的清理条件：
+    /// 正常的落地快照其 `expiresAt` 最多比 `capturedAt` 晚 15 分钟
+    /// （`SystemSnapshot.maxLifetimeMs`），小组件展示窗口最长 45 分钟。
+    /// 因此任何 capturedAt 超过 `staleAfterSeconds` 的快照都已经不可能被展示，
+    /// 留着只会占空间、并让扩展在「读不到当前车辆」时回退到它。
+    ///
+    /// 不抛错：读不到目录就当作「没有残留」，避免启动路径因为一次 IO 失败去清数据。
+    public static func hasStaleSharedState(staleAfterSeconds: Double = 24 * 3600) -> Bool {
+        guard isAvailable() else { return false }
+        let cutoff = Date().timeIntervalSince1970 - staleAfterSeconds
+        return (try? coordinated(create: false, revoking: true) { root -> Bool in
+            let manager = FileManager.default
+            // owner 标记自身不带时间，只能借它指向的那份快照判断。
+            if let selected = try? owner(at: root) {
+                let target = path(root, owner: selected)
+                if !manager.fileExists(atPath: target.path) { return true }  // marker 指向的快照已丢，是死引用
+                if let value = try? readSnapshotFile(target), Double(value.capturedAt) / 1000 < cutoff { return true }
+            }
+            guard let entries = try? manager.contentsOfDirectory(at: root, includingPropertiesForKeys: nil),
+                  entries.count <= 64 else { return false }
+            for entry in entries {
+                let name = entry.lastPathComponent
+                if name.hasSuffix(".json"), ownerIdentifier(String(name.dropLast(5))) != nil,
+                   let value = try? readSnapshotFile(entry), Double(value.capturedAt) / 1000 < cutoff {
+                    return true
+                }
+            }
+            return false
+        }) ?? false
+    }
+
+    /// 读取快照文件的最小结构（只取 capturedAt）。坏文件返回 nil，由调用方跳过。
+    private static func readSnapshotFile(_ url: URL) throws -> SystemSnapshot {
+        let data = try Data(contentsOf: url, options: [.mappedIfSafe])
+        return try JSONDecoder().decode(SystemSnapshot.self, from: data)
+    }
+
+    /// 清空整个 App Group 共享区（快照 + owner 标记 + 小组件设置 + 双显标记 + 凭据 + 拉取缓存）。
+    ///
+    /// 只用于「这台设备上已经没有可信的账号上下文」：
+    ///   · 新安装/卸载重装（iOS 不随 App 卸载删除 App Group 容器，旧卡片会一直显示上一台车）；
+    ///   · 用户在网页里清掉全部账号、当前既无 token 也无车辆。
+    ///
+    /// 与 `clearAccount` 的区别：那条要求先知道 owner 且只清同一账号，这里**不依赖任何 owner**，
+    /// 直接把共享区当成不可信输入清空。调用方必须已经确认「确实没有任何有效账号」，
+    /// 否则会把别的账号/车辆的数据一起删掉。
+    ///
+    /// 失败只清到能清的部分：单个文件删不掉不阻断其余清理，也不抛错
+    /// （清理失败比留旧数据更难排查，但不该让调用方因此进不了面板）。
+    public static func resetAll() {
+        guard isAvailable() else { return }
+        try? coordinated(create: true, revoking: true) { root in
+            let manager = FileManager.default
+            // 先撤 marker：之后即使清理中途失败，扩展也读不到「当前车辆」，
+            // 只会走「没有快照」的占位路径，不会继续展示上一辆车。
+            try? manager.removeItem(at: root.appendingPathComponent(markerName))
+            for name in [settingsName, dualDisplayName] {
+                try? manager.removeItem(at: root.appendingPathComponent(name))
+            }
+            // 摘要快照：只删「文件名本身就是一个合法 owner 标识」的文件，
+            // 其余未知文件原样保留（与 revokeAccount 同一保守口径）。
+            if let entries = try? manager.contentsOfDirectory(at: root, includingPropertiesForKeys: nil),
+               entries.count <= 64 {
+                for entry in entries {
+                    let name = entry.lastPathComponent
+                    guard name.hasSuffix(".json"),
+                          ownerIdentifier(String(name.dropLast(5))) != nil else { continue }
+                    try? manager.removeItem(at: entry)
+                }
+            }
+            // 车模 PNG 与索引：卡片上的车图也属于上一台车，必须一起清掉。
+            if let entries = try? manager.contentsOfDirectory(at: root, includingPropertiesForKeys: nil) {
+                for entry in entries where entry.lastPathComponent.hasPrefix("widget-vehicle-art-") {
+                    try? manager.removeItem(at: entry)
+                }
+            }
+        }
+        WidgetCredentialStore.clear()
+        WidgetFetchCache.clear()
+    }
+
     private static func path(_ root: URL, owner: SystemSnapshotOwner) -> URL {
         root.appendingPathComponent(owner.accountVINHash + "." + owner.scopeID + ".json", isDirectory: false)
     }
