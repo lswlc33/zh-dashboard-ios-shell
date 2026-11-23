@@ -92,7 +92,7 @@ final class UpdatePanelViewController: UIViewController,
     @objc private func cacheStateChanged() {
         guard !closed else { return }
         syncModalLock()
-        if active && !IOSPanelCache.shared.snapshot().busy { loadResourceInfo() }
+        if active && !IOSPanelCache.shared.isBusyForBridge() { loadResourceInfo() }
     }
 
     override func viewWillAppear(_ animated: Bool) {
@@ -134,7 +134,7 @@ final class UpdatePanelViewController: UIViewController,
     /// 初始化只在真实终态解锁，不能把准备 / 下载回执当作完成。
     private func syncModalLock() {
         guard !closed, isViewLoaded else { return }
-        let busy = initializing || IOSPanelCache.shared.snapshot().busy
+        let busy = initializing || IOSPanelCache.shared.isBusyForBridge()
         isModalInPresentation = busy
         navigationController?.isModalInPresentation = busy
         navigationItem.rightBarButtonItem?.isEnabled = !busy
@@ -147,7 +147,7 @@ final class UpdatePanelViewController: UIViewController,
     }
 
     @objc private func dismissSelf() {
-        guard active, !initializing, !IOSPanelCache.shared.snapshot().busy else { return }
+        guard active, !initializing, !IOSPanelCache.shared.isBusyForBridge() else { return }
         // onChange 留到真正消失再发，检查等待先取消以拦住晚到的弹窗。
         checkTask?.cancel()
         panelCheckTask?.cancel()
@@ -346,7 +346,7 @@ final class UpdatePanelViewController: UIViewController,
 
     private func selectLine(_ line: IOSPanelLine) {
         guard active, presentedViewController == nil, line != IOSPanelLine.current else { return }
-        guard !initializing, !IOSPanelCache.shared.snapshot().busy else {
+        guard !initializing, !IOSPanelCache.shared.isBusyForBridge() else {
             // 标题不能用「切换更新线路」：正文说的是「先完成当前操作」，
             // 标题却像已经问过用户要不要切，前后矛盾。
             presentMessage(IOSStrings.updateBusyTitle, IOSStrings.updateBusyLineMessage)
@@ -360,7 +360,7 @@ final class UpdatePanelViewController: UIViewController,
         alert.addAction(UIAlertAction(title: IOSStrings.cancel, style: .cancel))
         alert.addAction(UIAlertAction(title: IOSStrings.confirm, style: .default) { [weak self] _ in
             guard let self = self, self.active else { return }
-            guard !self.initializing, !IOSPanelCache.shared.snapshot().busy else {
+            guard !self.initializing, !IOSPanelCache.shared.isBusyForBridge() else {
                 self.presentMessage(IOSStrings.updateLineChangedTitle, IOSStrings.busy)
                 return
             }
@@ -404,7 +404,7 @@ final class UpdatePanelViewController: UIViewController,
 
     private func reinitialize() {
         guard active else { return }
-        guard !initializing, !IOSPanelCache.shared.snapshot().busy else {
+        guard !initializing, !IOSPanelCache.shared.isBusyForBridge() else {
             presentMessage(IOSStrings.updateReinitializeTitle, IOSStrings.busy)
             return
         }
@@ -415,7 +415,7 @@ final class UpdatePanelViewController: UIViewController,
         alert.addAction(UIAlertAction(title: IOSStrings.cancel, style: .cancel))
         alert.addAction(UIAlertAction(title: IOSStrings.confirm, style: .default) { [weak self] _ in
             guard let self = self, self.active, !self.initializing,
-                  !IOSPanelCache.shared.snapshot().busy else { return }
+                  !IOSPanelCache.shared.isBusyForBridge() else { return }
             let id = UUID()
             self.initializeID = id
             self.initializing = true

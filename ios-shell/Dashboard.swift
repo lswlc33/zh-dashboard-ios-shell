@@ -543,7 +543,7 @@ final class PanelController: UIViewController, WKNavigationDelegate, WKUIDelegat
     private func requestWelcome() -> Bool {
         guard !returningToWelcome, onWelcome != nil, isViewLoaded, view.window != nil,
               UIApplication.shared.applicationState == .active, presentedViewController == nil,
-              !IOSPanelCache.shared.snapshot().busy else { return false }
+              !IOSPanelCache.shared.isBusyForBridge() else { return false }
         returningToWelcome = true
         let ticket = startupGeneration
         let navigationID = currentNavigationID

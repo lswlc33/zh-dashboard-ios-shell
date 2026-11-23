@@ -588,6 +588,8 @@ final class RecoveryViewController: UIViewController {
             return IOSStrings.recoveryInitErrorUrl
         case "app_group_unavailable":
             return IOSStrings.recoveryInitErrorAppGroup
+        case "panel_update_timeout":
+            return IOSStrings.recoveryInitErrorTimeout
         default:
             return IOSStrings.recoveryInitErrorGeneric
         }

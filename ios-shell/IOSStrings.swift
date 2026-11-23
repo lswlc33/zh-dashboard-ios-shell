@@ -180,6 +180,9 @@ enum IOSStrings {
     static let recoveryInitErrorCommit = "资源已下载但未能替换旧版本，请重试；当前面板仍可用。"
     static let recoveryInitErrorUrl = "面板资源地址无效，请稍后重试或切换软件更新线路。"
     static let recoveryInitErrorAppGroup = "系统共享区不可用，面板资源无法共享给小组件。请重启 App 后重试。"
+    /// 面板更新整批超时：以前这种情况界面会一直停在某个百分比、再点更新显示
+    /// `panel_update_busy`，用户没有任何下一步。现在明确告诉他可以重试。
+    static let recoveryInitErrorTimeout = "资源下载超时（网络太慢或线路不稳），已保留旧面板。可以重试，或稍后切换更新线路。"
     static let recoveryReasonUnsafe = "页面安全检查未通过，已停止打开。请重新初始化可信资源后再试。"
     static let recoveryReasonRenderer = "网页显示进程已停止，已返回原生恢复页。请检查资源后手动重试。"
     static let recoveryReasonTimeout = "页面未在规定时间内准备好。已停止等待，可以手动重试。"

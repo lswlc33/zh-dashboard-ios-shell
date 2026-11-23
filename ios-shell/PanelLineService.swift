@@ -43,7 +43,7 @@ final class IOSPanelLineService: IOSBridgeService {
             reply(["ticket": "", "done": true, "ok": false, "error": "bad_request"], nil)
             return
         }
-        guard !IOSPanelCache.shared.snapshot().busy else {
+        guard !IOSPanelCache.shared.isBusyForBridge() else {
             reply(["ticket": "", "done": true, "ok": false, "error": "panel_update_busy"], nil)
             return
         }

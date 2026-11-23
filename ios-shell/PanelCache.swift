@@ -81,7 +81,15 @@ final class IOSPanelCache {
         var fallbackAvailable = false
         /// 进度比例。优先用「已完成文件数 / 总数」——字节数依赖 Content-Length，
         /// CDN 压缩或缺少响应头时会算错（真机曾卡在 90%）。
+        ///
+        /// 下载阶段一律以「已完成文件数」为准（即使还是 0/11）：之前加了
+        /// `completedFiles > 0` 的条件，首个文件卡住时会退回字节比例，
+        /// 而字节比例依赖 Content-Length、在慢速滴灌下会长时间停在某个百分比
+        /// 看起来像卡死。文件数至少每个文件跳一次，用户能看出还在推进。
         var progress: Double {
+            if phase == .downloading || phase == .preparing, resourceCount > 0 {
+                return min(1, Double(completedFiles) / Double(resourceCount))
+            }
             if resourceCount > 0, completedFiles > 0 {
                 return min(1, Double(completedFiles) / Double(resourceCount))
             }
@@ -127,9 +135,19 @@ final class IOSPanelCache {
         configuration.httpShouldUsePipelining = true
         configuration.httpMaximumConnectionsPerHost = 6
         configuration.timeoutIntervalForRequest = 30
+        // `timeoutIntervalForRequest` 只是**空闲**超时：服务端每 29 秒挤一个字节就能
+        // 无限拖住这个请求，batch 永不结束 → state.busy 永远为 true → 之后所有
+        // initialize 和 panel.update 都被 busy 早退（用户看到 panel_update_busy）。
+        // 这里再给一个资源级硬上限：单次请求总时长超过它就必然报错并走重试/失败路径。
+        // 面板最大资源约 4MB，30 秒内下不完说明链路已经不可用；宁可失败让旧快照继续用。
+        configuration.timeoutIntervalForResource = 60
         return URLSession(configuration: configuration)
     }()
     private var state = State()
+    /// 本轮 busy 从什么时候开始（epoch 秒，0 表示当前不 busy）。
+    /// 只给 `isBusyForBridge()` 的残留自愈用：看门狗负责正常收尾，
+    /// 这里兜住「定时器压根没机会跑」（进程长时间挂起）的那类情况。
+    private var busySince: TimeInterval = 0
     /// 在途的 dataTask，按自增 id 存。完成/失败会立刻摘掉：之前只 append 不删，
     /// 数组会跟着重试次数无界增长（重试最多的资源会留下十几份已完成的 task）。
     private var tasks: [Int: URLSessionDataTask] = [:]
@@ -453,6 +471,44 @@ final class IOSPanelCache {
         queue.sync { state }
     }
 
+    /// 当前是否有一轮初始化/下载真的还在跑。
+    ///
+    /// 与直接读 `snapshot().busy` 的区别：这里额外核对「这一轮是什么时候开始的」，
+    /// 超过 `batchDeadlineSeconds` 的余量还没有任何终态就认为它是残留状态，
+    /// 主动把它降级成失败，而不是让 busy 继续挡住用户的手动更新。
+    /// 看门狗（`armDeadline`）负责正常收尾；这条是给「进程被挂起太久、
+    /// 定时器没机会跑」之类的极端情况留的第二道闸，保证下次点更新不是
+    /// 一句 `panel_update_busy` 了事。
+    func isBusyForBridge() -> Bool {
+        queue.sync { busyLocked() }
+    }
+
+    /// `isBusyForBridge` 的本体。**必须在 PanelCache 的串行队列上调用**：
+    /// 已经在 `queue.async` 里的内部路径（initialize / refresh）直接用它，
+    /// 从桥上进来（主线程/其他队列）的调用走会排队版本，避免 queue.sync 自锁。
+    private func busyLocked() -> Bool {
+        guard state.busy else { return false }
+        let started = busySince
+        guard started > 0,
+              Date().timeIntervalSince1970 - started > Self.batchDeadlineSeconds + 60 else {
+            return true
+        }
+        IOSDiagnostics.shared.log("panelCache: busy 已持续超过上限，清成失败态放行下一次更新")
+        state.phase = .error
+        state.error = "panel_update_timeout"
+        busySince = 0
+        // 残留状态多半是「下载没收尾」，磁盘上的旧快照通常完好：
+        // 探测走的是 cachedCurrent + 一次 fileExists（内部是 NSLock，不是 queue）。
+        state.fallbackAvailable = snapshotDirectory() != nil
+        let current = state
+        DispatchQueue.main.async { [weak self] in
+            guard let self = self else { return }
+            self.onState?(current)
+            NotificationCenter.default.post(name: Self.stateDidChangeNotification, object: self)
+        }
+        return false
+    }
+
     // MARK: - 初始化
 
     /// 下载并替换快照。`force` 表示「忽略已有快照、必须重新下载」。
@@ -460,7 +516,7 @@ final class IOSPanelCache {
     func initialize(force: Bool, completion: @escaping (State) -> Void) {
         queue.async { [weak self] in
             guard let self = self else { return }
-            guard !self.state.busy else {
+            guard !self.busyLocked() else {
                 let current = self.state
                 DispatchQueue.main.async { completion(current) }
                 return
@@ -471,6 +527,7 @@ final class IOSPanelCache {
             self.downloadLineRevision = IOSPanelLine.revision
             self.cancelled = false
             self.state = State(phase: .preparing, resourceCount: Self.resources.count)
+            self.busySince = Date().timeIntervalSince1970
             self.emit(ticket, completion)
 
             do {
@@ -599,7 +656,7 @@ final class IOSPanelCache {
     func refresh(completion: @escaping (State) -> Void) {
         queue.async { [weak self] in
             guard let self = self else { return }
-            guard !self.state.busy else {
+            guard !self.busyLocked() else {
                 let current = self.state
                 DispatchQueue.main.async { completion(current) }
                 return
@@ -612,6 +669,7 @@ final class IOSPanelCache {
                 // 一并清空，避免欢迎页挂一句对不上的旧失败原因。
                 self.state = State()
             }
+            self.busySince = 0
             let current = self.state
             DispatchQueue.main.async { completion(current) }
         }
@@ -637,6 +695,7 @@ final class IOSPanelCache {
             self.state = self.snapshotDirectory() != nil
                 ? State(phase: .ready, build: self.snapshotBuild())
                 : State()
+            self.busySince = 0
             let current = self.state
             DispatchQueue.main.async { completion(current) }
         }
@@ -644,6 +703,10 @@ final class IOSPanelCache {
 
     private func emit(_ ticket: Int, _ completion: @escaping (State) -> Void) {
         guard generation == ticket else { return }
+        // 终态统一在这里维护 busySince：离开 busy 就清零，仍在 busy 就保留本轮起点。
+        // 放在 emit 而不是各个赋值点，是因为终态有成对的成功/失败/早退分支，
+        // 逐个补很容易漏掉一条，而漏掉的那条正是残留 busy 的来源。
+        if !state.busy { busySince = 0 }
         let current = state
         DispatchQueue.main.async {
             completion(current)
@@ -665,6 +728,15 @@ final class IOSPanelCache {
     /// 单个资源失败后最多重试次数。移动网络抖动很常见，
     /// 一次失败就整批 abort 会让用户卡在「N-1/N」不动。
     private static let maxRetriesPerResource = 2
+
+    /// 整批硬上限：超过它无论进度如何都判失败。
+    ///
+    /// 存在的意义只有一个——**绝不让 `state.busy` 长期为 true**。
+    /// busy 由 batch 结束时清除，而一旦某条收尾路径丢了（取消与回调交错、
+    /// 请求既不报错也不返回、重试链断层），busy 就会永久为 true，
+    /// 之后 `initialize` 与 `panel.update` 全部被 busy 早退，用户看到的是
+    /// 「panel update busy」且旧面板一直不更新。宁可整批判失败保留旧快照。
+    private static let batchDeadlineSeconds: TimeInterval = 180
 
     /// 单个资源的下载状态。用显式状态机而不是一个共享游标：
     /// 旧实现失败时把 `nextIndex` 退回去重试，同一资源可能被两个并发位同时领取，
@@ -707,6 +779,9 @@ final class IOSPanelCache {
         var queue: [Int]
         /// 可选资源失败后被跳过的路径，透出到 State。
         var skipped: [String] = []
+        /// 整批看门狗。任何一条路径漏掉 finished（回调丢了、请求既不通也不报错、
+        /// 取消与重试交错），这里都会兜底结束整批，绝不让 state.busy 永久为 true。
+        var watchdog: DispatchWorkItem?
         let completion: (Result<Void, Error>) -> Void
 
         init(ticket: Int, count: Int, strict: Bool, completion: @escaping (Result<Void, Error>) -> Void) {
@@ -751,6 +826,7 @@ final class IOSPanelCache {
         state.resourceCount = Self.resources.count
         // 冷启动时先把阶段推给界面，别让用户盯着「待完成」等第一个字节。
         emitState(ticket)
+        armDeadline(batch)
 
         if Self.resources.isEmpty {
             batch.finished = true
@@ -937,8 +1013,28 @@ final class IOSPanelCache {
         }
     }
 
+    /// 装整批看门狗：到点还没结束就判失败，保证 busy 一定能被清掉。
+    /// 回调在 PanelCache 的串行队列上执行，和 batch 状态机同一条线程。
+    private func armDeadline(_ batch: Batch) {
+        let ticket = batch.ticket
+        let work = DispatchWorkItem { [weak self, weak batch] in
+            guard let self = self, let batch = batch, !batch.finished else { return }
+            guard self.generation == ticket else { return }
+            IOSDiagnostics.shared.log("panelCache: 整批超时（\(Int(Self.batchDeadlineSeconds))s），"
+                + "已完成 \(batch.completedFiles)/\(Self.resources.count)，按失败收尾")
+            // 走 failBatch 而不是自己收尾：它负责取消在途请求、清任务表并回调 completion，
+            // 是唯一能保证 initialize 拿到终态的地方。
+            self.failBatch(batch, Failure.reason("panel_update_timeout"))
+        }
+        batch.watchdog = work
+        queue.asyncAfter(deadline: .now() + Self.batchDeadlineSeconds, execute: work)
+    }
+
     private func finishBatch(_ batch: Batch) {
         guard !batch.finished else { return }
+        // 正常收尾：看门狗已经没用了，立刻撤掉，避免它在上限时刻又判一次失败。
+        batch.watchdog?.cancel()
+        batch.watchdog = nil
         // 最后一道闸：必需资源必须真的落盘。正常路径失败会直接 failBatch，
         // 万一状态机有漏洞，也不能把缺 index.html 的目录提交成 current。
         for (index, name) in Self.resources.enumerated() where Self.isRequired(name) {
@@ -992,6 +1088,9 @@ final class IOSPanelCache {
     private func failBatch(_ batch: Batch, _ error: Error) {
         guard !batch.finished else { return }
         batch.finished = true
+        // 失败收尾同样撤掉看门狗，否则到点会再进来判一次（虽然 finished 已挡住）。
+        batch.watchdog?.cancel()
+        batch.watchdog = nil
         // 整批已经注定失败，剩下的在途请求继续跑只是白烧流量。
         // 这里不碰 status：它们的回调会因为 batch.finished 提前 return。
         lock.lock()

@@ -325,7 +325,7 @@ final class IOSUpdateService: IOSBridgeCancellableService {
         case "panel.update":
             guard Set(options.keys) == ["line"], options["line"] as? String == line.rawValue,
                   !jobs.values.contains(where: { $0.method == "panel.update" }),
-                  !IOSPanelCache.shared.snapshot().busy else { reply(failure("panel_update_busy"), nil); return }
+                  !IOSPanelCache.shared.isBusyForBridge() else { reply(failure("panel_update_busy"), nil); return }
             let job = Job(method: method, args: args, generation: generation, line: line, reply: reply)
             jobs[job.id] = job
             IOSPanelCache.shared.initialize(force: true) { [weak self, weak job] state in
