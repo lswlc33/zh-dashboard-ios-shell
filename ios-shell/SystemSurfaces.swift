@@ -1734,6 +1734,37 @@ final class IOSSystemSurfacesService: NSObject, IOSBridgeService, IOSBridgeCance
         return manager
     }
 
+    /// 清掉已经停止更新的实时活动（2026-11-25）。
+    ///
+    /// 背景：iOS 不允许第三方在 App 被划掉之后后台更新实时活动（没有 APNs 推送通道时，
+    /// `pushType: nil` 的活动只能由宿主进程 update）。用户强退后卡片会永久停在最后一帧，
+    /// 以前它就一直那么挂着，桌面上看着像还在跑。
+    ///
+    /// 现在按内容自带的 staleDate 判断：超过宽限期仍没被刷新，就主动结束，
+    /// 避免长期展示一份停住的假数据。宽限期给 30 分钟——充电/骑行本身可能持续很久，
+    /// 期间 App 会持续 update，不会被误杀；只有真的停更了才会命中。
+    /// 调用时机只有「App 变前台」（启动或回前台），不占后台执行权。
+    static func reapIdleActivities(graceSeconds: TimeInterval = 30 * 60) {
+        guard #available(iOS 16.1, *) else { return }
+        let now = Date()
+        for activity in Activity<ZeehoActivityAttributes>.activities {
+            guard IOSLiveActivityManager.isLive(activity.activityState) else { continue }
+            let snapshot: SystemSnapshot?
+            if #available(iOS 16.2, *) { snapshot = activity.content.state.snapshot }
+            else { snapshot = activity.contentState.snapshot }
+            // 没有载荷就判断不了新旧：留给用户自己关，不擅自结束。
+            guard let snapshot = snapshot else { continue }
+            let deadline = IOSLiveActivityManager.staleDate(snapshot, kind: activity.attributes.kind)
+            guard now.timeIntervalSince(deadline) >= graceSeconds else { continue }
+            // `.immediate`：既然已经停更，就别再占着锁屏/灵动岛等用户手动划掉。
+            if #available(iOS 16.2, *) {
+                Task { await activity.end(nil, dismissalPolicy: .immediate) }
+            } else {
+                Task { await activity.end(using: nil, dismissalPolicy: .immediate) }
+            }
+        }
+    }
+
     @discardableResult private func reloadWidgets(force: Bool, snapshot: SystemSnapshot?) -> Bool {
         let available = runtimeAvailability()
         // 只要 App Group 可用就发刷新请求：reloadTimelines 对「扩展未被系统注册」是

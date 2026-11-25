@@ -159,7 +159,8 @@ struct WidgetUpdatedAt: View {
     // 桌面小组件保留最后已知值时用 true：同一行写「时间 · 可能已过期」，
     // 与 Android 小组件的 widget_updated_stale 一致，不再单独占一行红字。
     var keepsLastKnown = false
-    // Live Activity 传 false：时间新旧已经由这一行本身表达，不再叠加任何过期标注。
+    // 2026-11-25 起实时活动也标过期：App 被划掉后 iOS 不再让我们更新活动
+    // （无 APNs 推送通道），数值会冻结；隐藏标注等于让用户以为数据还在变。
     var annotatesStale = true
 
     var body: some View {

@@ -43,6 +43,17 @@ final class AppDelegate: UIResponder, UIApplicationDelegate {
         // 这里不承诺执行时间，只是让下一次机会始终处于排队状态。
         if #available(iOS 13.0, *) { IOSBackgroundScheduler.shared.scheduleAll() }
     }
+
+    func applicationDidBecomeActive(_ application: UIApplication) {
+        // 2026-11-25：清掉已经停更的实时活动。
+        //
+        // 用户从后台划掉 App 后，iOS 不再唤醒我们更新实时活动（没有 APNs 推送时），
+        // 卡片会永久停在最后一帧。这里在每次回到前台时按内容自带的 staleDate 判一次：
+        // 早就该更新却一直没更新的，直接结束，别让桌面长期挂着一份假数据。
+        // 放在主线程外执行：Activity.activities 与 end 都是线程安全的异步调用，
+        // 不该为了它拖慢首帧。
+        DispatchQueue.global(qos: .utility).async { IOSSystemSurfacesService.reapIdleActivities() }
+    }
 }
 
 // 启动分流：有可用快照且不是刚升级过就直接进面板，否则先走原生欢迎/恢复页。

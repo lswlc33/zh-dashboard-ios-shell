@@ -345,11 +345,19 @@ final class IOSBackgroundService: NSObject, IOSBridgeService, IOSBridgeCancellab
                 || previous?.uid != credential.uid || previous?.appID != credential.appID
                 || previous?.appSecret != credential.appSecret || previous?.h5AppID != credential.h5AppID
                 || previous?.h5Secret != credential.h5Secret
+            // 2026-11-25：小组件那份最小投影**先写**，不等钥匙串。
+            //
+            // 重签环境下 keychain-access-group 经常对不上（自签描述文件不带我们的组），
+            // replaceCredential 会失败并 `return`，于是后面这行镜像永远轮不到 ——
+            // 扩展拿不到凭据就只能读宿主快照，新用户看到的就是「小组件没数据」，
+            // 而钥匙串正常的设备一切正常（用户实测：自己能看、新用户看不到）。
+            // 两份凭据职责不同：Keychain 那份给后台任务，App Group 这份只给小组件取数；
+            // 前者失败不该连坐后者。镜像失败本身仍是静默的（App Group 不可用时 no-op）。
+            Self.mirrorWidgetCredential(accountID: credential.accountID, vin: credential.vin,
+                token: credential.token, appID: credential.appID, appSecret: credential.appSecret)
             if changed && !IOSBackgroundRunCoordinator.shared.replaceCredential(credential) {
                 reply(nil, "keychain_unavailable"); return
             }
-            Self.mirrorWidgetCredential(accountID: credential.accountID, vin: credential.vin,
-                token: credential.token, appID: credential.appID, appSecret: credential.appSecret)
             IOSBackgroundScheduler.shared.scheduleAll()
             reply(self.statusPayload(), nil)
         }
@@ -397,6 +405,12 @@ final class IOSBackgroundService: NSObject, IOSBridgeService, IOSBridgeCancellab
                 reply(["ok": true, "granted": false, "reason": "user_cancelled"], nil)
                 return
             }
+            // 2026-11-25：小组件那份最小投影必须**先写**，不能等钥匙串成功。
+            // 重签包（自签描述文件）里 keychain-access-group 常对不上，replaceCredential
+            // 会失败；以前它一 return，后面这行就永远轮不到，小组件只能退回读宿主快照 ——
+            // 新用户看到的就是「卡片没数据」。两份凭据职责不同，前者失败不该连坐后者。
+            Self.mirrorWidgetCredential(accountID: accountID, vin: vin, token: token,
+                                        appID: appID, appSecret: appSecret)
             guard IOSBackgroundRunCoordinator.shared.replaceCredential(credential) else {
                 credential.clear()
                 reply(nil, "keychain_unavailable")
@@ -411,13 +425,6 @@ final class IOSBackgroundService: NSObject, IOSBridgeService, IOSBridgeCancellab
                 IOSBackgroundPreferences.autoDailyTasksEnabled = tasks
             }
             IOSBackgroundScheduler.shared.scheduleAll()
-            // 顺手把一份**最小投影**放进 App Group，让桌面小组件能自己拉车况
-            // （官方 ZHWidgetExtension 的做法：扩展自带网络层，不依赖宿主存活）。
-            // 两份凭据语义不同：Keychain 那份给后台任务用（长期、可被系统定时唤醒）；
-            // App Group 这份只给小组件展示用（随前台会话刷新，清除时一起删）。
-            // 必须在 credential.clear() 之前调用。
-            Self.mirrorWidgetCredential(accountID: accountID, vin: vin, token: token,
-                                        appID: appID, appSecret: appSecret)
             IOSBackgroundLog.write("后台凭据已保存 autoSignIn=\(auto) scopes=\(scopes.joined(separator: "+"))")
             credential.clear()
             var payload = self.statusPayload()

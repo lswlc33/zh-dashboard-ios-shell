@@ -155,10 +155,12 @@ private struct LiveActivityBanner: View {
                     }
                 }
             }
-            // annotatesStale: false —— 实时活动不出现「数据已过期/可能已过期」，
-            // 只保留「最后更新 <时间>」这一行。
+            // annotatesStale: true —— 2026-11-25 用户实测「划掉 App 后活动不再刷新」。
+            // 那一刻起卡片上的一切数值都停住了，但以前这里写死 false，界面上只留一行
+            // 静态的「最后更新 <时间>」，看起来和活着没区别。iOS 不允许第三方后台刷新
+            // 实时活动（无 APNs 推送时），能做的至少是**如实告诉用户它已经停了**。
             WidgetUpdatedAt(timestamp: presentation.updatedAt, stale: presentation.isStale,
-                            annotatesStale: false)
+                            annotatesStale: true)
         }
         .padding(16)
     }
@@ -223,10 +225,9 @@ private struct LiveActivityExpandedBottom: View {
                         .font(.headline.monospacedDigit())
                 }
             }
-            // annotatesStale: false —— 实时活动不出现「数据已过期/可能已过期」，
-            // 只保留「最后更新 <时间>」这一行。
+            // annotatesStale: true —— 同 banner：App 被划掉后数值会冻结，必须如实标注过期。
             WidgetUpdatedAt(timestamp: presentation.updatedAt, stale: presentation.isStale,
-                            annotatesStale: false)
+                            annotatesStale: true)
         }
     }
 }
