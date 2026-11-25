@@ -280,8 +280,11 @@ private enum ActivityLifecycleTests {
 
     private static func gateSerializesSameID() async throws {
         let gate = SystemActivityOperationGate()
-        try check(await waitFor("同 id 首次加锁", { await gate.acquire("charging") }),
-                  "首次加锁超过 2 秒")
+        // check 的判据是同步 autoclosure，await 不能写在里面（swiftc 报
+        // "'async' call in an autoclosure that does not support concurrency"）；
+        // 先 await 出结果再断言。
+        let firstAcquired = await waitFor("同 id 首次加锁", { await gate.acquire("charging") })
+        try check(firstAcquired, "首次加锁超过 2 秒")
         let occupancy = Occupancy()
         let finished = DispatchSemaphore(value: 0)
         for _ in 0..<6 {
@@ -309,19 +312,23 @@ private enum ActivityLifecycleTests {
 
     private static func gateKeepsIDsIndependent() async throws {
         let gate = SystemActivityOperationGate()
-        try check(await waitFor("占用 charger", { await gate.acquire("charger") }), "charger 加锁失败")
-        try check(await waitFor("占用 rider", { await gate.acquire("rider") }), "不同 id 被互相阻塞")
-        try check(await waitFor("释放后重新加锁", {
+        let charged = await waitFor("占用 charger", { await gate.acquire("charger") })
+        try check(charged, "charger 加锁失败")
+        let rode = await waitFor("占用 rider", { await gate.acquire("rider") })
+        try check(rode, "不同 id 被互相阻塞")
+        let reacquired = await waitFor("释放后重新加锁", {
             await gate.release("rider")
             await gate.release("charger")
             await gate.acquire("rider")
             await gate.release("rider")
-        }), "全部释放后 id 没有恢复可用")
-        try check(await waitFor("重复释放", {
+        })
+        try check(reacquired, "全部释放后 id 没有恢复可用")
+        let releasedTwice = await waitFor("重复释放", {
             await gate.release("rider")
             await gate.acquire("rider")
             await gate.release("rider")
-        }), "空队列上重复释放破坏了 id")
+        })
+        try check(releasedTwice, "空队列上重复释放破坏了 id")
     }
 
     /// 只用于防止测试自身挂死；被测逻辑卡住时必须失败而不是静默超时。
