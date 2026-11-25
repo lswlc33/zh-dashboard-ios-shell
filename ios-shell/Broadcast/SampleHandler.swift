@@ -542,13 +542,13 @@ final class IOSCastBroadcastEngine {
             if lastSentAt > 0, now - lastSentAt > 15 { fail("frame_pull_timeout"); return }
             if lastSentAt == 0, now - castingStarted > 35 { fail("first_frame_timeout"); return }
         }
+        // 媒体控制口握手后可长期静默，暂停也会停止拉帧；会话活性由上面的帧流超时判断。
         for (port, socket) in Array(sockets) {
-            socket.tick(idleLimit: port == ports.control ? nil : 60,
-                        ioLimit: port == ports.data && encoder.running ? 2 : 15)
+            socket.tick(ioLimit: port == ports.data && encoder.running ? 2 : 15)
             if !active { return }
         }
         for socket in Array(controlSockets) {
-            socket.tick(idleLimit: nil, ioLimit: 15)
+            socket.tick(ioLimit: 15)
             if !active { return }
         }
         if now - lastPublishAt >= 1 { publish() }

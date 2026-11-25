@@ -873,7 +873,6 @@ final class IOSCastSocket {
     let queue: DispatchQueue
     let control: Bool
     var closed = false
-    var lastFrameAt = ProcessInfo.processInfo.systemUptime
     var partialSince: TimeInterval?
     var writeSince: TimeInterval?
     var onClosed: ((String) -> Void)?
@@ -972,7 +971,7 @@ final class IOSCastSocket {
                 else { length = Int(IOSCastWire.u16(header, 2)) }
                 self.readExactly(length) { [weak self] body in
                     guard let self = self, !self.closed else { return }
-                    self.partialSince = nil; self.lastFrameAt = ProcessInfo.processInfo.systemUptime
+                    self.partialSince = nil
                     let next: () -> Void = { [weak self] in self?.readFrame() }
                     if self.control { self.onControl?(IOSCastWire.Control(type: IOSCastWire.u32(header, 0), identifier: IOSCastWire.u32(header, 12), body: body), next) }
                     else { self.onMedia?(IOSCastWire.Media(command: IOSCastWire.u16(header, 0), serial: IOSCastWire.u32(header, 4), body: body), next) }
@@ -1001,11 +1000,10 @@ final class IOSCastSocket {
             }
         })
     }
-    func tick(idleLimit: TimeInterval?, ioLimit: TimeInterval) {
+    func tick(ioLimit: TimeInterval) {
         let now = ProcessInfo.processInfo.systemUptime
         if let partial = partialSince, now - partial > ioLimit { close("cast_frame_timeout") }
         else if let write = writeSince, now - write > ioLimit { close("cast_write_timeout") }
-        else if let limit = idleLimit, now - lastFrameAt > limit { close("vehicle_idle") }
     }
     func close(_ reason: String) {
         guard !closed else { return }
