@@ -117,7 +117,9 @@ private enum AppGroupTests {
         let active = "group.new.profile"
         let invalid = ["", "ordinary.bundle.id", "group.", "group..empty", "group.white space",
                        "group.a/b", "group.中文", "group.a\n", "group." + String(repeating: "x", count: 252)]
-        let longValid = "group." + String(repeating: "x", count: 251)
+        // 生产判据是 utf8.count <= 256，"group." 占 6 字节，所以后缀只能是 250 个字符；
+        // 旧值 251 实际是 257 字节，被 isValid 拒绝后回退 template_default（macOS CI 2026-11-25 实测）。
+        let longValid = "group." + String(repeating: "x", count: 250)
         let scenarios = [
             Scenario(name: "accessible override keeps precedence",
                      info: ["ZeehoAppGroupID": old, "ALTAppGroups": [alt]],
