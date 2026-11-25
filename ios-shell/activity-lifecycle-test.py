@@ -265,12 +265,14 @@ private enum ActivityLifecycleTests {
                   == Date(timeIntervalSince1970: 1_800_000_180), "车况失鲜时间超出快照有效期")
         let rideValue = snapshot(ride: ride(state: .recording, startedAt: at(30 * 60), updatedAt: at(20),
                                            speed: 11, speedAt: at(1_000)), expiresAt: expires)
+        // 最早的是速度采样 at(1000)+10s = baseMs-990_000，比 updatedAt+10s 与 expiresAt 都早。
         try check(SystemActivityPolicy.staleDate(rideValue, kind: .ride)
-                  == Date(timeIntervalSince1970: 1_799_999_981), "行程失鲜时间没有取最早字段")
+                  == Date(timeIntervalSince1970: 1_799_999_010), "行程失鲜时间没有取最早字段")
         let gauge = snapshot(gauge: SystemGaugeSnapshot(source: .ble, speedKph: 20, updatedAt: at(4)),
                             expiresAt: expires)
+        // gauge.updatedAt 是 at(4)，10 秒窗口的截止在 baseMs+6s，比 expiresAt 早。
         try check(SystemActivityPolicy.staleDate(gauge, kind: .gauge)
-                  == Date(timeIntervalSince1970: 1_799_999_996), "仪表失鲜时间没有用 10 秒窗口")
+                  == Date(timeIntervalSince1970: 1_800_000_006), "仪表失鲜时间没有用 10 秒窗口")
         let tight = snapshot(vehicle: vehicle(soc: 40, socAt: baseMs), expiresAt: baseMs + 5_000)
         try check(SystemActivityPolicy.staleDate(tight, kind: .vehicle)
                   == Date(timeIntervalSince1970: 1_800_000_005), "快照过期更早时没有采用它")
