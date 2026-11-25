@@ -49,6 +49,7 @@ final class IOSCastBroadcastEngine {
     private var sockets: [UInt16: IOSCastSocket] = [:]
     private var controlSockets: [IOSCastSocket] = []
     private var sessionControl: IOSCastSocket?
+    private var castIdentity: IOSCastIdentity?
     private var sessionIdentity: Data?
     private var sessionStarted = false
     private var nextControlIdentifier: UInt32 = 1
@@ -58,6 +59,9 @@ final class IOSCastBroadcastEngine {
     private var screen: [String: Int] = [:]
     private let screenLock = NSLock()
     private var submittedScreen: [String: Int] = [:]
+    // ReplayKit 可能只在握手前交付静止画面；锁下仅保留最后一份有效输入供后续拉帧重编码。
+    private var submittedSample: CMSampleBuffer?
+    private var acceptingSamples = false
     private var waitingSessionStart: (() -> Void)?
     private var connected: Set<UInt16> = []
     private var pending: [UInt16: [NWConnection]] = [:]
@@ -87,6 +91,7 @@ final class IOSCastBroadcastEngine {
         encoder = IOSCastEncoder(queue: queue)
         encoder.onFatal = { [weak self] code in self?.fail(code) }
         encoder.acceptsSample = { [weak self] in
+            // 最新真实帧可供静止画面反复编码；这里记录编码活性，不要求 ReplayKit 持续回调。
             guard let self = self, self.active, !self.paused, self.checkGrant() else { return false }
             self.lastSampleAt = ProcessInfo.processInfo.systemUptime
             return self.encoder.running
@@ -97,6 +102,7 @@ final class IOSCastBroadcastEngine {
             Unmanaged.passUnretained(self).toOpaque(), CFNotificationName(IOSCastMailbox.changedNotification as CFString), nil) }
     }
     func start(finish: @escaping (String) -> Void) {
+        screenLock.lock(); acceptingSamples = true; screenLock.unlock()
         queue.async { [weak self] in
             guard let self = self else { return }
             guard !self.active else { return }
@@ -120,6 +126,7 @@ final class IOSCastBroadcastEngine {
                     throw IOSCastError.reason("cast_route_required")
                 }
                 if let error = route.sourceError() { throw IOSCastError.reason(error) }
+                self.castIdentity = try IOSCastIdentity(bits: grant.recipe.session?.rsaBits ?? 1024)
                 self.mailbox = mailbox; self.grant = grant; self.settings = grant.settings; self.active = true
                 self.lastSampleAt = ProcessInfo.processInfo.systemUptime
                 self.observe()
@@ -267,8 +274,13 @@ final class IOSCastBroadcastEngine {
             guard controlSockets.count < 2 else { connection.cancel(); return }
         } else if let old = sockets.removeValue(forKey: port) { old.onClosed = nil; old.close("replaced") }
         if port != ports.control { connected.remove(port) }
-        if port == ports.data { frameIndex = 0; prefixedVideo = false; encoder.resetDelivery() }
-        let socket = IOSCastSocket(connection, queue: queue, control: port == ports.control, route: route)
+        if port == ports.data {
+            frameIndex = 0; prefixedVideo = false
+            do { try restartEncoderDelivery() }
+            catch { connection.cancel(); fail(IOSCastError.code(error)); return }
+        }
+        let socket = IOSCastSocket(connection, queue: queue, control: port == ports.control, route: route,
+                                   identity: port == ports.control ? castIdentity : nil)
         if port == ports.control { controlSockets.append(socket) } else { sockets[port] = socket }
         socket.onClosed = { [weak self, weak socket] code in
             guard let self = self, let socket = socket, self.active, self.generation == epoch, self.holds(socket, port: port) else { return }
@@ -309,7 +321,13 @@ final class IOSCastBroadcastEngine {
         do {
             guard let rule = recipe.control.first(where: { $0.request == frame.type }), rule.action != "ignore" else { next(); return }
             let replies = try socket.replies(rule, frame: frame, recipe: recipe)
-            if rule.action == "rsa" { sessionIdentity = socket.signedIdentity }
+            if rule.action == "rsa" {
+                guard let signature = socket.signedIdentity else { throw IOSCastError.reason("cast_identity_missing") }
+                if let previous = sessionIdentity, previous != signature {
+                    throw IOSCastError.reason("cast_identity_mismatch")
+                }
+                sessionIdentity = signature
+            }
             var output = replies.reduce(into: Data()) { $0.append($1) }
             let starts = recipe.session?.request == frame.type && !sessionStarted
             if starts, let session = recipe.session {
@@ -359,6 +377,7 @@ final class IOSCastBroadcastEngine {
                     try encoder.start(plan)
                     castingStarted = ProcessInfo.processInfo.systemUptime; lastSampleAt = castingStarted
                     phase = "handshaking"; reason = "waiting_frame_pull"
+                    submitLatestSample(epoch: generation)
                 }
                 // VT session/hardware 准备成功才 ACK；仍不等于接收端真正拉到视频。
                 socket.send(try IOSCastWire.media(command, serial: frame.serial)) { self.publish(); next() }
@@ -375,10 +394,11 @@ final class IOSCastBroadcastEngine {
         guard request.command == recipe.pullCommand else { next(); return }
         guard request.body.isEmpty else { fail("data_frame_invalid"); return }
         if recipe.session?.waitForFrame == true {
-            waitForVideo(socket: socket, epoch: epoch, deadline: ProcessInfo.processInfo.systemUptime + 5, next: next)
+            waitForVideo(socket: socket, epoch: epoch, deadline: nil, next: next)
             return
         }
         if let frame = paused ? nil : encoder.poll() { deliver(frame, socket: socket, next: next); return }
+        submitLatestSample(epoch: epoch)
         // 与 Android 25 ms 等待一致，但不阻塞串行编码队列；这期间不接下一条拉帧。
         queue.asyncAfter(deadline: .now() + .milliseconds(25)) { [weak self, weak socket] in
             guard let self = self, let socket = socket, self.active, self.generation == epoch,
@@ -386,13 +406,25 @@ final class IOSCastBroadcastEngine {
             self.deliver(self.paused ? nil : self.encoder.poll(), socket: socket, next: next)
         }
     }
-    private func waitForVideo(socket: IOSCastSocket, epoch: UInt64, deadline: TimeInterval, next: @escaping () -> Void) {
+    private func waitForVideo(socket: IOSCastSocket, epoch: UInt64, deadline: TimeInterval?, next: @escaping () -> Void) {
         guard active, generation == epoch, sockets[ports.data] === socket, checkGrant() else { return }
-        if let frame = paused ? nil : encoder.poll() { deliver(frame, socket: socket, next: next); return }
-        guard ProcessInfo.processInfo.systemUptime < deadline else { fail("first_frame_timeout"); return }
+        // 数据口可先于控制/媒体启动；暂停和协商阶段不消耗真正的首帧等待窗口。
+        guard !paused, sessionStarted, encoder.running else {
+            queue.asyncAfter(deadline: .now() + .milliseconds(25)) { [weak self, weak socket] in
+                guard let self = self, let socket = socket else { return }
+                self.waitForVideo(socket: socket, epoch: epoch, deadline: nil, next: next)
+            }
+            return
+        }
+        if let frame = encoder.poll() { deliver(frame, socket: socket, next: next); return }
+        let now = ProcessInfo.processInfo.systemUptime
+        let frameDeadline = max(deadline ?? now + 5, castingStarted + 5)
+        guard now < frameDeadline else { fail("first_frame_timeout"); return }
+        // ReplayKit 静止时可不再回调；按车机拉帧节奏重编码最新真实画面，仍由 fps/inFlight 限流。
+        submitLatestSample(epoch: epoch)
         queue.asyncAfter(deadline: .now() + .milliseconds(25)) { [weak self, weak socket] in
             guard let self = self, let socket = socket else { return }
-            self.waitForVideo(socket: socket, epoch: epoch, deadline: deadline, next: next)
+            self.waitForVideo(socket: socket, epoch: epoch, deadline: frameDeadline, next: next)
         }
     }
     private func deliver(_ frame: IOSCastEncoder.Frame?, socket: IOSCastSocket, next: @escaping () -> Void) {
@@ -438,17 +470,41 @@ final class IOSCastBroadcastEngine {
         } else { fail(reason) }
     }
     func video(_ sample: CMSampleBuffer) {
+        var dimensions: [String: Int]?
         if let image = CMSampleBufferGetImageBuffer(sample) {
             let width = CVPixelBufferGetWidth(image), height = CVPixelBufferGetHeight(image)
             if (16...4096).contains(width), (16...4096).contains(height) {
                 let orientation = (CMGetAttachment(sample, key: RPVideoSampleOrientationKey as CFString, attachmentModeOut: nil) as? NSNumber)?.intValue ?? 1
                 let rotation = [1: 0, 3: 2, 6: 1, 8: 3][orientation] ?? 0
-                screenLock.lock()
-                submittedScreen = ["width": width, "height": height, "rotation": rotation]
-                screenLock.unlock()
+                dimensions = ["width": width, "height": height, "rotation": rotation]
             }
         }
+        screenLock.lock()
+        guard acceptingSamples else { screenLock.unlock(); return }
+        if let dimensions = dimensions, CMSampleBufferDataIsReady(sample) {
+            submittedScreen = dimensions
+            submittedSample = sample
+        }
+        screenLock.unlock()
         encoder.submit(sample)
+    }
+    private func submitLatestSample(epoch: UInt64) {
+        // 先让已入队的 submit 释放 inputGate，再重交缓存；不阻塞串行握手/编码队列。
+        queue.async { [weak self] in
+            guard let self = self, self.active, self.generation == epoch, self.encoder.running, !self.paused else { return }
+            self.screenLock.lock(); let sample = self.submittedSample; self.screenLock.unlock()
+            if let sample = sample { self.encoder.submit(sample) }
+        }
+    }
+    private func restartEncoderDelivery() throws {
+        guard encoder.running else { return }
+        guard let plan = plan else { throw IOSCastError.reason("media_config_invalid") }
+        // 同 PTS 的静态画面也必须重编码为 IDR；重建隔离旧 VT 回调，清掉旧时间戳和参考链。
+        encoder.stop(); try encoder.start(plan)
+        let now = ProcessInfo.processInfo.systemUptime
+        castingStarted = now; lastSampleAt = now
+        if lastSentAt > 0 { lastSentAt = now }
+        submitLatestSample(epoch: generation)
     }
     func pause() { queue.async { [weak self] in
         guard let self = self, self.active else { return }
@@ -456,8 +512,11 @@ final class IOSCastBroadcastEngine {
     } }
     func resume() { queue.async { [weak self] in
         guard let self = self, self.active else { return }
-        self.paused = false; self.lastSampleAt = ProcessInfo.processInfo.systemUptime
-        self.phase = "handshaking"; self.reason = "waiting_frame_pull"; self.encoder.resetDelivery(); self.publish()
+        self.paused = false
+        do {
+            try self.restartEncoderDelivery()
+            self.phase = "handshaking"; self.reason = "waiting_frame_pull"; self.publish()
+        } catch { self.fail(IOSCastError.code(error)) }
     } }
     func stop() { queue.async { [weak self] in self?.end("idle", reason: "user_stopped", notifySystem: false) } }
     private func tick() {
@@ -535,6 +594,8 @@ final class IOSCastBroadcastEngine {
         timer?.cancel(); timer = nil
         routeMonitor?.pathUpdateHandler = nil; routeMonitor?.cancel(); routeMonitor = nil; routePath = nil
         teardownTransport()
+        castIdentity = nil
+        screenLock.lock(); acceptingSamples = false; submittedScreen = [:]; submittedSample = nil; screenLock.unlock()
         if observing {
             CFNotificationCenterRemoveObserver(CFNotificationCenterGetDarwinNotifyCenter(), Unmanaged.passUnretained(self).toOpaque(),
                 CFNotificationName(IOSCastMailbox.changedNotification as CFString), nil)

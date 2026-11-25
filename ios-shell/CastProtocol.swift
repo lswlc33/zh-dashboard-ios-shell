@@ -879,7 +879,7 @@ final class IOSCastSocket {
     var onClosed: ((String) -> Void)?
     var onControl: ((IOSCastWire.Control, @escaping () -> Void) -> Void)?
     var onMedia: ((IOSCastWire.Media, @escaping () -> Void) -> Void)?
-    private var identity: IOSCastIdentity?
+    private let identity: IOSCastIdentity?
     private(set) var signedIdentity: Data?
     private var receivedEOF = false
     private let route: IOSCastRoute
@@ -887,8 +887,8 @@ final class IOSCastSocket {
     private var deferredWrites: [(Data, () -> Void)] = []
     private var deferredBytes = 0
 
-    init(_ connection: NWConnection, queue: DispatchQueue, control: Bool, route: IOSCastRoute) {
-        self.connection = connection; self.queue = queue; self.control = control; self.route = route
+    init(_ connection: NWConnection, queue: DispatchQueue, control: Bool, route: IOSCastRoute, identity: IOSCastIdentity? = nil) {
+        self.connection = connection; self.queue = queue; self.control = control; self.route = route; self.identity = identity
     }
     @discardableResult private func verifyRoute() -> Bool {
         guard !closed, let path = connection.currentPath else { close("cast_route_lost"); return false }
@@ -901,11 +901,11 @@ final class IOSCastSocket {
         else { input = [:] }
         var signature = ""
         if rule.action == "rsa" {
-            if identity == nil { identity = try IOSCastIdentity(bits: recipe.session?.rsaBits ?? 1024) }
+            guard let identity = identity else { throw IOSCastError.reason("cast_identity_unavailable") }
             guard let value = (rule.inputKeys ?? []).compactMap({ input[$0] as? String }).first, !value.isEmpty else {
                 throw IOSCastError.reason("cast_sign_input_invalid")
             }
-            signature = try identity!.sign(value)
+            signature = try identity.sign(value)
             signedIdentity = Data(base64Encoded: signature)
         }
         return try rule.replies.map { reply in
@@ -1010,7 +1010,7 @@ final class IOSCastSocket {
     func close(_ reason: String) {
         guard !closed else { return }
         closed = true; connection.stateUpdateHandler = nil; connection.pathUpdateHandler = nil
-        connection.viabilityUpdateHandler = nil; connection.cancel(); identity = nil; signedIdentity = nil
+        connection.viabilityUpdateHandler = nil; connection.cancel(); signedIdentity = nil
         deferredWrites.removeAll(); deferredBytes = 0
         let callback = onClosed
         onClosed = nil; onControl = nil; onMedia = nil

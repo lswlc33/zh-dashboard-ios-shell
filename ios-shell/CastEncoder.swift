@@ -114,8 +114,10 @@ final class IOSCastEncoder {
               CMSampleBufferDataIsReady(sample), let input = CMSampleBufferGetImageBuffer(sample) else { return }
         let width = CVPixelBufferGetWidth(input), height = CVPixelBufferGetHeight(input)
         guard width > 0, height > 0, width <= 4096, height <= 4096 else { fatal("capture_dimensions_unsupported"); return }
-        let pts = CMSampleBufferGetPresentationTimeStamp(sample)
-        guard pts.isValid, !pts.isIndefinite else { droppedFrames &+= 1; return }
+        let sourcePTS = CMSampleBufferGetPresentationTimeStamp(sample)
+        guard sourcePTS.isValid, !sourcePTS.isIndefinite else { droppedFrames &+= 1; return }
+        // 静止屏幕会重复使用同一真实输入；输出时间、去重和限帧统一用单调时钟。
+        let pts = CMClockGetTime(CMClockGetHostTimeClock())
         if let last = lastPTS, CMTimeCompare(pts, last) <= 0 { droppedFrames &+= 1; return }
         if let last = lastPTS, CMTimeGetSeconds(CMTimeSubtract(pts, last)) < 1.0 / Double(plan.fps) { return }
         guard inFlight < 2 else { droppedFrames &+= 1; requestKeyframe(); return }
