@@ -14,20 +14,24 @@ import tempfile
 
 # SwiftUI/WidgetKit 的形状替身；时间选择、展示属性和 Timeline 方法全部提取生产代码。
 SWIFT_SUPPORT = r'''
-private protocol TimelineEntry {}
-private enum ColorScheme { case light, dark }
-private enum WidgetFamily { case systemSmall, systemMedium, systemLarge }
-private enum WidgetStatField {
+// 替身类型必须是 internal（默认可见性）：被提取的生产类型 ZeehoVehicleEntry 是
+// internal，它的存储属性/方法参数用到这些替身；若替身声明成 private，Swift 会报
+// "property must be declared fileprivate because its type uses a private type"
+// （macOS CI 2026-11-25 实测），夹具就编不过。
+protocol TimelineEntry {}
+enum ColorScheme { case light, dark }
+enum WidgetFamily { case systemSmall, systemMedium, systemLarge }
+enum WidgetStatField {
     case sample
     static let defaultLarge: [Self] = []
     static let defaultMedium: [Self] = []
     static let selectable: [Self] = []
 }
-private struct WidgetDataSourceResult {
+struct WidgetDataSourceResult {
     enum Origin: String { case snapshot }
 }
-private enum TimelineReloadPolicy { case after(Date) }
-private struct Timeline<Entry> {
+enum TimelineReloadPolicy { case after(Date) }
+struct Timeline<Entry> {
     let entries: [Entry]
     let policy: TimelineReloadPolicy
 }
