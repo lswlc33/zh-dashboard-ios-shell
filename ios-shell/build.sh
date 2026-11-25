@@ -386,27 +386,40 @@ if [[ "${ZEEHO_RUN_STDLIB_TOOL:-0}" == "1" ]]; then
 else
     printf 'note: 跳过 swift-stdlib-tool 扫描（14/15.4 自带 Swift 运行时；需要时设 ZEEHO_RUN_STDLIB_TOOL=1）\n'
 fi
+# codesign / lipo 在 Xcode 26 runner 上偶发 SIGABRT（子进程 134 退出、不给任何原因，
+# 同一份字节重跑就过）。set -e 下直接调用会让整条 build.sh 静默 134 退出：2026-11-25 的
+# CI run 45613575360 失败日志就停在上一行 swift-stdlib 提示之后、appintents 之前，
+# 没有任何报错，无法判断是哪一步挂的。所以所有签名/切薄命令统一走这个包装：
+# 先打印步骤，失败（含被信号杀掉）最多重试三次，仍失败则打印状态码与输出后 exit 2。
+run_signing_step() {
+    local label="$1"; shift
+    local attempt=1 status=0 output=''
+    while (( attempt <= 3 )); do
+        status=0
+        output="$("$@" 2>&1)" || status=$?
+        if (( status == 0 )); then return 0; fi
+        printf 'warning: %s 失败（status=%s，第 %s/3 次）：%s\n' "$label" "$status" "$attempt" "${output:0:600}" >&2
+        attempt=$((attempt + 1))
+        sleep 2
+    done
+    printf 'BLOCKED: %s 连续 3 次失败（最后 status=%s）\n' "$label" "$status" >&2
+    exit 2
+}
 while IFS= read -r -d '' dylib; do
+    printf '[sign] dylib %s\n' "${dylib##*/}"
     architectures="$(xcrun lipo -archs "$dylib" 2>/dev/null || printf 'unknown')"
     if [[ "$architectures" != arm64 && "$architectures" != "unknown" ]]; then
-        xcrun lipo "$dylib" -thin arm64 -output "$dylib.arm64"
+        run_signing_step "lipo -thin $dylib" xcrun lipo "$dylib" -thin arm64 -output "$dylib.arm64"
         mv "$dylib.arm64" "$dylib"
     fi
-    # codesign 在 Xcode 26 runner 上偶发 SIGABRT（同一份字节重跑就过），
-    # 单次失败不该让整包 134 退出；重试一次并保留真实错误。
-    if ! codesign --force --sign - --timestamp=none "$dylib"; then
-        printf 'note: codesign 失败，重试一次 %s\n' "$dylib" >&2
-        codesign --force --sign - --timestamp=none "$dylib"
-    fi
-    codesign --verify --strict "$dylib"
+    run_signing_step "codesign $dylib" codesign --force --sign - --timestamp=none "$dylib"
+    run_signing_step "codesign verify $dylib" codesign --verify --strict "$dylib"
 done < <(find "$app_dir/Frameworks" "$widget_dir/Frameworks" "$broadcast_dir/Frameworks" -type f -name '*.dylib' -print0)
 # 所有 framework 同样由内到外签名，不限于 KMP；允许的实际嵌入范围仍由 validate_ipa 严格核对。
 while IFS= read -r -d '' framework; do
-    if ! codesign --force --sign - --timestamp=none "$framework"; then
-        printf 'note: codesign 失败，重试一次 %s\n' "$framework" >&2
-        codesign --force --sign - --timestamp=none "$framework"
-    fi
-    codesign --verify --strict "$framework"
+    printf '[sign] framework %s\n' "${framework##*/}"
+    run_signing_step "codesign $framework" codesign --force --sign - --timestamp=none "$framework"
+    run_signing_step "codesign verify $framework" codesign --verify --strict "$framework"
 done < <(find "$app_dir/Frameworks" "$widget_dir/Frameworks" "$broadcast_dir/Frameworks" -depth -type d -name '*.framework' -print0)
 # AppIntents metadata：小组件上的车控/刷新按钮 + 主 App 的后台任务 intent 靠它才生效。
 #
@@ -464,12 +477,12 @@ if [[ -f "${widget_const_values:-}" ]]; then
 fi
 # 三个真实 bundle 内到外签名。模板不是 Apple 授权，不保证普通安装/TrollStore能力。
 # 注意：签名必须在 metadata 生成之后，否则索引不会进签名封条。
-codesign --force --sign - --timestamp=none --entitlements "$script_dir/Entitlements/Broadcast.entitlements" --identifier io.github.lswlc33.dashboard.ios.broadcast "$broadcast_dir"
-codesign --verify --strict "$broadcast_dir"
-codesign --force --sign - --timestamp=none --entitlements "$script_dir/Entitlements/Widgets.entitlements" --identifier io.github.lswlc33.dashboard.ios.widgets "$widget_dir"
-codesign --verify --strict "$widget_dir"
-codesign --force --sign - --timestamp=none --entitlements "$script_dir/Entitlements/App.entitlements" --identifier io.github.lswlc33.dashboard.ios "$app_dir"
-codesign --verify --deep --strict "$app_dir"
+run_signing_step "codesign broadcast" codesign --force --sign - --timestamp=none --entitlements "$script_dir/Entitlements/Broadcast.entitlements" --identifier io.github.lswlc33.dashboard.ios.broadcast "$broadcast_dir"
+run_signing_step "codesign verify broadcast" codesign --verify --strict "$broadcast_dir"
+run_signing_step "codesign widgets" codesign --force --sign - --timestamp=none --entitlements "$script_dir/Entitlements/Widgets.entitlements" --identifier io.github.lswlc33.dashboard.ios.widgets "$widget_dir"
+run_signing_step "codesign verify widgets" codesign --verify --strict "$widget_dir"
+run_signing_step "codesign app" codesign --force --sign - --timestamp=none --entitlements "$script_dir/Entitlements/App.entitlements" --identifier io.github.lswlc33.dashboard.ios "$app_dir"
+run_signing_step "codesign verify app" codesign --verify --deep --strict "$app_dir"
 for executable in "$app_dir/Dashboard" "$widget_dir/DashboardWidgets" "$broadcast_dir/ZeehoCastBroadcast"; do
     file "$executable" | grep -q 'Mach-O 64-bit executable arm64'
     xcrun lipo "$executable" -verify_arch arm64
