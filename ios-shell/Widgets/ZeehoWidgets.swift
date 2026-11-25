@@ -67,6 +67,7 @@ private final class WidgetCompletionGate<Value> {
     private let lock = NSLock()
     private var completion: ((Value) -> Void)?
     private var fallback: DispatchWorkItem?
+    private var fallbackDeadline: DispatchTime?
 
     init(completion: @escaping (Value) -> Void) {
         self.completion = completion
@@ -79,6 +80,7 @@ private final class WidgetCompletionGate<Value> {
         completion = nil
         let fallback = self.fallback
         self.fallback = nil
+        fallbackDeadline = nil
         lock.unlock()
         fallback?.cancel()
         callback?(value)
@@ -88,15 +90,21 @@ private final class WidgetCompletionGate<Value> {
     func scheduleFallback(seconds: Double, value: Value) {
         // item 强持有 gate，独立于可能卡住的网络/读盘任务，交付后取消并释放。
         let item = DispatchWorkItem { _ = self.finish(value) }
+        let requestedDeadline = DispatchTime.now() + seconds
         lock.lock()
         let armed = completion != nil
+        // 读盘结束后可更新兜底值、收紧期限，但不能把首次武装的绝对期限往后推。
+        let deadline = min(fallbackDeadline ?? requestedDeadline, requestedDeadline)
         let previous = fallback
-        if armed { fallback = item }
+        if armed {
+            fallback = item
+            fallbackDeadline = deadline
+        }
         lock.unlock()
         // 重新武装（例如旧快照宽限）时必须撤掉上一个计时器，避免它晚到后仍持有 gate。
         previous?.cancel()
         guard armed else { return }
-        DispatchQueue.global(qos: .userInitiated).asyncAfter(deadline: .now() + seconds, execute: item)
+        DispatchQueue.global(qos: .userInitiated).asyncAfter(deadline: deadline, execute: item)
     }
 }
 
@@ -170,8 +178,7 @@ struct ZeehoVehicleProvider: TimelineProvider {
                 // 快照够新：立即交付，省掉一次网络等待。
                 // 快照偏旧：给自取留一个短窗口，取不到再回落这份旧值；
                 // 否则「扩展自己拉」会被旧快照永远抢在前面，等于没有生效。
-                let age = Date().timeIntervalSince1970 - Double(snapshot.capturedAt) / 1000
-                if age <= WidgetRefreshPolicy.freshSnapshotSeconds {
+                if Self.isFreshLocalSnapshot(snapshot, at: Date()) {
                     gate.finish(Self.timeline(entry: local, now: Date()))
                 } else {
                     gate.scheduleFallback(seconds: WidgetRefreshPolicy.staleSnapshotGraceSeconds,
@@ -221,17 +228,24 @@ struct ZeehoVehicleProvider: TimelineProvider {
         return TimeInterval(value % 60)
     }
 
+    /// 包装、统计或其他展示更新不能让旧电量/充电状态抢先于本轮自取结果。
+    static func isFreshLocalSnapshot(_ snapshot: SystemSnapshot, at date: Date) -> Bool {
+        guard let source = WidgetVehiclePresentation(snapshot: snapshot, date: date).updatedAt else { return false }
+        let age = date.timeIntervalSince1970 - Double(source) / 1000
+        return age <= WidgetRefreshPolicy.freshSnapshotSeconds
+    }
+
     static func timeline(entry: ZeehoVehicleEntry, now: Date) -> Timeline<ZeehoVehicleEntry> {
         let refreshAfter = now.addingTimeInterval(refreshInterval + Self.jitter(entry.snapshot?.owner.accountVINHash))
         var entries = [entry]
-        if let snapshot = entry.snapshot, let vehicle = snapshot.vehicle,
+        if let snapshot = entry.snapshot, let source = entry.presentation.updatedAt,
            !entry.presentation.isStale {
             // 未来 entry 只把数值标成「可能已过期」，不再抹掉电量/充电状态：
             // 过期后保留最后同步值 + 更新时间，和 Android 小组件同一口径。
             // 期限按小组件自己的展示窗口算，不能用 180 秒的会话级 expiresAt——
             // 那会让小组件刚加上 3 分钟就显示「可能已过期」。
-            let deadline = Date(timeIntervalSince1970: Double(vehicle.updatedAt) / 1000)
-                .addingTimeInterval(WidgetFreshness.maxAgeSeconds)
+            let deadline = Date(timeIntervalSince1970: Double(source) / 1000)
+                .addingTimeInterval(WidgetRefreshPolicy.displayMaxAgeSeconds)
             if deadline > now && deadline <= refreshAfter {
                 entries.append(ZeehoVehicleEntry(date: deadline, snapshot: snapshot, requiresRefresh: true,
                     showName: entry.showName, showTime: entry.showTime, darkMode: entry.darkMode,

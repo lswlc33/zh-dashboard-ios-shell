@@ -20,7 +20,7 @@ enum WidgetStrings {
     static let notCharging = "未充电"
     static let chargingState = "充电状态"
     static let chargeProgress = "充电进度"
-    static let chargeElapsed = "已充电"
+    static let chargeElapsed = "上次确认充电时长"
     static let stale = "数据已过期"
     static let mayBeStale = "可能已过期"
     static let lastUpdated = "最后更新"
@@ -134,7 +134,8 @@ struct WidgetVehiclePresentation {
         if freshWindow > SystemSnapshotFreshness.vehicleMaxAgeSeconds {
             // 宽窗口模式（桌面小组件）：只看最后同步时间，不看 expiresAt
             // （expiresAt 是 180 秒的会话级期限，用它判断会让小组件长期显示过期）。
-            let age = date.timeIntervalSince1970 - Double(vehicle.updatedAt) / 1000
+            guard let source = updatedAt else { return true }
+            let age = date.timeIntervalSince1970 - Double(source) / 1000
             return age > freshWindow || age < -SystemSnapshotFreshness.futureToleranceSeconds
         }
         if snapshot.isStale(at: date) { return true }
@@ -150,7 +151,27 @@ struct WidgetVehiclePresentation {
         guard charging == true else { return nil }
         return keepsLastKnown ? vehicle?.chargeProgressPercent : vehicle?.visibleChargeProgress(at: date)
     }
-    var updatedAt: Int64? { vehicle?.updatedAt }
+    var updatedAt: Int64? { snapshot.flatMap { SystemActivityPolicy.widgetSourceAt($0, at: date) } }
+}
+
+// SwiftUI 的日期 Text 由系统持续更新；iOS 16.1 也不依赖宿主重绘或 Date() 重新计算。
+struct WidgetSyncAge: View {
+    let timestamp: Int64?
+    var compact = false
+
+    static func text(_ timestamp: Int64?, showsLabel: Bool = true) -> Text {
+        let prefix = showsLabel ? Text("\(WidgetStrings.lastUpdated) ") : Text("")
+        guard let timestamp = timestamp else { return prefix + Text(WidgetStrings.missing) }
+        return prefix + Text(Date(timeIntervalSince1970: Double(timestamp) / 1000), style: .relative)
+    }
+
+    var body: some View {
+        Self.text(timestamp, showsLabel: !compact)
+            .monospacedDigit()
+            .lineLimit(compact ? 1 : 2)
+            .minimumScaleFactor(0.6)
+            .accessibilityLabel(Self.text(timestamp))
+    }
 }
 
 struct WidgetUpdatedAt: View {
@@ -162,6 +183,7 @@ struct WidgetUpdatedAt: View {
     // 2026-11-25 起实时活动也标过期：App 被划掉后 iOS 不再让我们更新活动
     // （无 APNs 推送通道），数值会冻结；隐藏标注等于让用户以为数据还在变。
     var annotatesStale = true
+    var relativeAge = false
 
     var body: some View {
         VStack(alignment: .leading, spacing: 3) {
@@ -169,7 +191,9 @@ struct WidgetUpdatedAt: View {
                 Label(WidgetStrings.stale, systemImage: "exclamationmark.circle")
                     .font(.caption2)
             }
-            if let timestamp = timestamp {
+            if relativeAge {
+                WidgetSyncAge(timestamp: timestamp).font(.caption2)
+            } else if let timestamp = timestamp {
                 let date = Date(timeIntervalSince1970: Double(timestamp) / 1000)
                 Text(line(date))
                     .font(.caption2)

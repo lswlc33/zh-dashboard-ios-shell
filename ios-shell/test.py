@@ -356,7 +356,8 @@ def main():
         build_sh.index('--entitlements "$script_dir/Entitlements/App.entitlements"'), '签名必须 Broadcast/Widget/App 由内到外'
     # 未签名 IPA 交用户自签时，第三方 profile 的 App Group 会被换成签名团队的组，
     # 三个进程（Host/Widget/Broadcast）必须按同一契约解析，不能写死模板值。
-    # 四层回退：显式 plist 键 > AltStore 回写 > embedded.mobileprovision > 模板默认值。
+    # 候选按显式 plist 键 > 全部 AltStore 组 > 自身/宿主 profile > 模板默认值排列；
+    # 只有 containerURL 可访问的合法组才能胜出，全失败保留首合法候选作诊断。
     # 全能签/eSign/zsign 这类 P12 工具不写 Info.plist，只把证书团队的组签进 entitlements，
     # 必须从 CMS 里的内嵌 plist 读；appex 常被漏放 profile，还要回退读宿主 bundle。
     # ad-hoc 产物仍按 APP_GROUP 模板签名（build-support.py 常量不变）；运行时只是允许覆盖。
@@ -368,6 +369,15 @@ def main():
         assert token in cast, 'CastProtocol.swift 必须与 Shared 同一组名契约: ' + token
     for token in ('profileCandidates', 'deletingLastPathComponent', '<?xml', '</plist>'):
         assert token in shared_app_group and token in cast, '两处都要支持 appex 回退读宿主 profile: ' + token
+    for source in (shared_app_group, cast):
+        code = strip_comments(source)
+        assert 'containerProbe: (String) -> URL?' in code, '组解析必须允许注入实际容器探测'
+        assert 'FileManager.default.containerURL(forSecurityApplicationGroupIdentifier:' in code, \
+            '生产默认探测必须检查进程实际 App Group 权限'
+    # 顺序、首合法诊断、去重和 Shared/Cast 一致性由同一套生产 Swift fixture 执行验证。
+    assert 'ios-shell/app-group-test.py' in {row['path'] for row in inputs['files']}, \
+        '组解析回归必须纳入构建输入清单'
+    assert 'app-group-test.py" --require-swift' in build_sh, 'Apple 构建必须实际运行组解析回归'
     surfaces = (root / 'SystemSurfaces.swift').read_text(encoding='utf-8')
     assert 'AppGroup.resolution()' in surfaces, '设置页诊断必须回传解析到的组名与来源'
     assert '"appGroup": groupInfo' in surfaces and '"appGroup": availability["appGroup"]' in surfaces, \
@@ -496,8 +506,9 @@ def main():
     # 收尾已并入充电状态协调：缺测不结束，明确停充只结束 charging 活动。
     charging = strip_comments(surfaces_src).split('private func reconcileCharging(', 1)[1].split('private func endCharging(', 1)[0]
     assert 'let charging = vehicle.charging' in charging, '充电状态缺测不能当停充'
-    assert re.search(r'if !charging\s*\{.*?stopChargingPoll\(\).*?endCharging\(owner: value.owner\).*?return', charging, re.S), \
-        '明确停充必须取消补采并结束充电活动'
+    # 收尾要带上同一轮后台上下文：冷后台里 end 也必须先过 canDeliver，不能只看主线程实例。
+    assert re.search(r'if !charging\s*\{.*?stopChargingPoll\(\).*?endCharging\(owner: value\.owner, context: context\).*?return',
+                     charging, re.S), '明确停充必须取消补采并结束充电活动'
     ending = strip_comments(surfaces_src).split('private func endCharging(', 1)[1].split('private func observeActivities(', 1)[0]
     assert 'manager.end(owner: selected, kind: .charging' in ending, '自动收尾只能结束 charging'
     assert 'manager.start(value, kind: .charging' in charging and 'vehicle.visibleCharging() == true' in charging

@@ -65,6 +65,12 @@ public struct WidgetCredential: Codable, Equatable, Sendable {
             && updatedAt > 0
     }
 
+    /// 续期只允许同一份前台授权材料；时间戳不同不代表可以用旧 Keychain 覆盖新 token。
+    public func matchesMaterial(_ other: WidgetCredential) -> Bool {
+        ownerID == other.ownerID && vin == other.vin && token == other.token
+            && appID == other.appID && appSecret == other.appSecret
+    }
+
     /// 是否还在可用期内。
     ///
     /// 窗口给 30 天：用户完全可能连续几周不开 App，而小组件仍应该能自己刷新车况
@@ -86,6 +92,8 @@ public enum WidgetCredentialStore {
     private static let fileName = "widget-credential.json"
     /// 凭据 JSON 的字节上限（字段都是短串，4KB 足够）。
     private static let maxBytes = 4096
+    // Host 的撤销、前台同步和后台续期共用锁；比较与写入不能被 clear 插入。
+    private static let lock = NSRecursiveLock()
 
     private static func directoryURL() throws -> URL {
         let root = try SystemSnapshotStore.containerURL()
@@ -100,6 +108,7 @@ public enum WidgetCredentialStore {
     /// 读一份可用凭据。任何失败（无组、缺文件、坏 JSON、过期）都返回 nil：
     /// 调用方据此退回快照，绝不因为凭据问题挡住小组件渲染。
     public static func read(at date: Date = Date()) -> WidgetCredential? {
+        lock.lock(); defer { lock.unlock() }
         guard let data = boundedRead(try? fileURL(), limit: maxBytes),
               let value = try? JSONDecoder().decode(WidgetCredential.self, from: data),
               value.isUsable(at: date) else { return nil }
@@ -109,6 +118,7 @@ public enum WidgetCredentialStore {
     /// 主 App 在前台授权/刷新时写入。返回是否真的落盘。
     @discardableResult
     public static func save(_ value: WidgetCredential) -> Bool {
+        lock.lock(); defer { lock.unlock() }
         guard value.isValid, let encoded = try? JSONEncoder().encode(value),
               encoded.count <= maxBytes else { return false }
         do {
@@ -131,9 +141,22 @@ public enum WidgetCredentialStore {
         }
     }
 
-    /// 账号切换 / 撤销授权 / 清除后台凭据时调用。删不掉也不报错（下次读取会因
-    /// 文件损坏或旧 owner 不匹配而如实退化成快照模式）。
+    /// 后台只续期已经存在且完全相同的授权，不从旧 Keychain 重建被撤销的镜像。
+    /// 即使旧镜像已过 30 天，只要材料仍匹配且本轮采样成功，就可以续期。
+    @discardableResult
+    public static func renew(matching value: WidgetCredential) -> Bool {
+        lock.lock(); defer { lock.unlock() }
+        guard value.isValid,
+              let data = boundedRead(try? fileURL(), limit: maxBytes),
+              let current = try? JSONDecoder().decode(WidgetCredential.self, from: data),
+              current.isValid, current.matchesMaterial(value),
+              value.updatedAt >= current.updatedAt else { return false }
+        return save(value)
+    }
+
+    /// 账号切换 / 撤销授权 / 清除后台凭据时调用；共享容器不可用时仍尽力清理。
     public static func clear() {
+        lock.lock(); defer { lock.unlock() }
         guard let directory = try? directoryURL() else { return }
         try? FileManager.default.removeItem(at: directory)
     }

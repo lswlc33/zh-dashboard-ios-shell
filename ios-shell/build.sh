@@ -166,6 +166,9 @@ python3 -I "$script_dir/daily-tasks-flow-test.py" --require-swift
 
 # 直接编译生产完成闸门与取数策略，验证超时/并发和同车快照择新。
 python3 -I "$script_dir/widget-delivery-test.py" --require-swift
+python3 -I "$script_dir/widget-credential-test.py" --require-swift
+python3 -I "$script_dir/app-group-test.py" --require-swift
+python3 -I "$script_dir/activity-lifecycle-test.py" --require-swift
 node "$repo_dir/test/ios-widget-data-source-contract.mjs" --require-swift
 
 gradle_args=(--project-dir "$shared_dir" --no-daemon --console=plain)

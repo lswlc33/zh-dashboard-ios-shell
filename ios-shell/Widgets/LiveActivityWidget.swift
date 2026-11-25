@@ -43,19 +43,24 @@ private struct LiveActivityPresentation {
         return vehicle.isStale
     }
     var name: String { snapshot?.vehicle?.name ?? WidgetStrings.vehicle }
-    var updatedAt: Int64? { isGauge ? snapshot?.gauge?.updatedAt : kind == .ride ? ride?.updatedAt : snapshot?.vehicle?.updatedAt }
+    var updatedAt: Int64? {
+        snapshot.flatMap { SystemActivityPolicy.latestSourceAt($0, kind: kind, at: date) }
+    }
+    var accessibilityText: Text {
+        Text("\(status) \(primaryLabel) \(primaryText), ") + WidgetSyncAge.text(updatedAt)
+    }
     // 车速/时长同样给最后已知的原始值：过期只由下面的「最后更新」时间体现，
     // 不再用 visibleSpeedKph 的 10 秒窗口把锁屏读数抹成「—」。
     var speed: Double? {
         isGauge ? snapshot?.gauge?.speedKph : ride?.speedKph
     }
     var elapsedText: String { WidgetValueText.elapsed(ride?.elapsedSeconds) }
-    /// 充电段起点（ContentState.chargeStartedAt）：视图用系统计时器
-    /// （Text(timerInterval:)）让「已充电」时长在锁屏/灵动岛自动走表，
-    /// 不依赖 App 进程存活；未充电或字段缺失（旧版本写入的活动）时不显示。
-    var chargeStarted: Date? {
-        guard kind == .charging, vehicle.charging == true, let ms = context.state.chargeStartedAt else { return nil }
-        return Date(timeIntervalSince1970: ms / 1000)
+    // 固定最后一次确认的时长；停更后系统不再把未知的充电进度继续走表。
+    var chargeElapsedText: String? {
+        guard kind == .charging, let snapshot = snapshot,
+              let seconds = SystemActivityPolicy.confirmedChargeElapsed(snapshot: snapshot,
+                  startedAt: context.state.chargeStartedAt) else { return nil }
+        return WidgetValueText.elapsed(seconds)
     }
     var primaryText: String {
         speedDisplay ? WidgetValueText.speed(speed) : WidgetValueText.percent(vehicle.soc)
@@ -139,11 +144,10 @@ private struct LiveActivityBanner: View {
                           systemImage: WidgetValueText.chargingSymbol(presentation.vehicle.charging))
                         .font(.subheadline)
                 }
-                if let started = presentation.chargeStarted {
-                    // 系统计时器自动走表：App 挂起时「已充电」仍逐秒推进，无需后台执行权。
+                if let elapsed = presentation.chargeElapsedText {
                     HStack(spacing: 6) {
                         Text(WidgetStrings.chargeElapsed).font(.caption).foregroundColor(.secondary)
-                        Text(timerInterval: started...started.addingTimeInterval(86_400), countsDown: false)
+                        Text(elapsed)
                             .font(.caption.monospacedDigit())
                     }
                 }
@@ -155,12 +159,9 @@ private struct LiveActivityBanner: View {
                     }
                 }
             }
-            // annotatesStale: true —— 2026-11-25 用户实测「划掉 App 后活动不再刷新」。
-            // 那一刻起卡片上的一切数值都停住了，但以前这里写死 false，界面上只留一行
-            // 静态的「最后更新 <时间>」，看起来和活着没区别。iOS 不允许第三方后台刷新
-            // 实时活动（无 APNs 推送时），能做的至少是**如实告诉用户它已经停了**。
+            // 日期 Text 在 iOS 16.1 也会自动显示增长的同步年龄。
             WidgetUpdatedAt(timestamp: presentation.updatedAt, stale: presentation.isStale,
-                            annotatesStale: true)
+                            annotatesStale: true, relativeAge: true)
         }
         .padding(16)
     }
@@ -217,17 +218,17 @@ private struct LiveActivityExpandedBottom: View {
                     Text(WidgetValueText.percent(progress)).font(.caption.monospacedDigit())
                 }
             }
-            if let started = presentation.chargeStarted {
+            if let elapsed = presentation.chargeElapsedText {
                 HStack {
                     Text(WidgetStrings.chargeElapsed).font(.caption)
                     Spacer(minLength: 0)
-                    Text(timerInterval: started...started.addingTimeInterval(86_400), countsDown: false)
+                    Text(elapsed)
                         .font(.headline.monospacedDigit())
                 }
             }
-            // annotatesStale: true —— 同 banner：App 被划掉后数值会冻结，必须如实标注过期。
+            // 同 banner：最后同步年龄由系统日期 Text 持续更新。
             WidgetUpdatedAt(timestamp: presentation.updatedAt, stale: presentation.isStale,
-                            annotatesStale: true)
+                            annotatesStale: true, relativeAge: true)
         }
     }
 }
@@ -238,8 +239,12 @@ private struct LiveActivityCompactLeading: View {
 
     var body: some View {
         let presentation = LiveActivityPresentation(context: context, date: Date())
-        Image(systemName: presentation.icon)
-            .accessibilityLabel(presentation.status)
+        VStack(spacing: 1) {
+            Image(systemName: presentation.icon).font(.caption2)
+            WidgetSyncAge(timestamp: presentation.updatedAt, compact: true).font(.system(size: 8))
+        }
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel(presentation.accessibilityText)
     }
 }
 
@@ -249,11 +254,12 @@ private struct LiveActivityCompactTrailing: View {
 
     var body: some View {
         let presentation = LiveActivityPresentation(context: context, date: Date())
-        Text(presentation.primaryText)
-            .font(.caption2.monospacedDigit())
-            .lineLimit(1)
-            .minimumScaleFactor(0.6)
-            .accessibilityLabel("\(presentation.primaryLabel) \(presentation.primaryText)")
+        VStack(spacing: 1) {
+            Text(presentation.primaryText).font(.caption2.monospacedDigit()).lineLimit(1).minimumScaleFactor(0.6)
+            WidgetSyncAge(timestamp: presentation.updatedAt, compact: true).font(.system(size: 8))
+        }
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel(presentation.accessibilityText)
     }
 }
 
@@ -263,8 +269,12 @@ private struct LiveActivityMinimal: View {
 
     var body: some View {
         let presentation = LiveActivityPresentation(context: context, date: Date())
-        Image(systemName: presentation.icon)
-            .accessibilityLabel("\(presentation.status) \(presentation.primaryText)")
+        VStack(spacing: 1) {
+            Image(systemName: presentation.icon).font(.caption2)
+            WidgetSyncAge(timestamp: presentation.updatedAt, compact: true).font(.system(size: 7))
+        }
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel(presentation.accessibilityText)
     }
 }
 

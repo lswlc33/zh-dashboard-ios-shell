@@ -79,6 +79,8 @@ FIXED_INPUTS = {
     # 必须进指纹白名单，否则「门禁代码被改过」不会被 sourceTreeSha256 发现。
     'ios-shell/publish-artifacts.py',
     'ios-shell/daily-tasks-flow-test.py',
+    'ios-shell/widget-credential-test.py', 'ios-shell/app-group-test.py',
+    'ios-shell/activity-lifecycle-test.py',
     'ios-shell/test.py', 'ios-shell/widget-delivery-test.py', 'ios-shell/bridge-bootstrap.js', 'test/ios-parity-build-contract.mjs',
     'test/ios-widget-data-source-contract.mjs',
     'ios-shell/Entitlements/App.entitlements', 'ios-shell/Entitlements/Widgets.entitlements',

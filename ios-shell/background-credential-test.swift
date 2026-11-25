@@ -153,6 +153,31 @@ enum BackgroundCredentialTest {
             coordinator.finish(deadline)
         } catch { check(false, "运行协调器行为测试异常") }
 
+        // MARK: - 8. 存储失败也必须撤销旧请求（注入结果，不触碰真实 Keychain）
+
+        let failingStore = IOSBackgroundRunCoordinator(saveCredential: { _ in false }, removeCredential: { false })
+        do {
+            let oldRun = try failingStore.begin(source: .shortcut, budget: 1)
+            var cancelled = false
+            failingStore.installCancellation(oldRun) { cancelled = true }
+            check(!failingStore.clearCredential(), "删除失败仍向调用方报告 Keychain 错误")
+            check(cancelled && !failingStore.isAuthorized(oldRun), "删除失败也取消并撤销旧请求")
+            check(!failingStore.commit(oldRun, {}), "删除失败后不能用旧授权写回")
+            failingStore.finish(oldRun)
+
+            let completed = try failingStore.begin(source: .shortcut, budget: 1)
+            failingStore.finish(completed)
+            check(failingStore.isAuthorized(completed), "正常收尾保留迟到交付资格")
+            check(!failingStore.replaceCredential(both), "替换失败保留错误回执")
+            check(!failingStore.isAuthorized(completed), "替换失败也使已收尾请求的 epoch 失效")
+
+            let inFlight = try failingStore.begin(source: .shortcut, budget: 1)
+            check(!failingStore.replaceCredential(both), "运行中替换失败仍报告错误")
+            check(!failingStore.isCurrent(inFlight) && !failingStore.commit(inFlight, {}),
+                  "运行中替换失败不能继续提交旧材料")
+            failingStore.finish(inFlight)
+        } catch { check(false, "存储失败撤销行为测试异常") }
+
         // MARK: - 结果
 
         if failures == 0 {

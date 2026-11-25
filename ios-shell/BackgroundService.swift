@@ -103,9 +103,8 @@ final class IOSBackgroundService: NSObject, IOSBridgeService, IOSBridgeCancellab
                 try syncCredential(args, reply: reply)
             case "background.credential.clear":
                 try requireEmpty(args)
-                guard IOSBackgroundRunCoordinator.shared.clearCredential() else {
-                    throw BackgroundArgumentError("keychain_unavailable")
-                }
+                // 先撤销本轮授权；Keychain 失败也不能跳过小组件与后台任务的清理。
+                let removed = IOSBackgroundRunCoordinator.shared.clearCredential()
                 cancelDailyTask()
                 // 小组件那份投影必须一起清：只清 Keychain 会让扩展继续用旧 token 打接口，
                 // 用户点了「清除凭据」却发现小组件还在联网，属于权限与预期双重不符。
@@ -115,6 +114,8 @@ final class IOSBackgroundService: NSObject, IOSBridgeService, IOSBridgeCancellab
                 IOSBackgroundScheduler.shared.cancel(IOSBackgroundTaskID.processing)
                 IOSBackgroundScheduler.shared.cancel(IOSBackgroundTaskID.signIn)
                 IOSBackgroundScheduler.shared.cancel(IOSBackgroundTaskID.dailyTasks)
+                IOSSystemSurfacesService.backgroundCredentialCleared()
+                guard removed else { throw BackgroundArgumentError("keychain_unavailable") }
                 IOSBackgroundLog.write("后台凭据已清除")
                 reply(statusPayload(), nil)
             case "background.samples.take":

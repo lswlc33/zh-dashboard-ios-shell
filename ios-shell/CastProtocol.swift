@@ -713,40 +713,58 @@ struct IOSCastHeartbeat: Codable {
 }
 
 final class IOSCastMailbox {
-    // 与 Shared/AppGroup.swift 同一契约（test.py 逐键断言）：未签名 IPA 交用户自签后，
+    // 与 Shared/AppGroup.swift 同一契约（app-group-test.py 共用 fixture 验证）：未签名 IPA 交用户自签后，
     // 描述文件里的 App Group 会被换成签名团队的组；AltStore/SideStore 重签时会把
     // profile 的 app groups 回写进每个 bundle 的 Info.plist 的 ALTAppGroups。
     // 本文件同时编进 Host 与 Broadcast 两个 module，不能 import ZeehoSystemShared，
     // 所以这里自带同一套解析；三处进程必须解析出同一个组名。
     static var groupID: String { resolvedGroupID() }
-    private static func resolvedGroupID() -> String {
-        let info = Bundle.main.infoDictionary ?? [:]
-        if let explicit = info["ZeehoAppGroupID"] as? String, isValidGroup(explicit) { return explicit }
-        if let groups = info["ALTAppGroups"] as? [String], let first = groups.first(where: { isValidGroup($0) }) { return first }
-        if let single = info["ALTAppGroups"] as? String, isValidGroup(single) { return single }
-        // 全能签/eSign/zsign 等 P12 工具只把证书团队的组签进 entitlements，不写 Info.plist；
-        // 从 CMS 包裹的 embedded.mobileprovision 抽内嵌 plist 取 application-groups。
-        // appex 常被单-profile 工具漏放，所以回退读宿主 bundle 的那份。
-        for url in profileCandidates() {
-            guard let data = try? Data(contentsOf: url),
-                  let start = data.range(of: Data("<?xml".utf8)),
-                  let end = data.range(of: Data("</plist>".utf8), in: start.lowerBound..<data.endIndex),
-                  let plist = try? PropertyListSerialization.propertyList(
-                      from: data.subdata(in: start.lowerBound..<end.upperBound),
-                      options: [], format: nil) as? [String: Any],
-                  let entitlements = plist["Entitlements"] as? [String: Any],
-                  let groups = entitlements["com.apple.security.application-groups"] as? [String],
-                  let first = groups.first(where: { isValidGroup($0) }) else { continue }
-            return first
+    static func resolvedGroupID(
+        bundle: Bundle = .main,
+        containerProbe: (String) -> URL? = { FileManager.default.containerURL(forSecurityApplicationGroupIdentifier: $0) }
+    ) -> String {
+        var firstValid: String?
+        var seen = Set<String>()
+        func accessible(_ groups: [String]) -> String? {
+            for group in groups where isValidGroup(group) && seen.insert(group).inserted {
+                if firstValid == nil { firstValid = group }
+                if containerProbe(group) != nil { return group }
+            }
+            return nil
         }
-        return "group.io.github.lswlc33.dashboard.ios"
+
+        // 与 Shared 一致：旧组名合法不代表重签后的进程能访问其容器。
+        let info = bundle.infoDictionary ?? [:]
+        if let explicit = info["ZeehoAppGroupID"] as? String,
+           let value = accessible([explicit]) { return value }
+        if let groups = info["ALTAppGroups"] as? [String],
+           let value = accessible(groups) { return value }
+        if let single = info["ALTAppGroups"] as? String,
+           let value = accessible([single]) { return value }
+        // 全能签/eSign/zsign 的 profile 只作候选线索；自己的组均不可用时继续读宿主。
+        for url in profileCandidates(bundle: bundle) {
+            if let groups = provisionedGroups(at: url), let value = accessible(groups) { return value }
+        }
+        let fallback = "group.io.github.lswlc33.dashboard.ios"
+        if let value = accessible([fallback]) { return value }
+        return firstValid ?? fallback
     }
-    private static func profileCandidates() -> [URL] {
+    private static func provisionedGroups(at url: URL) -> [String]? {
+        guard let data = try? Data(contentsOf: url),
+              let start = data.range(of: Data("<?xml".utf8)),
+              let end = data.range(of: Data("</plist>".utf8), in: start.lowerBound..<data.endIndex),
+              let plist = try? PropertyListSerialization.propertyList(
+                  from: data.subdata(in: start.lowerBound..<end.upperBound),
+                  options: [], format: nil) as? [String: Any],
+              let entitlements = plist["Entitlements"] as? [String: Any] else { return nil }
+        return entitlements["com.apple.security.application-groups"] as? [String]
+    }
+    private static func profileCandidates(bundle: Bundle) -> [URL] {
         var urls: [URL] = []
-        if let own = Bundle.main.path(forResource: "embedded", ofType: "mobileprovision") {
+        if let own = bundle.path(forResource: "embedded", ofType: "mobileprovision") {
             urls.append(URL(fileURLWithPath: own))
         }
-        let host = Bundle.main.bundleURL.deletingLastPathComponent().deletingLastPathComponent()
+        let host = bundle.bundleURL.deletingLastPathComponent().deletingLastPathComponent()
         let hostProfile = host.appendingPathComponent("embedded.mobileprovision")
         if hostProfile.path != urls.first?.path, FileManager.default.fileExists(atPath: hostProfile.path) {
             urls.append(hostProfile)

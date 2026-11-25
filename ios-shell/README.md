@@ -30,9 +30,9 @@ Swift UIKit + WKWebView 面板壳，默认从 `https://lswlc33.github.io/zeeho-3
 - 仪表最小化会先请求启动当前 ride / gauge Live Activity，再收起网页仪表；原生确认的 GPS / BLE 录制与 gauge 事件继续更新已有活动，实际显示取决于系统权限、设备与活动状态。
 - `Widgets/` 只有一个传统 `com.apple.widgetkit-extension` appex。普通 Widget 支持 small / medium / large；同一 `WidgetBundle` 内的 `ActivityConfiguration` 提供锁屏 / 横幅、Dynamic Island compact / minimal / expanded 布局，不使用 ExtensionKit 的 `EXAppExtensionAttributes`。
 - 「我的 → iOS 系统展示」使用标准页面卡片，提供启用 / 关闭、活动开始 / 更新 / 结束及小组件刷新。执行检查真实回执、有效车辆范围、extension、App Group 与系统权限；缺能力显示 `unavailable`。公开 entitlement 模板不证明群组权限已获批准，灵动岛展示还取决于设备硬件与系统。
-- 新鲜度口径分两层：**桌面小组件**保留最后已知值，超过 30 分钟只在时间后追加「可能已过期」（对齐 Android `BaseWidget.updated()`）；**Live Activity** 不出现任何过期字样，锁屏 / 灵动岛始终展示最后一次同步到的电量、充电状态、车速与时长，时间新旧由「最后更新 <时间>」那一行体现（用户自行判断）。共享层的 180 秒车辆窗口 / 10 秒速度窗口只用于「实时读数是否可信」的其它判断，不再拿它把 Live Activity 抹成「—」。重新读取或刷新不改样本时间；iOS 16.2+ 使用 `staleDate`，16.1 没有同等系统自动过期保证。Widget 实际刷新受系统预算控制，`reload_requested` 不是已显示新数据。
+- 新鲜度口径分两层：**桌面小组件**保留最后已知值，核心车况的展示窗口为 45 分钟，超过后在同步时间旁标注「可能已过期」；本地快照准入、时间线过期条目和时间标签使用同一份核心字段源时间，统计 / 骑行更新不会给旧电量续鲜。**Live Activity** 保留最后确认的读数，并在锁屏与灵动岛各形态显示最后同步年龄和过期语义；充电时长固定在最后确认样本，不在停更后继续计时。车辆 / 速度的可信窗口仍分别为 180 秒 / 10 秒，iOS 16.2+ 同时设置 `staleDate`，16.1 使用系统动态日期显示同步年龄，没有同等系统自动过期保证。回前台按各类活动自身的核心源时间清理停更 30 分钟的活动，并与更新 / 结束共用串行闸门、执行前重验；冷后台确认停充只结束相应充电活动，车辆活动仍接收车况。重新读取或刷新不改样本时间；系统挂起或强退后不保证执行清理。Widget 实际刷新受系统预算控制，`reload_requested` 不是已显示新数据。
 
-iOS 前台成功确认已保存的账号 / 车辆会话后，通过 `background.credential.sync` 静默同步当前 token 与签名材料到本机 Keychain；`autoMerge` 也会补做同步，网页不再提供后台卡片或授权弹层。相同账号 / 车辆 / 会话去重，账号或 token 已变化时丢弃迟到结果；缺少此方法的旧壳跳过静默同步。同步凭据不会打开自动签到或每日任务开关。
+iOS 前台成功确认已保存的账号 / 车辆会话后，通过 `background.credential.sync` 先写小组件所需的 App Group 投影，再同步当前 token 与签名材料到本机 Keychain；Keychain 失败不会挡住本次小组件投影。`autoMerge` 也会补做同步，网页不再提供后台卡片或授权弹层。相同账号 / 车辆 / 会话去重，账号或 token 已变化时丢弃迟到结果；后台成功采样只续期材料完全匹配的现有投影，不从旧 Keychain 重建镜像。清除凭据即使 Keychain 删除失败，也撤销旧任务的交付资格、清理小组件凭据 / 缓存 / 调度并停止充电轮询与持续处理；本机持久撤销标记阻止旧 Keychain 在重启后恢复，成功保存新授权后才解除。缺少同步方法的旧壳跳过静默同步；同步凭据不会打开自动签到或每日任务开关。
 
 周期补采调度只注册 `BGAppRefreshTask` 和 `BGProcessingTask` 两类单次车况补采，后者要求网络、不要求外接电源；提交只申请执行机会，时间与是否执行由 iOS 决定。旧 `signin` / `tasks` identifier 保留取消迁移队列，签到与每日任务仍可由快捷指令主动执行，不再由 BGTaskScheduler 自动运行。原生补采先入待合并队列，回前台按当前车辆送入既有历史准入通道；缺测留空，不承诺完整连续轨迹、后台电池健康或用 GPS 推算容量。
 
@@ -56,7 +56,7 @@ Android 桌面小组件、VPN 抓取、Android Wi-Fi Direct 建组与 root 增�
 
 **构建只通过公开镜像仓库 [`lswlc33/zh-dashboard-ios-shell`](https://github.com/lswlc33/zh-dashboard-ios-shell) 的 GitHub Actions（macOS runner + 真实 Xcode）进行，产出 ad-hoc 签名 IPA，不是 Apple 分发签名包**。私有仓库是唯一源码来源，按白名单用 `tools/sync-public-ios.sh` 同步；公开仓库是投影，不在公开侧维护业务源码。`build.sh` 服务于这条 CI 路线，Windows 不编译 Swift 或生成 IPA。
 
-CI 经源码契约检查、KMP framework 构建、Swift host / Shared / Widget / Broadcast 编译、真实 Widget AppIntents metadata 提取、由内到外 ad-hoc 签名与结构校验后，仅上传五个文件：`zeehowebnext.ipa`、`version2.json`、`build-manifest.json`、`source-commit.txt`、`SHA256SUMS`。不自动创建日期 pre-release，不持有产物仓库写密钥；CI 绿色或 artifact 存在不等于正式发布。本轮新增通信目标尚未同步或在 Xcode 执行；外向同步 / CI 确认未得到答复，不能当允许或拒绝。
+CI 经源码契约检查、生产 Swift 回归、KMP framework 构建、Swift host / Shared / Widget / Broadcast 编译、真实 Widget AppIntents metadata 提取、由内到外 ad-hoc 签名与结构校验后，上传五个文件：`zeehowebnext.ipa`、`version2.json`、`build-manifest.json`、`source-commit.txt`、`SHA256SUMS`。新增凭据 / App Group / 活动生命周期回归以 `--require-swift` 接入构建，缺编译器不能当通过。公开 main 的推送还会进入独立 `publish` job，由仅授权产物仓库的部署密钥移交；版本未前进时跳过覆盖，回退阻止。CI 绿色或 artifact 存在不等于正式发布，Windows 本地检查不替代本次源码的 Xcode 构建或设备验收。
 
 版本与 build 唯一取自 host `Info.plist` 的 `CFBundleShortVersionString` / `CFBundleVersion`，打包时派生 Widget 同值；`--build-number` 只能断言一致，不覆盖版本，不从 CI run number 定号。每次获授权的正式迭代前，主会话核对真实已发包及烧号记录后递增两项；`1.1.0 (47)` 只是格式示例，实际版本由主发布会话定号，不继续沿用 1.0 发布新字节。
 

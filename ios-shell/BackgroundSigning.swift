@@ -160,6 +160,8 @@ struct IOSBackgroundCredential: Codable, Equatable, Sendable {
 enum IOSBackgroundCredentialStore {
     private static let service = "io.github.lswlc33.dashboard.ios.background.credential"
     private static let account = "active"
+    private static let revokedKey = "zeeho.background.credential.revoked.v1"
+    private static let lock = NSLock()
 
     /// 读取结果。**必须区分「没有」和「有但坏了」**，否则两类完全不同的原因
     /// 会被压成同一个 `no_credential`，用户永远不知道该重新授权还是重装 App。
@@ -182,6 +184,9 @@ enum IOSBackgroundCredentialStore {
 
     /// 需要给用户解释原因时用这个。
     static func outcome() -> LoadOutcome {
+        lock.lock(); defer { lock.unlock() }
+        // Keychain 删除/替换失败也不能恢复已撤销的旧授权；仅成功保存新授权才解除。
+        guard !UserDefaults.standard.bool(forKey: revokedKey) else { return .missing }
         switch read() {
         case .nothing: return .missing
         case let .failure(status): return .unusable(reason: "keychain_\(status)")
@@ -202,6 +207,9 @@ enum IOSBackgroundCredentialStore {
     static func save(_ value: IOSBackgroundCredential) -> Bool {
         guard value.isValid else { return false }
         guard let data = try? JSONEncoder().encode(value) else { return false }
+        lock.lock(); defer { lock.unlock() }
+        // 新材料已由前台确认，写入失败时旧材料也不能继续代表当前授权。
+        UserDefaults.standard.set(true, forKey: revokedKey)
         let query: [String: Any] = [
             kSecClass as String: kSecClassGenericPassword,
             kSecAttrService as String: service,
@@ -212,15 +220,22 @@ enum IOSBackgroundCredentialStore {
             kSecAttrAccessible as String: kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly
         ]
         let status = SecItemUpdate(query as CFDictionary, update as CFDictionary)
-        if status == errSecSuccess { return true }
+        if status == errSecSuccess {
+            UserDefaults.standard.set(false, forKey: revokedKey)
+            return true
+        }
         guard status == errSecItemNotFound else { return false }
         var insert = query
         update.forEach { insert[$0.key] = $0.value }
-        return SecItemAdd(insert as CFDictionary, nil) == errSecSuccess
+        let saved = SecItemAdd(insert as CFDictionary, nil) == errSecSuccess
+        if saved { UserDefaults.standard.set(false, forKey: revokedKey) }
+        return saved
     }
 
     @discardableResult
     static func remove() -> Bool {
+        lock.lock(); defer { lock.unlock() }
+        UserDefaults.standard.set(true, forKey: revokedKey)
         let query: [String: Any] = [
             kSecClass as String: kSecClassGenericPassword,
             kSecAttrService as String: service,
@@ -379,7 +394,14 @@ final class IOSBackgroundRunCoordinator: @unchecked Sendable {
     private var epoch: UInt64 = 0
     private var active: Active?
 
-    private init() {}
+    private let saveCredential: (IOSBackgroundCredential) -> Bool
+    private let removeCredential: () -> Bool
+
+    init(saveCredential: @escaping (IOSBackgroundCredential) -> Bool = IOSBackgroundCredentialStore.save,
+         removeCredential: @escaping () -> Bool = IOSBackgroundCredentialStore.remove) {
+        self.saveCredential = saveCredential
+        self.removeCredential = removeCredential
+    }
 
     func begin(source: IOSBackgroundRunSource, budget: TimeInterval) throws -> IOSBackgroundRunContext {
         try Task.checkCancellation()
@@ -436,26 +458,26 @@ final class IOSBackgroundRunCoordinator: @unchecked Sendable {
         action?()
     }
 
-    /// Keychain 写成功才切 epoch；失败保留旧凭据与正在运行的任务。
+    /// 前台授权材料变化或撤销一律切 epoch；Keychain 失败也不能让旧请求继续交付。
     /// 同步锁只包住短暂的 Keychain 操作，绝不跨 await。
     func replaceCredential(_ value: IOSBackgroundCredential) -> Bool {
-        changeCredential { IOSBackgroundCredentialStore.save(value) }
+        changeCredential { saveCredential(value) }
     }
 
     func clearCredential() -> Bool {
-        changeCredential { IOSBackgroundCredentialStore.remove() }
+        changeCredential { removeCredential() }
     }
 
     private func changeCredential(_ change: () -> Bool) -> Bool {
         lock.lock()
-        guard change() else { lock.unlock(); return false }
+        let changed = change()
         epoch &+= 1
         active?.cancelled = true
         active?.context.validity.revoke()
         let action = active?.cancel
         lock.unlock()
         action?()
-        return true
+        return changed
     }
 
     /// 记账/排通知与凭据切换使用同一把同步锁，旧账号不能在 clear 之后落新结果。

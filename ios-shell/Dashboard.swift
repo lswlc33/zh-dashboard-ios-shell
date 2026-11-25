@@ -45,14 +45,10 @@ final class AppDelegate: UIResponder, UIApplicationDelegate {
     }
 
     func applicationDidBecomeActive(_ application: UIApplication) {
-        // 2026-11-25：清掉已经停更的实时活动。
-        //
-        // 用户从后台划掉 App 后，iOS 不再唤醒我们更新实时活动（没有 APNs 推送时），
-        // 卡片会永久停在最后一帧。这里在每次回到前台时按内容自带的 staleDate 判一次：
-        // 早就该更新却一直没更新的，直接结束，别让桌面长期挂着一份假数据。
-        // 放在主线程外执行：Activity.activities 与 end 都是线程安全的异步调用，
-        // 不该为了它拖慢首帧。
-        DispatchQueue.global(qos: .utility).async { IOSSystemSurfacesService.reapIdleActivities() }
+        // 按活动自身的核心源时间清理停更 30 分钟的内容，不让旧进度误伤刚更新的电量。
+        // 从主线程登记清理任务，与 scope / 凭据切换保持顺序；实际 end 异步执行，
+        // 并在取得与 update 共用的活动闸门后再次核对，避免恢复更新与结束交错。
+        IOSSystemSurfacesService.reapIdleActivities()
     }
 }
 

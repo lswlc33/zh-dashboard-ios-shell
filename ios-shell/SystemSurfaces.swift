@@ -144,48 +144,51 @@ private actor IOSLiveActivityManager {
     private var generation: UInt64 = 0
     private var owner: SystemSnapshotOwner?
     private var lastUpdates: [String: TimeInterval] = [:]
-    private var updating: Set<String> = []
-    private var lastContents: [String: SystemSnapshot] = [:]
+    private let gate = SystemActivityOperationGate.shared
 
     func setScope(_ next: SystemSnapshotOwner?, generation ticket: UInt64) async {
         guard ticket >= generation else { return }
         generation = ticket; owner = next
-        // 系统划掉或自行结束的活动也要回收缓存，不能只依赖主动 end。
         let liveIDs = Set(Activity<ZeehoActivityAttributes>.activities.filter { Self.isLive($0.activityState) }.map { $0.id })
         lastUpdates = lastUpdates.filter { liveIDs.contains($0.key) }
-        lastContents = lastContents.filter { liveIDs.contains($0.key) }
-        // nil 表示「网页还没确认车辆」的未知状态，不是撤销：冷启动 installBridge 时
-        // scopeProvider() 恒为 nil，这里若按 != next 结束活动，会把用户上次会话的
-        // Live Activity 全部杀掉。撤销只能走显式的 clearScope()。
+        // nil 仍然表示未知；只有 clearScope 才是显式撤销。
         guard let next = next else { return }
-        let old = Activity<ZeehoActivityAttributes>.activities.filter { $0.attributes.owner != next }
-        for activity in old {
-            guard ticket == generation, owner == next else { return }
-            await finish(activity)
+        for activity in Activity<ZeehoActivityAttributes>.activities where activity.attributes.owner != next {
+            await gate.acquire(activity.id)
+            guard ticket == generation, owner == next else { await gate.release(activity.id); return }
+            if Self.isLive(activity.activityState), activity.attributes.owner != next {
+                await Self.finishWhileHoldingGate(activity)
+                lastUpdates.removeValue(forKey: activity.id)
+            }
+            await gate.release(activity.id)
         }
     }
 
-    /// 显式撤销（关闭系统显示）：结束本 App 的全部活动，并清掉当前 owner 引用。
-    /// 与 `setScope(nil)` 的区别就是这里真的结束活动。
     func clearScope(generation ticket: UInt64) async -> Int {
         guard ticket >= generation else { return 0 }
         generation = ticket; owner = nil
-        let all = Activity<ZeehoActivityAttributes>.activities
         var ended = 0
-        for activity in all {
-            guard ticket == generation, owner == nil else { return ended }
-            await finish(activity); ended += 1
+        for activity in Activity<ZeehoActivityAttributes>.activities {
+            await gate.acquire(activity.id)
+            guard ticket == generation, owner == nil else { await gate.release(activity.id); return ended }
+            if Self.isLive(activity.activityState) {
+                await Self.finishWhileHoldingGate(activity)
+                lastUpdates.removeValue(forKey: activity.id); ended += 1
+            }
+            await gate.release(activity.id)
         }
         return ended
     }
 
-    // .stale 是 iOS 16.2 才有的 ActivityState；deployment target 15.4 必须用可用性分支，
-    // 否则整文件编译失败（CI 实测）。
-    // fileprivate：同一文件里的 service 同步取「正在运行的活动」时也要用它。
     fileprivate static func isLive(_ state: ActivityState) -> Bool {
         if state == .active { return true }
         if #available(iOS 16.2, *) { return state == .stale }
         return false
+    }
+
+    fileprivate static func content(_ activity: Activity<ZeehoActivityAttributes>) -> ZeehoActivityAttributes.ContentState {
+        if #available(iOS 16.2, *) { return activity.content.state }
+        return activity.contentState
     }
 
     func running(owner expected: SystemSnapshotOwner?) -> [IOSRunningSystemActivity] {
@@ -196,170 +199,165 @@ private actor IOSLiveActivityManager {
     }
 
     func start(_ snapshot: SystemSnapshot, kind: ZeehoActivityKind, generation ticket: UInt64,
-               lease: IOSSystemSurfaceLease) async throws -> IOSStartedSystemActivity {
-        guard lease.valid, ticket == generation, owner == snapshot.owner else { throw SystemSnapshotError("stale_session") }
+               lease: IOSSystemSurfaceLease, context: IOSBackgroundRunContext? = nil) async throws -> IOSStartedSystemActivity {
+        guard lease.valid, context?.canDeliver != false, ticket == generation, owner == snapshot.owner else {
+            throw SystemSnapshotError("stale_session")
+        }
         guard ActivityAuthorizationInfo().areActivitiesEnabled else { throw SystemSnapshotError("live_activities_disabled") }
         guard kind == .ride || !snapshot.isStale() else { throw SystemSnapshotError("snapshot_stale") }
         switch kind {
         case .charging:
             guard snapshot.vehicle?.visibleCharging() == true else { throw SystemSnapshotError("fresh_charging_data_required") }
         case .ride:
-            // 用户已主动打开记录；waiting/gap 也能先开活动，速度缺席不代表记录结束。
-            guard snapshot.ride.map({ $0.state != .ended }) == true else {
-                throw SystemSnapshotError("native_recording_required")
-            }
+            guard snapshot.ride.map({ $0.state != .ended }) == true else { throw SystemSnapshotError("native_recording_required") }
         case .vehicle:
-            guard let vehicle = snapshot.vehicle,
-                  SystemSnapshotFreshness.isFresh(vehicle.updatedAt, maxAgeSeconds: SystemSnapshotFreshness.vehicleMaxAgeSeconds) else {
+            guard let source = SystemActivityPolicy.latestSourceAt(snapshot, kind: .vehicle),
+                  SystemSnapshotFreshness.isFresh(source, maxAgeSeconds: SystemSnapshotFreshness.vehicleMaxAgeSeconds) else {
                 throw SystemSnapshotError("fresh_vehicle_data_required")
             }
         case .gauge:
             guard snapshot.gauge?.visibleSpeedKph() != nil else { throw SystemSnapshotError("native_gauge_sample_required") }
         }
         if let existing = running(owner: snapshot.owner).first(where: { $0.kind == kind }) {
-            // 复用已有活动时也要刷新内容：否则用户点「开始活动」拿到的还是上一次
-            // 发布的旧电量/旧速度（created:false 曾直接返回 id，不更新任何内容）。
-            // 复用也必须成功更新；取消/已结束的竞态不能被 try? 吞掉并骗报 running。
-            _ = try await update(snapshot, id: existing.id, generation: ticket, lease: lease)
-            guard lease.valid, ticket == generation, owner == snapshot.owner else {
+            _ = try await update(snapshot, id: existing.id, generation: ticket, lease: lease, context: context)
+            guard lease.valid, context?.canDeliver != false, ticket == generation, owner == snapshot.owner else {
                 throw SystemSnapshotError("operation_cancelled")
             }
             return IOSStartedSystemActivity(id: existing.id, created: false)
         }
-        let attributes = ZeehoActivityAttributes(owner: snapshot.owner, kind: kind)
-        let initial = presentation(snapshot, previous: nil, kind: kind)
-        let state = ZeehoActivityAttributes.ContentState(
-            snapshot: initial,
+        let initial = SystemActivityPolicy.presentation(snapshot, previous: nil, kind: kind)
+        let state = ZeehoActivityAttributes.ContentState(snapshot: initial,
             chargeStartedAt: Self.chargeStartedAt(kind: kind, snapshot: initial, previous: nil))
+        let attributes = ZeehoActivityAttributes(owner: snapshot.owner, kind: kind)
         let activity: Activity<ZeehoActivityAttributes>
+        // request 是同步调用：在当前 actor turn 中重新验证后立即执行，期间不让出执行权。
+        guard lease.valid, context?.canDeliver != false, ticket == generation, owner == snapshot.owner else {
+            throw SystemSnapshotError("operation_cancelled")
+        }
         if #available(iOS 16.2, *) {
             activity = try Activity.request(attributes: attributes,
-                content: ActivityContent(state: state, staleDate: Self.staleDate(snapshot, kind: kind)),
-                pushType: nil)
+                content: ActivityContent(state: state, staleDate: Self.staleDate(initial, kind: kind)), pushType: nil)
         } else {
             activity = try Activity.request(attributes: attributes, contentState: state, pushType: nil)
         }
-        // 原生确认后也可能立即换账号/导航或超时；只能结束这个精确 id，不能动新 owner 的活动。
-        guard lease.valid, ticket == generation, owner == snapshot.owner else {
-            await finish(activity)
+        guard lease.valid, context?.canDeliver != false, ticket == generation, owner == snapshot.owner else {
+            _ = await end(owner: snapshot.owner, id: activity.id)
             throw SystemSnapshotError("operation_cancelled")
         }
-        lastContents[activity.id] = initial
         lastUpdates[activity.id] = ProcessInfo.processInfo.systemUptime
         return IOSStartedSystemActivity(id: activity.id, created: true)
     }
 
     func update(_ snapshot: SystemSnapshot, id: String?, generation ticket: UInt64,
-                lease: IOSSystemSurfaceLease) async throws -> Int {
-        guard lease.valid, ticket == generation, owner == snapshot.owner else { throw SystemSnapshotError("stale_session") }
+                lease: IOSSystemSurfaceLease, context: IOSBackgroundRunContext? = nil) async throws -> Int {
+        guard lease.valid, context?.canDeliver != false, ticket == generation, owner == snapshot.owner else {
+            throw SystemSnapshotError("stale_session")
+        }
         let targets = Activity<ZeehoActivityAttributes>.activities.filter {
             $0.attributes.owner == snapshot.owner && (id == nil || $0.id == id)
-                && !($0.attributes.kind == .ride && snapshot.ride?.state == .ended)
-                && Self.isLive($0.activityState)
+                && !($0.attributes.kind == .ride && snapshot.ride?.state == .ended) && Self.isLive($0.activityState)
         }
         guard !targets.isEmpty else { throw SystemSnapshotError("live_activity_not_running") }
         var updated = 0
         for activity in targets {
-            guard lease.valid, ticket == generation, owner == snapshot.owner else { throw SystemSnapshotError("stale_session") }
-            // 每个 id 独立节流且 await 期间占槽，云端/骑行/gauge 同时到达也不会叠发。
-            let now = ProcessInfo.processInfo.systemUptime
-            guard !updating.contains(activity.id), now - (lastUpdates[activity.id] ?? -.infinity) >= 5 else { continue }
-            updating.insert(activity.id)
-            let previous: SystemSnapshot?
-            let previousChargeStarted: Double?
-            if let cached = lastContents[activity.id] { previous = cached }
-            else if #available(iOS 16.2, *) { previous = activity.content.state.snapshot }
-            else { previous = activity.contentState.snapshot }
-            if #available(iOS 16.2, *) { previousChargeStarted = activity.content.state.chargeStartedAt }
-            else { previousChargeStarted = activity.contentState.chargeStartedAt }
-            let value = presentation(snapshot, previous: previous, kind: activity.attributes.kind)
-            let state = ZeehoActivityAttributes.ContentState(
-                snapshot: value,
-                chargeStartedAt: Self.chargeStartedAt(kind: activity.attributes.kind, snapshot: value,
-                                                      previous: previousChargeStarted))
-            if #available(iOS 16.2, *) {
-                await activity.update(ActivityContent(state: state, staleDate: Self.staleDate(value, kind: activity.attributes.kind)))
-            } else { await activity.update(using: state) }
-            updating.remove(activity.id)
-            guard Self.isLive(activity.activityState) else {
-                lastUpdates.removeValue(forKey: activity.id)
-                lastContents.removeValue(forKey: activity.id)
-                continue
+            await gate.acquire(activity.id)
+            do {
+                if try await updateWhileHoldingGate(activity, snapshot: snapshot, generation: ticket, lease: lease, context: context) {
+                    updated += 1
+                }
+            } catch {
+                await gate.release(activity.id)
+                throw error
             }
-            lastUpdates[activity.id] = now
-            lastContents[activity.id] = value
-            // actor 在 await 时允许换 scope；不能用已经失效的样本确认成功或留下旧活动。
-            guard lease.valid, ticket == generation, owner == snapshot.owner else {
-                if owner != snapshot.owner { await finish(activity) }
-                throw SystemSnapshotError("operation_cancelled")
-            }
-            updated += 1
+            await gate.release(activity.id)
         }
         return updated
     }
 
+    private func updateWhileHoldingGate(_ activity: Activity<ZeehoActivityAttributes>, snapshot: SystemSnapshot,
+        generation ticket: UInt64, lease: IOSSystemSurfaceLease, context: IOSBackgroundRunContext?) async throws -> Bool {
+        // 闸门前的判断只是找候选；排队期间可换车、撤销、超时或被另一入口结束。
+        guard lease.valid, context?.canDeliver != false, ticket == generation, owner == snapshot.owner else {
+            throw SystemSnapshotError("stale_session")
+        }
+        guard activity.attributes.owner == snapshot.owner, Self.isLive(activity.activityState) else { return false }
+        let previous = Self.content(activity)
+        let kind = activity.attributes.kind
+        let value = SystemActivityPolicy.presentation(snapshot, previous: previous.snapshot, kind: kind)
+        if let oldTime = SystemActivityPolicy.latestSourceAt(previous.snapshot, kind: kind),
+           let newTime = SystemActivityPolicy.latestSourceAt(value, kind: kind), newTime < oldTime { return false }
+        let now = ProcessInfo.processInfo.systemUptime
+        // 状态改变不能被速度/云端的五秒节流吞掉，否则暂停会继续显示 recording。
+        let edgeChanged = value.ride?.state != previous.snapshot.ride?.state ||
+            value.ride?.gapCount != previous.snapshot.ride?.gapCount ||
+            value.vehicle?.charging != previous.snapshot.vehicle?.charging
+        guard edgeChanged || now - (lastUpdates[activity.id] ?? -.infinity) >= 5 else { return false }
+        let state = ZeehoActivityAttributes.ContentState(snapshot: value,
+            chargeStartedAt: Self.chargeStartedAt(kind: kind, snapshot: value, previous: previous.chargeStartedAt))
+        if #available(iOS 16.2, *) {
+            await activity.update(ActivityContent(state: state, staleDate: Self.staleDate(value, kind: kind)))
+        } else { await activity.update(using: state) }
+        guard lease.valid, context?.canDeliver != false, ticket == generation, owner == snapshot.owner else {
+            if owner != snapshot.owner { await Self.finishWhileHoldingGate(activity) }
+            lastUpdates.removeValue(forKey: activity.id)
+            throw SystemSnapshotError("operation_cancelled")
+        }
+        guard Self.isLive(activity.activityState) else { lastUpdates.removeValue(forKey: activity.id); return false }
+        lastUpdates[activity.id] = now
+        return true
+    }
+
     func end(owner expected: SystemSnapshotOwner, id: String? = nil, kind: ZeehoActivityKind? = nil,
-             generation ticket: UInt64? = nil) async -> Int {
-        if let ticket = ticket, ticket != generation { return 0 }
+             generation ticket: UInt64? = nil, lease: IOSSystemSurfaceLease? = nil,
+             context: IOSBackgroundRunContext? = nil) async -> Int {
+        var ended = 0
         let targets = Activity<ZeehoActivityAttributes>.activities.filter {
             $0.attributes.owner == expected && (id == nil || $0.id == id) && (kind == nil || $0.attributes.kind == kind)
         }
-        var ended = 0
         for activity in targets {
-            if let ticket = ticket, ticket != generation { return ended }
-            await finish(activity); ended += 1
+            await gate.acquire(activity.id)
+            guard (ticket == nil || ticket == generation), lease?.valid != false, context?.canDeliver != false else {
+                await gate.release(activity.id); return ended
+            }
+            if activity.attributes.owner == expected, Self.isLive(activity.activityState) {
+                await Self.finishWhileHoldingGate(activity)
+                lastUpdates.removeValue(forKey: activity.id); ended += 1
+            }
+            await gate.release(activity.id)
         }
         return ended
     }
 
-    // 只用于活动展示：缺速保留最后一帧及其原时间；不写回历史、不伪造采样时间。
-    private func presentation(_ value: SystemSnapshot, previous: SystemSnapshot?, kind: ZeehoActivityKind) -> SystemSnapshot {
-        let gauge = value.gauge ?? previous?.gauge
-        var ride = value.ride
-        if kind == .ride, let current = ride, current.state != .ended {
-            if let gauge = value.gauge, gauge.updatedAt >= (current.speedUpdatedAt ?? 0) {
-                ride = SystemRideSnapshot(state: current.state, startedAt: current.startedAt,
-                    updatedAt: max(current.updatedAt, gauge.updatedAt), speedKph: gauge.speedKph,
-                    speedUpdatedAt: gauge.updatedAt, elapsedSeconds: current.elapsedSeconds, gapCount: current.gapCount)
-            } else if current.speedKph == nil, previous?.ride?.speedKph != nil { ride = previous?.ride }
-        }
-        return SystemSnapshot(owner: value.owner, capturedAt: value.capturedAt, expiresAt: value.expiresAt,
-            vehicle: value.vehicle, ride: ride, gauge: gauge)
-    }
-
-    /// 充电段的起点（epoch ms）：沿用活动上一帧的起点，保持同一段充电计时连续；
-    /// 新段从充电状态首次确认时刻起算；未充电/非充电活动置空。
-    /// 视图用系统计时器渲染该值，进程挂起时「已充电」时长仍在锁屏上自动走表。
     fileprivate static func chargeStartedAt(kind: ZeehoActivityKind, snapshot: SystemSnapshot,
-                                        previous: Double?) -> Double? {
-        guard kind == .charging, snapshot.vehicle?.charging == true else { return nil }
-        return previous ?? Double(snapshot.vehicle?.chargingUpdatedAt ?? snapshot.capturedAt)
+                                            previous: Double?) -> Double? {
+        SystemActivityPolicy.chargeStartedAt(kind: kind, snapshot: snapshot, previous: previous)
     }
 
     fileprivate static func staleDate(_ snapshot: SystemSnapshot, kind: ZeehoActivityKind) -> Date {
-        var deadlines = [snapshot.expiresAt]
-        if kind == .gauge, let gauge = snapshot.gauge {
-            deadlines.append(gauge.updatedAt + 10_000)
-        } else if kind == .ride, let ride = snapshot.ride {
-            deadlines.append(ride.updatedAt + 10_000)
-            if ride.speedKph != nil, let timestamp = ride.speedUpdatedAt { deadlines.append(timestamp + 10_000) }
-        } else if let vehicle = snapshot.vehicle {
-            if vehicle.socPercent != nil, let timestamp = vehicle.socUpdatedAt { deadlines.append(timestamp + 180_000) }
-            if vehicle.charging != nil, let timestamp = vehicle.chargingUpdatedAt { deadlines.append(timestamp + 180_000) }
-            if vehicle.charging == true, vehicle.chargeProgressPercent != nil,
-               let timestamp = vehicle.chargeProgressUpdatedAt { deadlines.append(timestamp + 180_000) }
-        }
-        return Date(timeIntervalSince1970: Double(deadlines.min() ?? snapshot.expiresAt) / 1000)
+        SystemActivityPolicy.staleDate(snapshot, kind: kind)
     }
 
-    private func finish(_ activity: Activity<ZeehoActivityAttributes>) async {
-        // await 期间可能仍有更新收尾，返回前再次清理该活动的缓存。
-        defer {
-            lastUpdates.removeValue(forKey: activity.id)
-            lastContents.removeValue(forKey: activity.id)
-        }
+    // 只能在持有 SystemActivityOperationGate 的本 id turn 内调用。
+    fileprivate static func finishWhileHoldingGate(_ activity: Activity<ZeehoActivityAttributes>) async {
+        guard isLive(activity.activityState) else { return }
         if #available(iOS 16.2, *) { await activity.end(nil, dismissalPolicy: .immediate) }
         else { await activity.end(using: nil, dismissalPolicy: .immediate) }
+    }
+
+    static func reapIdleActivities(graceSeconds: TimeInterval = 30 * 60) {
+        for activity in Activity<ZeehoActivityAttributes>.activities {
+            Task {
+                let gate = SystemActivityOperationGate.shared
+                await gate.acquire(activity.id)
+                // 取得闸门后才读 content：前一轮 update 可能刚刚带来新 SOC/车速。
+                let state = content(activity)
+                if isLive(activity.activityState), state.snapshot.owner == activity.attributes.owner,
+                   SystemActivityPolicy.isIdle(state.snapshot, kind: activity.attributes.kind, graceSeconds: graceSeconds) {
+                    await finishWhileHoldingGate(activity)
+                }
+                await gate.release(activity.id)
+            }
+        }
     }
 }
 
@@ -459,7 +457,7 @@ final class IOSSystemSurfacesService: NSObject, IOSBridgeService, IOSBridgeCance
             // 冷启动被 BGTask 唤醒时没有面板服务实例，下面的通知无人接收、LA 永远不更新；
             // 直接按凭据 owner 把样本写进运行中的实时活动，保证充电中的锁屏/灵动岛
             // 在 App 完全不打开时也能跟进最新电量（对齐参考实现 jihe-drive-ios）。
-            updateRunningActivities(sample: sample, credential: credential)
+            updateRunningActivities(sample: sample, credential: credential, context: context)
         }
         NotificationCenter.default.post(name: sampleAccepted,
             object: AcceptedSample(sample: sample, credential: credential, context: context))
@@ -477,7 +475,7 @@ final class IOSSystemSurfacesService: NSObject, IOSBridgeService, IOSBridgeCance
             chargingUpdatedAt: sample.charging == nil ? previous.chargingUpdatedAt : sample.capturedAt,
             chargeProgressPercent: previous.chargeProgressPercent,
             chargeProgressUpdatedAt: previous.chargeProgressUpdatedAt,
-            updatedAt: sample.capturedAt,
+            updatedAt: max(previous.updatedAt, sample.capturedAt),
             voltage: previous.voltage, current: previous.current, power: previous.power,
             lockState: previous.lockState, seatState: previous.seatState, online: previous.online,
             todayMileKm: previous.todayMileKm, lastMileKm: previous.lastMileKm,
@@ -492,38 +490,59 @@ final class IOSSystemSurfacesService: NSObject, IOSBridgeService, IOSBridgeCance
     /// 只处理同 owner 的 charging/vehicle：ride/gauge 是本会话输入，没有服务实例时
     /// nativeRide/nativeGauge 均为空，绝不能用云端样本伪造（契约要求）。
     private static func updateRunningActivities(sample: IOSBackgroundClient.VehicleSample,
-        credential: IOSBackgroundCredential) {
+        credential: IOSBackgroundCredential, context: IOSBackgroundRunContext) {
         guard #available(iOS 16.1, *) else { return }
         for activity in Activity<ZeehoActivityAttributes>.activities {
             guard activity.attributes.owner.accountVINHash == credential.ownerHash,
-                  IOSLiveActivityManager.isLive(activity.activityState),
                   activity.attributes.kind == .charging || activity.attributes.kind == .vehicle else { continue }
-            let previous: SystemSnapshot?
-            if #available(iOS 16.2, *) { previous = activity.content.state.snapshot }
-            else { previous = activity.contentState.snapshot }
-            guard let previous = previous,
-                  previous.owner.accountVINHash == credential.ownerHash,
-                  let vehicle = previous.vehicle,
-                  sample.capturedAt >= vehicle.updatedAt else { continue }
-            let merged = Self.mergedBackgroundVehicle(vehicle, sample: sample)
-            let captured = sample.capturedAt
-            // vehicle 口径与 candidate 一致（180 秒），受快照 15 分钟寿命上限约束。
-            let expiresAt = min(max(captured + 1, captured + 180_000), captured + SystemSnapshot.maxLifetimeMs)
-            guard let value = try? SystemSnapshot(owner: previous.owner, capturedAt: captured,
-                expiresAt: expiresAt, vehicle: merged, ride: previous.ride, gauge: previous.gauge) else { continue }
-            let previousStarted: Double?
-            if #available(iOS 16.2, *) { previousStarted = activity.content.state.chargeStartedAt }
-            else { previousStarted = activity.contentState.chargeStartedAt }
-            let state = ZeehoActivityAttributes.ContentState(
-                snapshot: value,
-                chargeStartedAt: IOSLiveActivityManager.chargeStartedAt(kind: activity.attributes.kind, snapshot: value,
-                                                                        previous: previousStarted))
-            if #available(iOS 16.2, *) {
-                Task { await activity.update(ActivityContent(state: state,
-                    staleDate: IOSLiveActivityManager.staleDate(value, kind: activity.attributes.kind))) }
-            } else {
-                Task { await activity.update(using: state) }
+            Task { @MainActor in
+                let gate = SystemActivityOperationGate.shared
+                await gate.acquire(activity.id)
+                guard activeInstance == nil, context.canDeliver, credential.canSampleVehicle,
+                      IOSBackgroundCredentialStore.load() == credential, loadApproved(for: credential.ownerHash),
+                      widgetOwner(accountID: credential.accountID, vin: credential.vin) == activity.attributes.owner,
+                      IOSLiveActivityManager.isLive(activity.activityState) else {
+                    await gate.release(activity.id); return
+                }
+                let previous = IOSLiveActivityManager.content(activity)
+                guard previous.snapshot.owner == activity.attributes.owner, let vehicle = previous.snapshot.vehicle,
+                      sample.capturedAt >= (SystemActivityPolicy.latestSourceAt(previous.snapshot, kind: activity.attributes.kind) ?? 0) else {
+                    await gate.release(activity.id); return
+                }
+                // 明确的停止充电只结束 charging；同一采样仍更新 vehicle 的 SOC/充电态。
+                if activity.attributes.kind == .charging, sample.charging == false {
+                    await IOSLiveActivityManager.finishWhileHoldingGate(activity)
+                } else {
+                    let merged = Self.mergedBackgroundVehicle(vehicle, sample: sample)
+                    let captured = max(previous.snapshot.capturedAt, sample.capturedAt)
+                    let value = SystemSnapshot(owner: previous.snapshot.owner, capturedAt: captured,
+                        expiresAt: captured + 180_000, vehicle: merged,
+                        ride: previous.snapshot.ride, gauge: previous.snapshot.gauge)
+                    guard (try? value.validated(expectedOwner: activity.attributes.owner)) != nil else {
+                        await gate.release(activity.id); return
+                    }
+                    let state = ZeehoActivityAttributes.ContentState(snapshot: value,
+                        chargeStartedAt: IOSLiveActivityManager.chargeStartedAt(kind: activity.attributes.kind,
+                            snapshot: value, previous: previous.chargeStartedAt))
+                    if #available(iOS 16.2, *) {
+                        await activity.update(ActivityContent(state: state,
+                            staleDate: IOSLiveActivityManager.staleDate(value, kind: activity.attributes.kind)))
+                    } else { await activity.update(using: state) }
+                }
+                await gate.release(activity.id)
             }
+        }
+    }
+
+    // 凭据撤销只取消充电调度，绝不停止独立的骑行/GPS/BLE 会话。
+    static func backgroundCredentialCleared() {
+        precondition(Thread.isMainThread)
+        guard let service = activeInstance else { return }
+        service.chargingStartLease.cancel(); service.chargingStartLease = IOSSystemSurfaceLease()
+        service.chargingStarting = false
+        service.stopChargingPoll()
+        if let owner = service.owner {
+            IOSContinuedCharging.shared.stop(ownerID: owner.ownerIdentifierString, success: false)
         }
     }
 
@@ -1352,23 +1371,12 @@ final class IOSSystemSurfacesService: NSObject, IOSBridgeService, IOSBridgeCance
                     // 写回调不能让活动车速倒退到排队前；车况沿用本次成功值，原生源使用最新已接受样本。
                     self.latest = (try? self.candidate(vehicle: value.vehicle)) ?? value
                     self.lastError = nil
-                    // App 在前台跑起来就顺手把小组件取数凭据同步一次：用户要求的是
-                    // 「APP 运行的时候把 token 等关键信息给小组件，由小组件自己发请求」，
-                    // 而不是必须先去后台任务面板点授权。没有已授权凭据时这里是 no-op，
-                    // 小组件继续走读快照的老路。
-                    // 走 worker：这里读 Keychain + 写 4KB 文件，放主线程会卡首屏。
-                    // 用显式捕获列表把值类型带进去：Swift 5 的非 Sendable 闭包里直接引用
-                    // 外部 `let` 会在 strict concurrency 下报 data race 警告。
-                    let credentialOwner = value.owner
-                    self.worker.async { [credentialOwner, selectedScope] in
-                        Self.refreshWidgetCredential(for: credentialOwner, scope: selectedScope)
-                    }
                     self.reloadWidgets(force: false, snapshot: value)
-                    if job?.activityKind != .charging { self.reconcileCharging(value) }
+                    if job?.activityKind != .charging { self.reconcileCharging(value, context: context) }
                     self.observeActivities()
                     if let completion = completion { completion() }
                     else {
-                        self.publishExistingActivity(self.latest ?? value)
+                        self.publishExistingActivity(self.latest ?? value, context: context)
                         if let job = job { self.finishStored(job, value: value) }
                     }
                     didPersist?(true)
@@ -1513,8 +1521,8 @@ final class IOSSystemSurfacesService: NSObject, IOSBridgeService, IOSBridgeCance
         } catch { lastError = Self.code(error) }
     }
 
-    private func reconcileCharging(_ value: SystemSnapshot) {
-        guard approved, !revoking, value.owner == owner, let vehicle = value.vehicle,
+    private func reconcileCharging(_ value: SystemSnapshot, context: IOSBackgroundRunContext? = nil) {
+        guard context?.canDeliver != false, approved, !revoking, value.owner == owner, let vehicle = value.vehicle,
               let charging = vehicle.charging, let at = vehicle.chargingUpdatedAt,
               at >= chargingSampleAt else { return }
         chargingSampleAt = at; chargingValue = charging
@@ -1528,7 +1536,7 @@ final class IOSSystemSurfacesService: NSObject, IOSBridgeService, IOSBridgeCance
             chargingStartLease.cancel(); chargingStartLease = IOSSystemSurfaceLease(); chargingStarting = false
             stopChargingPoll()
             IOSContinuedCharging.shared.stop(ownerID: value.owner.ownerIdentifierString, success: true)
-            endCharging(owner: value.owner)
+            endCharging(owner: value.owner, context: context)
             return
         }
         observeActivities()
@@ -1547,8 +1555,8 @@ final class IOSSystemSurfacesService: NSObject, IOSBridgeService, IOSBridgeCance
             defer { if let self = self, self.epoch == ticket, lease.valid { self.chargingStarting = false } }
             do {
                 await manager.setScope(value.owner, generation: ticket)
-                guard lease.valid, UIApplication.shared.applicationState != .background else { return }
-                _ = try await manager.start(value, kind: .charging, generation: ticket, lease: lease)
+                guard lease.valid, context?.canDeliver != false, UIApplication.shared.applicationState != .background else { return }
+                _ = try await manager.start(value, kind: .charging, generation: ticket, lease: lease, context: context)
                 guard let self = self, lease.valid, self.epoch == ticket, self.owner == value.owner else { return }
                 Self.defaults.removeObject(forKey: Self.chargingKey(hash, "pending"))
                 self.observeActivities(); self.ensureChargingPoll()
@@ -1559,14 +1567,14 @@ final class IOSSystemSurfacesService: NSObject, IOSBridgeService, IOSBridgeCance
         }
     }
 
-    private func endCharging(owner selected: SystemSnapshotOwner) {
+    private func endCharging(owner selected: SystemSnapshotOwner, context: IOSBackgroundRunContext? = nil) {
         guard #available(iOS 16.1, *) else { return }
         for activity in Activity<ZeehoActivityAttributes>.activities
             where activity.attributes.owner == selected && activity.attributes.kind == .charging {
             activityObservers.removeValue(forKey: activity.id)?.cancel()
         }
-        let manager = liveManager(); let ticket = epoch
-        Task { _ = await manager.end(owner: selected, kind: .charging, generation: ticket) }
+        let manager = liveManager(); let ticket = epoch; let lease = ownerLease
+        Task { _ = await manager.end(owner: selected, kind: .charging, generation: ticket, lease: lease, context: context) }
     }
 
     private func observeActivities() {
@@ -1616,24 +1624,31 @@ final class IOSSystemSurfacesService: NSObject, IOSBridgeService, IOSBridgeCance
         chargingPoll?.cancel(); chargingPoll = nil
     }
 
+    private static func chargingCredentialMatches(_ scope: IOSRideScope) -> Bool {
+        guard let credential = IOSBackgroundCredentialStore.load() else { return false }
+        return credential.canSampleVehicle && credential.ownerHash == scope.ownerHash
+            && credential.accountID == scope.accountID && credential.vin == scope.vin
+    }
+
     private func ensureChargingPoll() {
         guard chargingPoll == nil, approved, !revoking, let selected = owner,
-              let captured = scope, captured == scopeProvider?(),
+              let captured = scope, captured == scopeProvider?(), Self.chargingCredentialMatches(captured),
               !Self.defaults.bool(forKey: Self.chargingKey(selected.accountVINHash, "suppressed")),
               runningValue().contains(where: { $0.kind == .charging }) else { return }
         let ticket = epoch; let lease = chargingPollLease
         // 普通 Task 只在进程获得执行时间时工作；LA 本身不提供后台执行权，更不启动 GPS。
         chargingPoll = Task { @MainActor [weak self] in
+            defer { if let self = self, self.epoch == ticket, lease.valid { self.chargingPoll = nil } }
             var interval: UInt64 = 30
             while lease.valid, !Task.isCancelled {
                 do { try await Task.sleep(nanoseconds: interval * 1_000_000_000) } catch { return }
                 guard let self = self, lease.valid, self.epoch == ticket, self.owner == selected,
-                      self.scopeProvider?() == captured, self.approved,
+                      self.scopeProvider?() == captured, self.approved, Self.chargingCredentialMatches(captured),
                       self.runningValue().contains(where: { $0.kind == .charging }) else { return }
                 let report: IOSBackgroundTaskReport
                 do {
                     report = try await IOSBackgroundRunner.withRun(source: .system("liveActivity.charging")) { context in
-                        guard lease.valid, IOSBackgroundCredentialStore.load()?.ownerHash == captured.ownerHash else {
+                        guard lease.valid, Self.chargingCredentialMatches(captured) else {
                             throw IOSBackgroundError.cancelled
                         }
                         return await IOSBackgroundRunner.runRefresh(context: context)
@@ -1699,13 +1714,13 @@ final class IOSSystemSurfacesService: NSObject, IOSBridgeService, IOSBridgeCance
             } catch { self?.finish(job, self?.failure(Self.code(error)) ?? ["ok": false]) }
         }
     }
-    private func publishExistingActivity(_ value: SystemSnapshot) {
-        guard !revoking, #available(iOS 16.1, *) else { return }
+    private func publishExistingActivity(_ value: SystemSnapshot, context: IOSBackgroundRunContext? = nil) {
+        guard context?.canDeliver != false, !revoking, #available(iOS 16.1, *) else { return }
         let manager = liveManager(); let ticket = epoch; let lease = ownerLease
         Task {
             await manager.setScope(value.owner, generation: ticket)
             // 没有用户已授权活动时只落 Widget 快照，绝不因刷新/录制自动 request 新活动。
-            _ = try? await manager.update(value, id: nil, generation: ticket, lease: lease)
+            _ = try? await manager.update(value, id: nil, generation: ticket, lease: lease, context: context)
         }
     }
     private func endActivity(id: String?, kind: ZeehoActivityKind? = nil, job: Job) {
@@ -1720,7 +1735,7 @@ final class IOSSystemSurfacesService: NSObject, IOSBridgeService, IOSBridgeCance
         let manager = liveManager(); let ticket = epoch
         Task { @MainActor [weak self] in
             guard job.lease.valid else { return }
-            let count = await manager.end(owner: owner, id: id, kind: kind, generation: ticket)
+            let count = await manager.end(owner: owner, id: id, kind: kind, generation: ticket, lease: job.lease)
             guard let self = self, self.current(job) else { return }
             guard count > 0 else { self.finish(job, self.failure("live_activity_not_running")); return }
             self.finish(job, ["ok": true, "ended": count, "running": false])
@@ -1734,35 +1749,11 @@ final class IOSSystemSurfacesService: NSObject, IOSBridgeService, IOSBridgeCance
         return manager
     }
 
-    /// 清掉已经停止更新的实时活动（2026-11-25）。
-    ///
-    /// 背景：iOS 不允许第三方在 App 被划掉之后后台更新实时活动（没有 APNs 推送通道时，
-    /// `pushType: nil` 的活动只能由宿主进程 update）。用户强退后卡片会永久停在最后一帧，
-    /// 以前它就一直那么挂着，桌面上看着像还在跑。
-    ///
-    /// 现在按内容自带的 staleDate 判断：超过宽限期仍没被刷新，就主动结束，
-    /// 避免长期展示一份停住的假数据。宽限期给 30 分钟——充电/骑行本身可能持续很久，
-    /// 期间 App 会持续 update，不会被误杀；只有真的停更了才会命中。
-    /// 调用时机只有「App 变前台」（启动或回前台），不占后台执行权。
+    /// 只按本 kind 的最后一次有效核心来源回收；显示失鲜与停更三十分钟是两个判据。
+    /// 前台调用不创建后台执行权。实际读取/结束在共享 per-id 闸门内执行。
     static func reapIdleActivities(graceSeconds: TimeInterval = 30 * 60) {
         guard #available(iOS 16.1, *) else { return }
-        let now = Date()
-        for activity in Activity<ZeehoActivityAttributes>.activities {
-            guard IOSLiveActivityManager.isLive(activity.activityState) else { continue }
-            let snapshot: SystemSnapshot?
-            if #available(iOS 16.2, *) { snapshot = activity.content.state.snapshot }
-            else { snapshot = activity.contentState.snapshot }
-            // 没有载荷就判断不了新旧：留给用户自己关，不擅自结束。
-            guard let snapshot = snapshot else { continue }
-            let deadline = IOSLiveActivityManager.staleDate(snapshot, kind: activity.attributes.kind)
-            guard now.timeIntervalSince(deadline) >= graceSeconds else { continue }
-            // `.immediate`：既然已经停更，就别再占着锁屏/灵动岛等用户手动划掉。
-            if #available(iOS 16.2, *) {
-                Task { await activity.end(nil, dismissalPolicy: .immediate) }
-            } else {
-                Task { await activity.end(using: nil, dismissalPolicy: .immediate) }
-            }
-        }
+        IOSLiveActivityManager.reapIdleActivities(graceSeconds: graceSeconds)
     }
 
     @discardableResult private func reloadWidgets(force: Bool, snapshot: SystemSnapshot?) -> Bool {
@@ -1970,40 +1961,6 @@ final class IOSSystemSurfacesService: NSObject, IOSBridgeService, IOSBridgeCance
         return SystemSnapshotOwner(scopeID: stableScopeID(for: scope.ownerHash),
                                    accountVINHash: scope.ownerHash,
                                    accountHash: anonymousAccount(accountID))
-    }
-
-    /// 每次快照落盘成功后，把小组件取数凭据对齐到「当前这辆车」。
-    ///
-    /// 只在**已有已授权的后台凭据**且账号/VIN 与本帧一致时才镜像：小组件不能凭白拿到
-    /// 用户从没授权过的长期凭据。没有凭据时静默跳过（扩展继续读快照）。
-    /// 发现 owner 变了就先把旧投影清掉，绝不让扩展拿上一辆车的 token 去拉新车的接口。
-    static func refreshWidgetCredential(for owner: SystemSnapshotOwner, scope: IOSRideScope?) {
-        guard SystemSnapshotStore.isAvailable() else { return }
-        guard let scope = scope, let credential = IOSBackgroundCredentialStore.load(),
-              credential.canSampleVehicle,
-              credential.vin == scope.vin, credential.accountID == scope.accountID,
-              let derived = widgetOwner(accountID: credential.accountID, vin: credential.vin),
-              derived == owner else {
-            // 没有可镜像的凭据：如果共享区里还留着别的 owner 的投影，必须清掉。
-            if let existing = WidgetCredentialStore.read(), existing.ownerID != owner.ownerIdentifierString {
-                WidgetCredentialStore.clear()
-                WidgetFetchCache.clear()
-            }
-            return
-        }
-        let existing = WidgetCredentialStore.read()
-        if existing?.ownerID == derived.ownerIdentifierString,
-           existing?.token == credential.token,
-           existing?.appSecret == credential.appSecret {
-            return // 已经是最新的，别每次快照都重写文件。
-        }
-        let value = WidgetCredential(ownerID: derived.ownerIdentifierString, vin: credential.vin,
-                                     token: credential.token, appID: credential.appID,
-                                     appSecret: credential.appSecret,
-                                     updatedAt: Int64(Date().timeIntervalSince1970 * 1000))
-        if !WidgetCredentialStore.save(value) { return }
-        // 换车/换账号后旧的拉取缓存必须作废，否则新卡片会先闪一下上一辆车的数据。
-        WidgetFetchCache.clear()
     }
 
     func compatibilityScopeOptions() throws -> [String: Any] {
