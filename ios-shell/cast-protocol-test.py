@@ -99,6 +99,10 @@ private enum CastProtocolTests {
         let identity = try IOSCastIdentity(bits: recipe.session?.rsaBits ?? 2048)
         var settings = IOSCastSettings(); settings.tier = recipe.tiers[0].id
         let signature = Data(base64Encoded: try identity.sign("fixture-HUID"))!
+        // 临时会话公钥/签名交给独立 OpenSSL 恢复，确认线上签名没有多加摘要层。
+        let directory = URL(fileURLWithPath: CommandLine.arguments[1]).deletingLastPathComponent()
+        try Data(base64Encoded: identity.publicKey)!.write(to: directory.appendingPathComponent("public.der"))
+        try signature.write(to: directory.appendingPathComponent("signature.bin"))
         try group("production recipe control opcode table / nonzero identifier / empty ACK / no reply loops") {
             for rule in recipe.control {
                 var input: [String: Any] = ["HUID": "fixture-HUID", "huid": "fixture-HUID", "sn": "quote\"-slash\\-测试"]
@@ -221,6 +225,16 @@ def main():
         subprocess.run([compiler, '-swift-version', '5', '-parse-as-library', str(work / 'Production.swift'),
                         str(work / 'Tests.swift'), '-o', str(executable)], cwd=work, check=True, timeout=60)
         subprocess.run([str(executable), str(work / 'recipe.json')], cwd=work, check=True, timeout=20)
+        openssl = shutil.which('openssl')
+        if not openssl:
+            raise RuntimeError('OpenSSL required to verify raw RSA interoperability')
+        recovered = subprocess.run([openssl, 'pkeyutl', '-verifyrecover', '-pubin', '-keyform', 'DER',
+                                    '-inkey', str(work / 'public.der'), '-in', str(work / 'signature.bin'),
+                                    '-pkeyopt', 'rsa_padding_mode:pkcs1'],
+                                   capture_output=True, check=True, timeout=10).stdout
+        if recovered != b'fixture-HUID':
+            raise RuntimeError('raw RSA signature changed: recovered payload does not match HUID')
+        print('PASS: production Swift signature recovered by independent OpenSSL (raw HUID / PKCS1 type-1)')
 
 
 if __name__ == '__main__':
