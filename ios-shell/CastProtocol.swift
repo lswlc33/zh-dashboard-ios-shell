@@ -547,9 +547,7 @@ struct IOSCastRecipe: Codable {
     func plan(_ config: IOSCastCapture, _ settings: IOSCastSettings) throws -> IOSCastPlan {
         guard let tier = tiers.first(where: { $0.id == settings.tier }) else { throw IOSCastError.reason("cast_tier_invalid") }
         let alignment = capture.dimensionAlignment ?? 16
-        if alignment == 2, (config.width % 2 != 0 || config.height % 2 != 0) {
-            throw IOSCastError.reason("media_config_invalid")
-        }
+        // 通用配方还服务于允许奇数上报的仪表；向下取偶数并回 ACK，不套用某型号的拒绝规则。
         var w = IOSCastPlan.align(min(config.width, settings.maxWidth), to: alignment)
         var h = IOSCastPlan.align(min(config.height, settings.maxHeight), to: alignment)
         let scale = min(1, min(Double(tier.widthLimit) / Double(w), Double(tier.heightLimit) / Double(h)))

@@ -166,9 +166,11 @@ private enum CastProtocolTests {
             try check(IOSCastPlan.macroblocks(width: 1600, height: 770) == 4900, "macroblocks must ceil")
             try IOSCastPlan.validateLevel("3.2", width: 1600, height: 770, fps: 25)
             try rejects("h264_level_load_invalid") { try IOSCastPlan.validateLevel("3.1", width: 1600, height: 770, fps: 25) }
-            try rejects("media_config_invalid") {
-                _ = try even.plan(IOSCastCapture(width: 1600, height: 771, fps: 25, codec: 2, bitrate: 2500000, extended: false), settings)
-            }
+            let odd = try even.capturePlan(capture(even, width: 855, height: 481, signature: signature), settings: settings, identity: signature)
+            try check(odd.width == 854 && odd.height == 480, "odd reported canvas must normalize to even dimensions")
+            let oddAck = even.acknowledgement(odd)
+            try check(IOSCastWire.u16(oddAck, even.captureAck.widthOffset) == 854 && IOSCastWire.u16(oddAck, even.captureAck.heightOffset) == 480,
+                      "odd canvas ACK must match actual encoded dimensions")
             tiers[0]["maxMacroblocks"] = 4800; value["tiers"] = tiers
             let bounded = try IOSCastRecipe.from(value).plan(config, settings)
             try check(IOSCastPlan.macroblocks(width: bounded.width, height: bounded.height) <= 4800, "macroblock cap floored")
