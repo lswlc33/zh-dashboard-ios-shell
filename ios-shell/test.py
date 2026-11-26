@@ -140,6 +140,8 @@ def main():
         check_charging_only_history(root)
         print('iOS charging-only history/queue source contracts passed (no Apple compilation or device validation)')
         return
+    # macOS 上实际编译执行生产投屏协议；其他平台明确 SKIP，不以源码检查冒充执行。
+    subprocess.run([sys.executable, '-I', str(root / 'cast-protocol-test.py')], check=True)
     repo = root.parent
     with (root / 'Info.plist').open('rb') as f:
         info = plistlib.load(f)

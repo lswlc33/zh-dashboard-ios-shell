@@ -349,26 +349,29 @@ final class IOSCastBroadcastEngine {
         let identifier = nextControlIdentifier; nextControlIdentifier &+= 1
         return try IOSCastWire.control(message.type, identifier: identifier, body: body)
     }
-    private func media(_ frame: IOSCastWire.Media, socket: IOSCastSocket, next: @escaping () -> Void) {
+    private func media(_ frame: IOSCastWire.Media, socket: IOSCastSocket, next: @escaping () -> Void, identityDeadline: TimeInterval? = nil) {
         do {
             guard let rule = recipe.media.first(where: { $0.request == frame.command }), rule.action != "ignore" else { next(); return }
             guard let command = rule.reply else { throw IOSCastError.reason("cast_recipe_invalid") }
             switch rule.action {
             case "configure":
-                if let offset = recipe.capture.signatureOffset {
-                    guard frame.body.count > offset, frame.body.count - offset <= 1024,
-                          let expected = sessionIdentity else { throw IOSCastError.reason("media_identity_missing") }
-                    var echo = Data(frame.body.dropFirst(offset))
-                    while echo.last == 0 { echo.removeLast() }
-                    guard let signature = Data(base64Encoded: echo), signature == expected else {
-                        throw IOSCastError.reason("media_identity_mismatch")
+                if recipe.capture.signatureOffset != nil, sessionIdentity == nil {
+                    // 控制身份和媒体配置来自两条 socket：有界等待身份，不能把正常乱序当认证失败。
+                    let deadline = identityDeadline ?? ProcessInfo.processInfo.systemUptime + 5
+                    guard ProcessInfo.processInfo.systemUptime < deadline else { throw IOSCastError.reason("media_identity_missing") }
+                    let epoch = generation
+                    queue.asyncAfter(deadline: .now() + .milliseconds(25)) { [weak self, weak socket] in
+                        guard let self = self, let socket = socket, self.active, self.generation == epoch,
+                              self.holds(socket, port: self.ports.media), self.checkGrant() else { return }
+                        self.media(frame, socket: socket, next: next, identityDeadline: deadline)
                     }
+                    return
                 }
-                let config = try recipe.parseCapture(frame.body)
-                if !encoder.running { plan = try recipe.plan(config, settings) }
-                guard let plan = plan else { throw IOSCastError.reason("media_config_invalid") }
+                let negotiated = try recipe.capturePlan(frame.body, settings: settings, identity: sessionIdentity,
+                                                       active: encoder.running ? plan : nil)
+                plan = negotiated
                 configured = true
-                socket.send(try IOSCastWire.media(command, serial: frame.serial, body: recipe.acknowledgement(plan)), completion: next)
+                socket.send(try IOSCastWire.media(command, serial: frame.serial, body: recipe.acknowledgement(negotiated)), completion: next)
             case "start":
                 if recipe.capture.signatureOffset != nil, !configured { throw IOSCastError.reason("media_config_required") }
                 if plan == nil { plan = try recipe.plan(recipe.fallback, settings) }

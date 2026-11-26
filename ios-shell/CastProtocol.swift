@@ -372,6 +372,7 @@ struct IOSCastRecipe: Codable {
         let dimensionsOnly: Bool?
         let signatureOffset: Int?
         let dimensionAliases: [DimensionAlias]?
+        let dimensionAlignment: Int? // 缺省保留旧配方的 16；偶数画布由配方显式选择 2。
     }
     struct DimensionAlias: Codable {
         let width: Int; let height: Int; let outputHeight: Int
@@ -477,6 +478,7 @@ struct IOSCastRecipe: Codable {
                         fits(capture.bitrateOffset, 4, capture.minBytes) && fits(capture.extendedOffset, 1, capture.minBytes))
         }
         if let offset = capture.signatureOffset { try require(offset >= capture.minBytes && offset <= 256) }
+        try require([2, 16].contains(capture.dimensionAlignment ?? 16))
         let aliases = capture.dimensionAliases ?? []
         try require(aliases.count <= 4 && Set(aliases.map { "\($0.width)x\($0.height)" }).count == aliases.count)
         for alias in aliases {
@@ -514,6 +516,23 @@ struct IOSCastRecipe: Codable {
             codec: codec == 0 ? capture.zeroCodec : codec, bitrate: Int(Int32(bitPattern: IOSCastWire.u32(data, capture.bitrateOffset))),
             extended: data[data.startIndex + capture.extendedOffset] != 0)
     }
+    // 与 socket 无关的生产协商入口；媒体配置和控制身份可能从不同连接先后到达。
+    func capturePlan(_ data: Data, settings: IOSCastSettings, identity: Data?, active: IOSCastPlan? = nil) throws -> IOSCastPlan {
+        if let offset = capture.signatureOffset {
+            guard data.count > offset, data.count - offset <= 1024, let expected = identity else {
+                throw IOSCastError.reason("media_identity_missing")
+            }
+            var echo = Data(data.dropFirst(offset))
+            while echo.last == 0 { echo.removeLast() }
+            guard let signature = Data(base64Encoded: echo), signature == expected else {
+                throw IOSCastError.reason("media_identity_mismatch")
+            }
+        }
+        let proposed = try plan(parseCapture(data), settings)
+        // 已启动后不能确认旧尺寸并继续发旧流，让接收端误以为新配置已经生效。
+        if let active = active, active != proposed { throw IOSCastError.reason("media_config_changed") }
+        return proposed
+    }
     func acknowledgement(_ plan: IOSCastPlan) -> Data {
         var out = Data(repeating: 0, count: captureAck.size)
         var codec = Data(); IOSCastWire.append32(plan.codec, to: &codec)
@@ -527,10 +546,18 @@ struct IOSCastRecipe: Codable {
     }
     func plan(_ config: IOSCastCapture, _ settings: IOSCastSettings) throws -> IOSCastPlan {
         guard let tier = tiers.first(where: { $0.id == settings.tier }) else { throw IOSCastError.reason("cast_tier_invalid") }
-        var w = IOSCastPlan.align(min(config.width, settings.maxWidth)), h = IOSCastPlan.align(min(config.height, settings.maxHeight))
+        let alignment = capture.dimensionAlignment ?? 16
+        if alignment == 2, (config.width % 2 != 0 || config.height % 2 != 0) {
+            throw IOSCastError.reason("media_config_invalid")
+        }
+        var w = IOSCastPlan.align(min(config.width, settings.maxWidth), to: alignment)
+        var h = IOSCastPlan.align(min(config.height, settings.maxHeight), to: alignment)
         let scale = min(1, min(Double(tier.widthLimit) / Double(w), Double(tier.heightLimit) / Double(h)))
-        w = IOSCastPlan.align(Int(Double(w) * scale)); h = IOSCastPlan.align(Int(Double(h) * scale))
-        while (w / 16) * (h / 16) > tier.maxMacroblocks, w > 16, h > 16 { if w >= h { w -= 16 } else { h -= 16 } }
+        w = IOSCastPlan.align(Int(Double(w) * scale), to: alignment)
+        h = IOSCastPlan.align(Int(Double(h) * scale), to: alignment)
+        while IOSCastPlan.macroblocks(width: w, height: h) > tier.maxMacroblocks, w > 16 || h > 16 {
+            if w >= h && w > 16 { w -= alignment } else { h -= alignment }
+        }
         let requestedFPS = config.fps > 0 ? min(config.fps, settings.maxFPS) : 30
         let fps = tier.compatibilityFPS ? (requestedFPS >= 15 ? min(tier.fps, requestedFPS) : tier.fps) : tier.fps
         let requestedBPS = (256000...8000000).contains(config.bitrate) ? min(tier.bitrate, config.bitrate) : tier.bitrate
@@ -539,6 +566,27 @@ struct IOSCastRecipe: Codable {
         return IOSCastPlan(tier: tier.id, width: w, height: h, fps: effectiveFPS,
             bitrate: max(256000, min(tier.requestedBitrate ? requestedBPS : tier.bitrate, settings.maxBitrate)), codec: config.codec,
             extended: settings.extended && config.extended, level: tier.level)
+    }
+    // 帧码和响应内容完全由已验证的配方指定；不对未知 opcode 猜测 +1 或推断车型。
+    func controlReplies(_ rule: Rule, frame: IOSCastWire.Control, identity: IOSCastIdentity?) throws -> (frames: [Data], signature: Data?) {
+        guard rule.request == frame.type else { throw IOSCastError.reason("control_frame_invalid") }
+        if rule.action == "ignore" { return ([], nil) }
+        let input: [String: Any]
+        if rule.action == "rsa" || rule.action == "echo" { input = try IOSCastWire.object(frame.body) }
+        else { input = [:] }
+        var signature = ""
+        if rule.action == "rsa" {
+            guard let identity = identity else { throw IOSCastError.reason("cast_identity_unavailable") }
+            guard let value = (rule.inputKeys ?? []).compactMap({ input[$0] as? String }).first, !value.isEmpty else {
+                throw IOSCastError.reason("cast_sign_input_invalid")
+            }
+            signature = try identity.sign(value)
+        }
+        let frames = try rule.replies.map { reply -> Data in
+            let data = try reply.json.map { try render($0, input: input, defaults: rule.defaults ?? [:], identity: identity, signature: signature) } ?? Data()
+            return try IOSCastWire.control(reply.type, identifier: frame.identifier, body: data)
+        }
+        return (frames, signature.isEmpty ? nil : Data(base64Encoded: signature))
     }
     // 替换解析后的 JSON 值，禁止手工字符串插入 HUID/SN（引号会破坏 JSON）。
     func render(_ template: String, input: [String: Any] = [:], defaults: [String: String] = [:], identity: IOSCastIdentity? = nil,
@@ -575,7 +623,7 @@ struct IOSCastRecipe: Codable {
     }
 }
 
-struct IOSCastPlan {
+struct IOSCastPlan: Equatable {
     let tier: String
     let width: Int
     let height: Int
@@ -584,7 +632,8 @@ struct IOSCastPlan {
     let codec: UInt32
     let extended: Bool
     let level: String
-    static func align(_ n: Int) -> Int { max(16, n & ~15) }
+    static func align(_ n: Int, to alignment: Int = 16) -> Int { max(16, n - n % alignment) }
+    static func macroblocks(width: Int, height: Int) -> Int { ((width + 15) / 16) * ((height + 15) / 16) }
     static func validateLevel(_ level: String, width: Int, height: Int, fps: Int) throws {
         if level == "auto" { return }
         // 标准 H.264 Annex A 宏块与宏块/秒上限；不是接收端私有协议值。
@@ -592,7 +641,7 @@ struct IOSCastPlan {
             "1.3": (396, 11880), "2.1": (792, 19800), "2.2": (1620, 20250), "3.0": (1620, 40500),
             "3.1": (3600, 108000), "3.2": (5120, 216000), "4.0": (8192, 245760),
             "4.2": (8704, 522240), "5.0": (22080, 589824), "5.1": (36864, 983040), "5.2": (36864, 2073600)]
-        let blocks = ((width + 15) / 16) * ((height + 15) / 16)
+        let blocks = macroblocks(width: width, height: height)
         guard let limit = limits[level], blocks <= limit.0, blocks * fps <= limit.1 else {
             throw IOSCastError.reason("h264_level_load_invalid")
         }
@@ -895,22 +944,9 @@ final class IOSCastSocket {
         return true
     }
     func replies(_ rule: IOSCastRecipe.Rule, frame: IOSCastWire.Control, recipe: IOSCastRecipe) throws -> [Data] {
-        let input: [String: Any]
-        if rule.action == "rsa" || rule.action == "echo" { input = try IOSCastWire.object(frame.body) }
-        else { input = [:] }
-        var signature = ""
-        if rule.action == "rsa" {
-            guard let identity = identity else { throw IOSCastError.reason("cast_identity_unavailable") }
-            guard let value = (rule.inputKeys ?? []).compactMap({ input[$0] as? String }).first, !value.isEmpty else {
-                throw IOSCastError.reason("cast_sign_input_invalid")
-            }
-            signature = try identity.sign(value)
-            signedIdentity = Data(base64Encoded: signature)
-        }
-        return try rule.replies.map { reply in
-            let data = try reply.json.map { try recipe.render($0, input: input, defaults: rule.defaults ?? [:], identity: identity, signature: signature) } ?? Data()
-            return try IOSCastWire.control(reply.type, identifier: frame.identifier, body: data)
-        }
+        let result = try recipe.controlReplies(rule, frame: frame, identity: identity)
+        if rule.action == "rsa" { signedIdentity = result.signature }
+        return result.frames
     }
     func start(expectedIP: String, ready: @escaping () -> Void) {
         connection.pathUpdateHandler = { [weak self] path in
