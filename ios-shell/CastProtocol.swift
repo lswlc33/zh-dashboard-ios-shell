@@ -665,7 +665,7 @@ enum IOSCastTarget {
     }
 }
 
-// 随机会话 RSA，未抄 Android 内置秘密。RawSign 的 PKCS1 type-1 padding 对应 Java
+// 随机会话 RSA，未抄 Android 内置秘密。原始 PKCS1 type-1 padding 对应 Java
 // Cipher(ENCRYPT_MODE, privateKey)，不能换成 SHA256WithRSA（那会多一层 DigestInfo）。
 final class IOSCastIdentity {
     private let privateKey: SecKey
@@ -696,13 +696,14 @@ final class IOSCastIdentity {
     func sign(_ input: String) throws -> String {
         guard !input.isEmpty, input.utf8.count <= SecKeyGetBlockSize(privateKey) - 11 else { throw IOSCastError.reason("cast_sign_input_invalid") }
         let input = Data(input.utf8)
-        var signature = [UInt8](repeating: 0, count: SecKeyGetBlockSize(privateKey))
-        var size = signature.count
-        let status = input.withUnsafeBytes { bytes in
-            SecKeyRawSign(privateKey, .PKCS1, bytes.bindMemory(to: UInt8.self).baseAddress!, input.count, &signature, &size)
+        var error: Unmanaged<CFError>?
+        // Raw 表示不添加摘要或 DigestInfo；与原有 PKCS1 type-1 字节保持一致。
+        guard let bytes = SecKeyCreateSignature(privateKey, .rsaSignatureDigestPKCS1v15Raw, input as CFData, &error) else {
+            throw IOSCastError.reason("cast_sign_failed")
         }
-        guard status == errSecSuccess, size == SecKeyGetBlockSize(privateKey) else { throw IOSCastError.reason("cast_sign_failed") }
-        return Data(signature.prefix(size)).base64EncodedString()
+        let signature = bytes as Data
+        guard signature.count == SecKeyGetBlockSize(privateKey) else { throw IOSCastError.reason("cast_sign_failed") }
+        return signature.base64EncodedString()
     }
 }
 
